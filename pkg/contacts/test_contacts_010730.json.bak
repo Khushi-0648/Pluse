@@ -1,0 +1,14 @@
+[
+  {
+    "phone": "14155552671",
+    "name": "Test Alice",
+    "email": "alice@test.com",
+    "tags": [
+      "VIP",
+      "Beta"
+    ],
+    "bot_paused_until": "2026-10-20T02:07:30.2996522+05:30",
+    "needs_attention": true,
+    "created_at": "2026-10-20T01:07:30.2842013+05:30"
+  }
+]

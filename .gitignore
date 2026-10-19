@@ -1,0 +1,46 @@
+# Binaries & executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+server.exe
+whatsapp-auto.exe
+cloudflared.exe
+
+# Database & SQLite files (contains sensitive session keys and credentials)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+whatsapp.db
+whatsapp_platform.db
+whatsapp-*.db
+
+# Live session & message data (sensitive user data)
+contacts.json
+contacts.json.bak
+contacts-*.json
+messages.json
+messages.json.bak
+messages-*.json
+scheduled.json
+scheduled-*.json
+
+# Active config with hashed passwords
+config.yaml
+.env
+
+# Test artifacts & cookies
+cookies.txt
+*.test
+*.out
+cover.out
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

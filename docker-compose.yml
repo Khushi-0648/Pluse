@@ -1,0 +1,125 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # 1. Primary PostgreSQL 16 Database
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: whatsapp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-whatsapp_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-whatsapp_secure_password_2026}
+      POSTGRES_DB: ${DB_NAME:-whatsapp_platform}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/database/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-whatsapp_user} -d ${DB_NAME:-whatsapp_platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # 2. Redis 7 for Queue, Rate Limiting & SSE/WebSocket Pub/Sub
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: whatsapp_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================================
+  # 3. Go Backend API & Background Workers
+  # ============================================================================
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.api
+    container_name: whatsapp_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DRIVER: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_ENABLED: "true"
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ============================================================================
+  # 4. React + Vite Web Dashboard
+  # ============================================================================
+  web:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.web
+    container_name: whatsapp_web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "5173:80"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8080/api/v1
+      - VITE_STRAPI_BASE_URL=http://localhost:1337
+
+  # ============================================================================
+  # 5. Strapi v5 Headless CMS
+  # ============================================================================
+  cms:
+    build:
+      context: ./apps/cms
+      dockerfile: ../../infrastructure/docker/Dockerfile.cms
+    container_name: whatsapp_cms
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_CLIENT: postgres
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${DB_NAME:-whatsapp_platform}_cms
+      DATABASE_USERNAME: ${DB_USER:-whatsapp_user}
+      DATABASE_PASSWORD: ${DB_PASSWORD:-whatsapp_secure_password_2026}
+      DATABASE_SSL: "false"
+      APP_KEYS: "toBeModified1,toBeModified2,toBeModified3,toBeModified4"
+      API_TOKEN_SALT: "toBeModifiedSalt12345"
+      ADMIN_JWT_SECRET: "adminSecretTokenValue98765"
+      TRANSFER_TOKEN_SALT: "transferTokenSaltKey123"
+      JWT_SECRET: "cmsJwtSecretKeyVal999"
+    ports:
+      - "1337:1337"
+    volumes:
+      - cms_uploads:/opt/app/public/uploads
+
+volumes:
+  postgres_data:
+  redis_data:
+  cms_uploads:
