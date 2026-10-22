@@ -41,7 +41,7 @@
     const saved = (has) => (has ? 'Saved - leave empty to keep it' : '');
     return html`<div class="stack">
       <form class="card" data-form="set-connection" id="f-connection" novalidate>
-        <div class="card-head"><div><h2>Your WhatsApp Business API</h2><p>Pulse uses Meta's official WhatsApp Business Platform with your own Meta app, number and access token. Nothing is shared with anyone else. Help &gt; Using the official WhatsApp API explains where to find each value.</p></div></div>
+        <div class="card-head"><div><h2>Your WhatsApp Business API</h2><p>Pulse uses Meta's official WhatsApp Business Platform with your own Meta app, number and access token. <strong>Note:</strong> Numbers registered to the Cloud API cannot be used in the WhatsApp mobile app simultaneously. Use a dedicated business number or manage all customer chats through the Pulse inbox. Help &gt; Using the official WhatsApp API explains where to find each value.</p></div></div>
         <div class="card-body form-grid">
           ${field('c-pnid', 'Phone number ID', html`<input type="text" id="c-pnid" name="phone_number_id" value="${C.phone_number_id}" inputmode="numeric" autocomplete="off" required>`, 'In Meta: WhatsApp > API Setup. A long number; it is not your phone number.')}
           ${field('c-waba', 'WhatsApp Business account ID', html`<input type="text" id="c-waba" name="business_account_id" value="${C.business_account_id}" inputmode="numeric" autocomplete="off">`, 'Shown on the same page.')}

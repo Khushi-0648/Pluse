@@ -6,9 +6,18 @@ The linked-device (WhatsApp Web style, QR code) connection of Pulse 1.x has been
 
 ## What you need
 
+> [!WARNING]
+> **Phone Number Coexistence Limitation (Mobile WhatsApp Disconnection):**
+> Meta's official WhatsApp Business Platform (Cloud API) is strictly mutually exclusive with the WhatsApp mobile apps.
+> - A phone number registered to Cloud API **cannot be logged into the WhatsApp consumer app or WhatsApp Business app on a mobile phone at the same time**.
+> - If you register an existing mobile number, you must delete/deregister the WhatsApp account on your smartphone before adding it to Meta's API Setup.
+> - Once connected, all messaging and customer chats are handled exclusively through Pulse's Web Inbox. Attempting to log back into WhatsApp on a phone will deactivate Cloud API message routing.
+> - **Recommendation:** Use a dedicated business SIM, a virtual phone number, or a business landline.
+
 - A Meta (Facebook) account and a Meta Business portfolio for your business.
-- A phone number for the business that is **not** in use in the WhatsApp or WhatsApp Business app (or one you move to the platform). Meta sends it a verification code by SMS or call.
-- A way to make Pulse reachable over https from the internet, so Meta can deliver incoming messages, for example Cloudflare Tunnel (free).
+- A dedicated phone number for the business (SMS or voice call capable for receiving Meta's 6-digit registration code).
+- A permanent HTTPS webhook ingress (e.g. a Named Cloudflare Tunnel or static ngrok domain) so Meta can deliver incoming messages to Pulse.
+- A permanent System User Access Token from Meta Business Manager with `whatsapp_business_messaging` permissions.
 
 ## Step by step
 

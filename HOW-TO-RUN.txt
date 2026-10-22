@@ -1,0 +1,115 @@
+Pulse - messaging automation
+============================
+
+The version number is in VERSION.txt and in the dashboard under Help.
+
+START
+  Double-click Run-App.bat (or whatsapp-auto.exe). The dashboard opens in its own window.
+  Run-Server.bat starts Pulse without a window; open http://127.0.0.1:8085 in your browser.
+
+FIRST SIGN-IN
+  Pulse creates a one-time password the first time it starts. It is shown in the black
+  console window and saved in FIRST-RUN-PASSWORD.txt inside the data folder
+  (%APPDATA%\Pulse). After signing in you choose your own password and the file is deleted.
+  There is no built-in master password.
+
+FORGOT THE PASSWORD?
+  Close Pulse, right-click Reset-Password.bat and choose "Run as administrator".
+  You get a new one-time password. Messages, contacts and the WhatsApp connection are kept.
+  The dashboard shows a notice for 7 days.
+
+CRITICAL: PHONE NUMBER & SETUP REQUIREMENTS BEFORE YOU START
+  Pulse connects through Meta's official WhatsApp Business Platform (Cloud API).
+  Unlike legacy tools or consumer WhatsApp, Meta's Cloud API has two vital requirements:
+
+  1. DEDICATED PHONE NUMBER (CANNOT BE USED ON MOBILE AT THE SAME TIME):
+     Meta does NOT permit a number registered to the Cloud API to be active in the
+     WhatsApp or WhatsApp Business mobile app on your smartphone at the same time.
+     - Strongly recommended: Use a separate business SIM, a virtual number, or a landline.
+     - If you register an existing phone number, you MUST first delete/deregister the
+       WhatsApp account on your mobile phone. Once registered to Cloud API, all chats,
+       replies, and message history are managed exclusively through the Pulse Web Inbox.
+     - Attempting to log back into WhatsApp on your phone will disconnect the Cloud API.
+
+  2. META PREREQUISITES ("HEAVY SETUP"):
+     To connect Pulse, you need:
+     - A Meta Developer Account (developers.facebook.com) and Meta Business Portfolio.
+     - A permanent System User Access Token with whatsapp_business_messaging permissions.
+     - A fixed HTTPS tunnel (e.g., a Named Cloudflare Tunnel or static ngrok domain) to
+       receive incoming customer messages (Meta delivers incoming messages via webhooks).
+     - Approved message templates in WhatsApp Manager for outbound broadcasts (outside 24 hrs).
+     Every step is documented in detail in docs\meta-whatsapp-setup.md and SETUP-GUIDE.md.
+
+CONNECT WHATSAPP
+  From developers.facebook.com, you need: the phone number ID, the WhatsApp Business account ID,
+  a permanent access token (Business settings > System users), and the app secret
+  (App settings > Basic).
+  Incoming messages need a fixed https address or tunnel (e.g. a named Cloudflare
+  tunnel with a fixed domain, a static ngrok domain, or a reverse proxy like Caddy).
+  Quick tunnels (cloudflared tunnel --url...) get a new address on every start, which
+  breaks Meta's webhook; use a fixed address for daily business.
+  Privacy note: managed tunnels (Cloudflare, ngrok) terminate TLS at their edge;
+  for 100% private deployments, terminate TLS directly on your own infrastructure.
+  Paste everything in Settings > WhatsApp connection, press Test connection and Save, then
+  in Meta's WhatsApp > Configuration set the Callback URL and Verify token shown by Pulse
+  and subscribe to "messages". Only the webhook address works through the tunnel.
+
+THEN
+  Follow the "Get started" list on the Home page: read WhatsApp's messaging rules,
+  connect the Business API, receive a first message, enter your business details,
+  send a test to your own mobile, switch automatic replies on.
+
+24 HOURS AND TEMPLATES
+  WhatsApp lets you reply freely for 24 hours after a customer writes. After that only
+  message templates approved by Meta (WhatsApp Manager) can be sent. Enter them under
+  "Official WhatsApp template" in campaigns and scheduled messages. Meta bills some
+  messages, mostly templates.
+
+TRY YOUR REPLIES
+  Auto-replies > Test a message shows the reply a customer would get, without sending.
+  Practice mode (Settings) shows what would be sent without sending anything.
+
+YOUR DATA
+  Contacts, messages and settings data are stored encrypted in %APPDATA%\Pulse, readable only
+  by your Windows account. The access token and app secret are stored sealed with your
+  Windows account. An encrypted backup is saved every day (last 7 kept); see
+  Settings > Privacy and data. An extra backup copy can go to a folder on this computer
+  (for example a USB drive or a synced folder); network folders are not allowed.
+  "Sign out" only signs you out and deletes nothing. To delete all data, use
+  Settings > Privacy and data; Pulse asks for your password first. Close Pulse normally (Ctrl+C in its window, or
+  scripts\Stop-Background.ps1) so the last changes are saved.
+
+OTHER FILES
+  Reset-Password.bat           new one-time admin password if you forgot yours
+  Run-Unlink.bat               disconnect: remove the WhatsApp access token from this computer
+  Create-Desktop-Shortcut.bat  put a Pulse shortcut on the desktop
+  Unblock-Pulse.bat            unblock downloaded files from Windows SmartScreen
+  scripts\Install-Service.ps1  keep Pulse running in the background and restart it if it stops
+  scripts\Stop-Background.ps1  close a background Pulse normally (everything is saved)
+  scripts\Uninstall-Service.ps1  stop running Pulse in the background
+  scripts\Sign-Executable.ps1  sign the executable with a code-signing certificate
+  scripts\Create-DevCertificate.ps1 create and trust a self-signed dev certificate
+  BUILD.md                     instructions for building from source and code-signing
+  SETUP-GUIDE.md               full setup guide, keeping Pulse running, upgrading
+  COMPLIANCE.md                WhatsApp's rules: opt-in, 24 hours, templates, quality
+  contacts.example.csv         example file for Contacts > Import
+  SHA256SUMS.txt               checksum to confirm whatsapp-auto.exe was not changed
+  VERSION.txt                  the version of this package
+
+WINDOWS BLOCKS THE PROGRAM?
+  Unless this copy was signed with a trusted code-signing certificate, Windows may stop it:
+  - SmartScreen ("Windows protected your PC"): choose "More info" > "Run anyway", but only if
+    the checksum in SHA256SUMS.txt matches (PowerShell: Get-FileHash whatsapp-auto.exe).
+    Run Unblock-Pulse.bat to remove the internet download flag.
+  - Smart App Control blocks unsigned programs completely and cannot be bypassed for one
+    program on Windows 11. Use an official signed release or trust your organization's
+    certificate (BUILD.md).
+  To check a copy: right-click whatsapp-auto.exe > Properties > Digital Signatures.
+
+UPGRADING
+  Close the old version first. From 1.x, contacts, messages and settings are kept; connect
+  the Business API as above. The old WhatsApp Web session files are no longer used:
+  Settings > Privacy and data offers to delete them. Remove Pulse from the phone's
+  Linked devices list. Pulse imports contacts and messages from versions before 1.4 into
+  the encrypted data folder and keeps the unencrypted originals in
+  %APPDATA%\Pulse\old-version-backup until you delete them.

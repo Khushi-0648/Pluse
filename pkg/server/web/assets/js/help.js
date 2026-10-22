@@ -10,6 +10,7 @@
       P.mount(el, html`<div class="stack">
         <section class="card"><div class="card-head"><h2>Using the official WhatsApp API</h2></div><div class="card-body stack-sm">
           <p>Pulse connects through Meta's official WhatsApp Business Platform (Cloud API). This is the way WhatsApp's terms allow businesses to automate messages. You use your own Meta account and number; you need to set it up once:</p>
+          <div class="notice warn"><p><strong>Phone Number Requirement:</strong> A number connected to Meta's Cloud API cannot be used in the WhatsApp or WhatsApp Business mobile app at the same time. Use a dedicated SIM, virtual number or landline, or manage all chats here in the Pulse inbox.</p></div>
           <ol class="steps">
             <li>At <strong>developers.facebook.com</strong>, create an app of type <strong>Business</strong> and add the <strong>WhatsApp</strong> product.</li>
             <li>In WhatsApp &gt; API Setup, add your business phone number and copy the <strong>Phone number ID</strong> and the <strong>WhatsApp Business account ID</strong>.</li>
