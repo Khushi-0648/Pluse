@@ -30,7 +30,29 @@ scheduled-*.json
 
 # Active config with hashed passwords
 config.yaml
+config.yaml.bak
+config.yaml.tmp
 .env
+
+# Pulse data folders, one-time passwords and backups
+data/
+old-version-backup/
+FIRST-RUN-PASSWORD.txt
+store.key
+*.json.bak
+*.tmp
+templates.json
+campaigns.json
+audit.json
+webhook-failed.json
+
+# Release archives, audit artifacts and test screenshots
+*.zip
+audit_page_*.png
+audit_report*
+extracted_pdf_text.txt
+scratch_zip/
+uismoke-shots/
 
 # Test artifacts & cookies
 cookies.txt
@@ -44,3 +66,24 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Release zips made by Build.bat
+dist/
+
+# Signing certificates, logs, local tokens, sealed sessions and backups (never commit)
+*.pfx
+*.p12
+*.log
+control.token
+*.sealed
+backups/
+.env.*
+!.env.example
+# crash.log is covered by *.log; whatsapp-auto.old.exe by *.exe; *.db, *.db-wal and
+# *.db-shm are listed above.
+
+# Release staging & dev certs
+whatsapp-auto-exe/
+certs/
+*.cer
+*.sha256

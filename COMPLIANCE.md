@@ -1,60 +1,36 @@
-# WhatsApp Automation & Meta Policy Compliance Guide
+# Using Pulse within WhatsApp's rules
 
-## Overview
-Pulse WhatsApp Automation Platform is designed to operate safely, ethically, and responsibly. 
+This is practical guidance, not legal advice. Check Meta's current [WhatsApp Business Messaging Policy](https://business.whatsapp.com/policy), [Commerce Policy](https://www.whatsapp.com/legal/commerce-policy) and the [WhatsApp Business Platform terms](https://www.whatsapp.com/legal/business-terms) yourself.
 
-> [!IMPORTANT]
-> **Architecture & Protocol Notice**: Pulse connects using WhatsApp Web's Multi-Device companion protocol (via `whatsmeow`). It is an independent software tool and is **not** an official Meta WhatsApp Cloud API partner application. While Pulse incorporates multi-layered anti-ban safeguards (randomized jitter delays, automatic STOP opt-out compliance, consecutive failure circuit-breakers, warmup pacing), users must practice responsible opt-in messaging to maintain good account reputation.
+## The connection
 
----
+Pulse connects only through **Meta's official WhatsApp Business Platform (Cloud API)**, with your own Meta app, number and access token. This is the way WhatsApp's terms allow businesses to send automated messages. (Pulse 1.x linked to WhatsApp like WhatsApp Web; that connection has been removed.)
 
-## 1. Explicit Consent & Opt-In Policy
-* **Requirement**: You must only send messages to contacts who have explicitly consented (opted in) to receive communications from your organization.
-* **Prohibited**: Scraping phone numbers from public directories, purchasing contact lists, or sending cold outreach messages is strictly against WhatsApp terms and risks instant account bans.
-* **Best Practice**: Keep records of how each contact opted in (e.g., website contact form, checkout checkbox, or inbound support request).
+Using the official platform does not make every message acceptable: Meta's policies still apply, Meta rates the quality of your number, and numbers that get many blocks or reports have their limits lowered or are restricted.
 
----
+## Meta's main rules and how Pulse helps
 
-## 2. Mandatory Unsubscribe & STOP Compliance
-* **Mechanism**: Pulse Automation includes built-in keyword listeners for:
-  `STOP`, `UNSUBSCRIBE`, `OPTOUT`, `CANCEL`, `QUIT`.
-* **Behavior**: When an incoming message matches an opt-out keyword, the system:
-  1. Instantly tags the contact as `Opted-Out`.
-  2. Sets the contact's Do-Not-Disturb (DND) status to `ACTIVE`.
-  3. Halts any future broadcast or automated message dispatches to that phone number.
-  4. Dispatches a confirmation acknowledgment informing the user how to resubscribe (`START`).
+| Rule | What Pulse does |
+| --- | --- |
+| Opt-in before messaging | Each contact has a consent record (source and date). Campaigns go only to opted-in contacts unless you switch that off. CSV import can read a consent column. Integrations cannot mark someone as opted in; the opt-in must be recorded in Pulse. |
+| 24-hour customer service window | Free text is only sent within 24 hours of the customer's last message. Messages typed in the inbox, the `send` command and the integration endpoint are refused outside it, with a plain explanation. Campaigns and scheduled messages send the Meta-approved template you chose to customers outside the window, or skip them. Automatic replies always answer a message that just arrived. |
+| Templates | Created and approved in WhatsApp Manager. In Pulse you enter the template name, language and which values (for example `{{first_name}}`) fill `{{1}}`, `{{2}}`... A template with an empty value is not sent. |
+| Honour opt-outs | STOP, UNSUBSCRIBE, "rok do", "band karo", "mat bhejo" and similar mark the contact do-not-message immediately, on every way of sending. START or "shuru karo" opts back in. |
+| Quality rating and messaging limits | Home shows Meta's quality rating. A red rating counts as "at risk": campaigns are paused and blocked. Keep the Careful pace while Meta's daily limit for a new number grows. |
+| Blocked numbers, test mode, practice mode, daily limit | Apply to every way of sending: automatic replies, the inbox, scheduled messages, campaigns, integrations and the `send` command. |
+| Reach a person | AGENT, HUMAN, PERSON, "talk to someone", "baat karni hai" or menu option 4 pause the bot in that chat and put it under *Needs attention*. |
+| Do not spam | Daily limit, warm-up limit (50 a day), cooldown and per-customer reply cap, loop detection, randomised gaps and batch pauses, automatic pause after 5 failed sends or when several recipients opt out. |
+| Accurate information | Default replies only use details you entered. A reply whose details are empty is never sent with a gap. |
+| Protect personal data | Customer data is encrypted on disk; the access token and app secret are sealed with your Windows account; per-customer export and deletion; retention period. |
 
----
+## Costs
 
-## 3. Account Warming-Up Schedule (Anti-Ban Protocol)
-When connecting a new phone number to WhatsApp Automation, abrupt high-volume dispatches trigger automated heuristic flags. Follow this graduated schedule:
+Meta bills some messages (mostly templates) to your Meta account; prices depend on the category and the customer's country. Check WhatsApp Manager for current prices.
 
-| Timeline | Max Messages / Day | Recommended Delay | Target Audience |
-| :--- | :--- | :--- | :--- |
-| **Day 1 – 3** | 20 – 50 messages | 8 – 15 seconds | Existing loyal clients |
-| **Day 4 – 7** | 50 – 100 messages | 6 – 12 seconds | Active subscribers |
-| **Week 2** | 100 – 250 messages | 5 – 10 seconds | Segmented customer lists |
-| **Week 3+** | 250 – 500+ messages | 4 – 10 seconds | General opt-in database |
+## Content
 
-> [!TIP]
-> Enable **Warmup Mode** in Settings to automatically enforce a safe ceiling of 50 messages per day while establishing account reputation.
+Do not send messages about illegal goods, gambling, adult content, weapons, drugs, deceptive offers, or anything Meta's Commerce and Business Messaging policies prohibit. Do not ask customers for card numbers, passwords or one-time codes.
 
----
+## Independence
 
-## 4. Anti-Ban Technical Safeguards
-Pulse WhatsApp Automation incorporates multi-layered technical protections:
-1. **Randomized Jitter Delays**: Broadcast dispatches randomize pacing between 4 and 10 seconds, mimicking human interaction.
-2. **Consecutive Error Circuit Breaker**: If 5 consecutive messages fail delivery, the campaign terminates immediately to prevent cascading bans.
-3. **Typing Simulation**: The platform simulates the WhatsApp `composing...` status before sending auto-replies.
-4. **Human Handover Pause**: When a user requests an agent, automated bot responses are suspended for 24 hours to prevent bot spam during live discussions.
-
----
-
-## 5. Acceptable Content
-* You must not send messages promoting illegal goods, gambling, adult content, fraudulent schemes, or deceptive claims.
-* Ensure all transactional updates (order status, appointment reminders) are timely, accurate, and concise.
-
----
-
-## Legal Disclaimer
-Pulse WhatsApp Automation Platform is an independent automation software solution. It is not affiliated, associated, authorized, endorsed by, or in any way officially connected with WhatsApp LLC, Meta Platforms, Inc., or any of their subsidiaries or affiliates.
+Pulse is independent software. It is not affiliated with, authorised, maintained, sponsored or endorsed by WhatsApp LLC or Meta Platforms, Inc. WhatsApp is a trademark of WhatsApp LLC.

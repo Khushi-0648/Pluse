@@ -2,168 +2,120 @@ package history
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
-func TestHistoryStore(t *testing.T) {
-	tmpFile, err := os.CreateTemp("", "messages_*.json")
+func TestStatsExcludeImportedHistory(t *testing.T) {
+	s, err := NewStore(filepath.Join(t.TempDir(), "m.json"), 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tmpFile.Name())
-	tmpFile.Close()
-
-	store, err := NewStore(tmpFile.Name(), 10)
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+	old := time.Now().Add(-48 * time.Hour)
+	for i := 0; i < 5; i++ {
+		s.Record(MessageRecord{ID: "imp" + string(rune('a'+i)), Direction: DirectionIncoming, Type: TypeHistorySync, Phone: "1415", Timestamp: old})
 	}
-
-	// Record incoming
-	store.Record(MessageRecord{
-		ID:          "msg_1",
-		Direction:   DirectionIncoming,
-		Type:        TypeUserMessage,
-		SenderPhone: "14155552671",
-		SenderName:  "Alice",
-		Text:        "hii",
-		Timestamp:   time.Now(),
-	})
-
-	// Record outgoing
-	store.Record(MessageRecord{
-		ID:          "msg_2",
-		Direction:   DirectionOutgoing,
-		Type:        TypeAutoReply,
-		SenderPhone: "Me",
-		Recipient:   "14155552671",
-		Text:        "Hello! How are you doing?",
-		Timestamp:   time.Now(),
-	})
-
-	list := store.List(10, "", "")
-	if len(list) != 2 {
-		t.Fatalf("Expected 2 messages, got %d", len(list))
+	s.Record(MessageRecord{ID: "live1", Direction: DirectionIncoming, Type: TypeUserMessage, Phone: "1415"})
+	s.Record(MessageRecord{ID: "live2", Direction: DirectionOutgoing, Type: TypeAutoReply, Phone: "1415", Status: StatusSent})
+	st := s.Stats(time.Time{})
+	if st.Incoming != 1 || st.Outgoing != 1 || st.AutoReplies != 1 {
+		t.Fatalf("imported messages counted (C16): %+v", st)
 	}
-
-	in, out := store.TotalStats()
-	if in != 1 || out != 1 {
-		t.Fatalf("Expected 1 in, 1 out, got %d in, %d out", in, out)
+	if s.ImportedCount() != 5 || s.DeleteHistorySync() != 5 || s.ImportedCount() != 0 {
+		t.Fatal("imported messages not tracked or deleted")
 	}
-
-	// Test search filter
-	filtered := store.List(10, "", "Hello")
-	if len(filtered) != 1 || filtered[0].ID != "msg_2" {
-		t.Fatalf("Expected 1 filtered result msg_2, got %d", len(filtered))
-	}
-
-	// Record another message for Bob
-	store.Record(MessageRecord{
-		ID:          "msg_3",
-		Direction:   DirectionIncoming,
-		Type:        TypeUserMessage,
-		SenderPhone: "+19998887777",
-		SenderName:  "Bob",
-		Text:        "Hey there",
-		Timestamp:   time.Now(),
-	})
-
-	if len(store.List(10, "", "")) != 3 {
-		t.Fatalf("Expected 3 messages before ClearPhone, got %d", len(store.List(10, "", "")))
-	}
-
-	// Test ClearPhone for Alice
-	deletedAlice := store.ClearPhone("+14155552671")
-	if deletedAlice != 2 {
-		t.Fatalf("Expected 2 deleted messages for Alice, got %d", deletedAlice)
-	}
-
-	remaining := store.List(10, "", "")
-	if len(remaining) != 1 || remaining[0].ID != "msg_3" {
-		t.Fatalf("Expected only Bob's message to remain, got %d messages", len(remaining))
-	}
-
-	// Test clear all
-	if err := store.Clear(); err != nil {
-		t.Fatal(err)
-	}
-	if len(store.List(10, "", "")) != 0 {
-		t.Fatal("Expected empty store after clear")
+	s.Record(MessageRecord{ID: "live1", Direction: DirectionIncoming, Phone: "1415"})
+	if len(s.ExportAll()) != 2 {
+		t.Error("duplicate message IDs must be ignored")
 	}
 }
 
-func TestHistoryLIDResolution(t *testing.T) {
-	tmpFile, err := os.CreateTemp("", "messages_lid_*.json")
+func TestStatusOnlyMovesForward(t *testing.T) {
+	s, _ := NewStore(filepath.Join(t.TempDir(), "m.json"), 100)
+	s.Record(MessageRecord{ID: "x", Direction: DirectionOutgoing, Phone: "1", Status: StatusSent})
+	s.UpdateStatus("x", StatusRead)
+	s.UpdateStatus("x", StatusDelivered)
+	if m, _ := s.Get("x"); m.Status != StatusRead {
+		t.Fatalf("status went backwards: %s", m.Status)
+	}
+	if s.SentSince(time.Now().Add(-time.Minute)) != 1 {
+		t.Error("read messages count as sent")
+	}
+}
+
+func TestQueriesAndConversations(t *testing.T) {
+	s, _ := NewStore(filepath.Join(t.TempDir(), "m.json"), 100)
+	base := time.Now().Add(-time.Hour)
+	s.Record(MessageRecord{ID: "1", Direction: DirectionIncoming, Phone: "919876543210", Name: "Asha", Text: "hello", Timestamp: base})
+	s.Record(MessageRecord{ID: "2", Direction: DirectionOutgoing, Type: TypeAutoReply, Phone: "919876543210", Text: "hi there", Timestamp: base.Add(time.Second)})
+	s.Record(MessageRecord{ID: "3", Direction: DirectionIncoming, Phone: "14155550100", Text: "price?", Timestamp: base.Add(2 * time.Second)})
+	if got := s.List(10, "9876543210", ""); len(got) != 2 || got[0].ID != "2" {
+		t.Fatalf("phone filter or order wrong: %+v", got)
+	}
+	if got := s.List(10, "", "PRICE"); len(got) != 1 {
+		t.Fatal("search should be case-insensitive")
+	}
+	convs := s.Conversations()
+	if len(convs) != 2 || convs[0].Phone != "14155550100" || convs[1].Name != "Asha" {
+		t.Fatalf("conversations wrong: %+v", convs)
+	}
+	read := base.Add(500 * time.Millisecond)
+	if convs[1].UnreadSince(&read) != 0 || convs[1].UnreadSince(nil) != 1 {
+		t.Error("unread counting wrong")
+	}
+	if s.AutoRepliesTo("919876543210", base.Add(-time.Minute)) != 1 {
+		t.Error("auto replies per contact wrong")
+	}
+	if n := s.PurgeOlderThan(1); n != 0 {
+		t.Error("recent messages must not be purged")
+	}
+}
+
+func TestLegacyFileMigrates(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "messages.json")
+	legacy := `[{"id":"a","direction":"incoming","type":"history_sync","timestamp":"2026-01-01T10:00:00Z","sender_phone":"919876543210","sender_name":"Asha","recipient":"Me","text":"old"},
+{"id":"b","direction":"outgoing","type":"ai_reply","timestamp":"2026-01-01T10:01:00Z","sender_phone":"Me","recipient":"919876543210","text":"reply"}]`
+	if err := os.WriteFile(p, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(p, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tmpFile.Name())
-	tmpFile.Close()
+	all := s.ExportAll()
+	if len(all) != 2 || all[0].Phone != "919876543210" || !all[0].Imported || all[1].Phone != "919876543210" || all[1].Type != TypeAutoReply {
+		t.Fatalf("legacy records not migrated: %+v", all)
+	}
+}
 
-	store, err := NewStore(tmpFile.Name(), 10)
+func TestCapKeepsNewest(t *testing.T) {
+	s, _ := NewStore(filepath.Join(t.TempDir(), "m.json"), 3)
+	for i := 0; i < 5; i++ {
+		s.Record(MessageRecord{ID: string(rune('a' + i)), Direction: DirectionIncoming, Phone: "1"})
+	}
+	all := s.ExportAll()
+	if len(all) != 3 || all[0].ID != "c" {
+		t.Fatalf("cap kept the wrong messages: %+v", all)
+	}
+	s.UpdateStatus("e", StatusRead)
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMarkFailedRecordsReason(t *testing.T) {
+	s, err := NewStore(filepath.Join(t.TempDir(), "h.json"), 100)
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Fatal(err)
 	}
-
-	// Record message with LID in sender_phone and sender_name
-	store.Record(MessageRecord{
-		ID:          "lid_msg_1",
-		Direction:   DirectionIncoming,
-		Type:        TypeUserMessage,
-		SenderPhone: "245058100052033",
-		SenderName:  "+245058100052033",
-		Recipient:   "Me",
-		Text:        "Hello there",
-		Timestamp:   time.Now(),
-	})
-
-	// Record outgoing message with LID in recipient and sender_name
-	store.Record(MessageRecord{
-		ID:          "lid_msg_2",
-		Direction:   DirectionOutgoing,
-		Type:        TypeUserMessage,
-		SenderPhone: "Me",
-		SenderName:  "+245058100052033",
-		Recipient:   "245058100052033",
-		Text:        "Hi, how can I help?",
-		Timestamp:   time.Now(),
-	})
-
-	resolver := func(target string) string {
-		if target == "245058100052033" {
-			return "919971731137"
-		}
-		return target
+	s.Record(MessageRecord{ID: "out1", Direction: DirectionOutgoing, Phone: "14155550001", Text: "hi", Status: StatusSent})
+	s.Record(MessageRecord{ID: "in1", Direction: DirectionIncoming, Phone: "14155550001", Text: "hello"})
+	if !s.MarkFailed("out1", "More than 24 hours") || s.MarkFailed("in1", "x") || s.MarkFailed("nope", "x") {
+		t.Fatal("only known outgoing messages can be marked failed")
 	}
-	nameResolver := func(target string) string {
-		if target == "919971731137" {
-			return "Sparsh Gupta Techpros"
-		}
-		return ""
+	if m, _ := s.Get("out1"); m.Status != StatusFailed || m.Error != "More than 24 hours" {
+		t.Fatalf("got %+v", m)
 	}
-
-	store.FixPhoneNumbers(resolver, nameResolver)
-
-	msgs := store.List(10, "", "")
-	if len(msgs) != 2 {
-		t.Fatalf("Expected 2 messages, got %d", len(msgs))
-	}
-
-	for _, m := range msgs {
-		if m.Direction == DirectionIncoming {
-			if m.SenderPhone != "919971731137" {
-				t.Errorf("Expected incoming SenderPhone to be 919971731137, got %s", m.SenderPhone)
-			}
-			if m.SenderName != "Sparsh Gupta Techpros" {
-				t.Errorf("Expected incoming SenderName to be 'Sparsh Gupta Techpros', got %s", m.SenderName)
-			}
-		} else {
-			if m.Recipient != "919971731137" {
-				t.Errorf("Expected outgoing Recipient to be 919971731137, got %s", m.Recipient)
-			}
-			if m.SenderName != "Sparsh Gupta Techpros" {
-				t.Errorf("Expected outgoing SenderName to be 'Sparsh Gupta Techpros', got %s", m.SenderName)
-			}
-		}
-	}
+	_ = s.Flush()
 }

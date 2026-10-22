@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Choose your password - {{.Product}}</title>
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/js/auth.js" defer></script>
+</head>
+<body>
+<main class="auth-page">
+  <div class="card auth-card">
+    <div class="card-body stack">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">P</div>
+        <div><div class="brand-name">Choose your password</div><div class="brand-sub">The one-time password only works once.</div></div>
+      </div>
+      {{if .Error}}<div class="notice bad" role="alert"><p>{{.Error}}</p></div>{{end}}
+      <div class="notice bad" role="alert" id="client-error" hidden><p id="client-error-text"></p></div>
+      <form method="post" action="/setup-password" class="stack" id="setup-form" autocomplete="off">
+        <div class="field">
+          <label for="new_password">New password</label>
+          <div class="input-group">
+            <input type="password" id="new_password" name="new_password" required minlength="8" maxlength="128" autocomplete="new-password" aria-describedby="pw-rules" autofocus>
+            <button class="btn" type="button" data-toggle-password="new_password" aria-controls="new_password" aria-pressed="false">Show</button>
+          </div>
+          <ul class="rules-list" id="pw-rules">
+            <li data-rule="length">At least 8 characters</li>
+            <li data-rule="mix">Letters and numbers</li>
+            <li data-rule="words">No easy words such as admin, password or 12345678</li>
+            <li data-rule="variety">At least 4 different characters</li>
+          </ul>
+        </div>
+        <div class="field">
+          <label for="confirm_password">Type it again</label>
+          <input type="password" id="confirm_password" name="confirm_password" required autocomplete="new-password">
+        </div>
+        <button class="btn primary" type="submit">Save password</button>
+      </form>
+    </div>
+  </div>
+</main>
+</body>
+</html>

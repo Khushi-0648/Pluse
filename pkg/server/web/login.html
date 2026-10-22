@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Sign in - {{.Product}}</title>
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/js/auth.js" defer></script>
+</head>
+<body>
+<main class="auth-page">
+  <div class="card auth-card">
+    <div class="card-body stack">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">P</div>
+        <div><div class="brand-name">{{.Product}}</div><div class="brand-sub">Sign in to your dashboard</div></div>
+      </div>
+      {{if .Error}}<div class="notice bad" role="alert"><p>{{.Error}}</p></div>{{end}}
+      <form method="post" action="/login" class="stack" autocomplete="on">
+        <div class="field">
+          <label for="password">Password</label>
+          <div class="input-group">
+            <input type="password" id="password" name="password" required autocomplete="current-password" autofocus>
+            <button class="btn" type="button" data-toggle-password="password" aria-controls="password" aria-pressed="false">Show</button>
+          </div>
+          <span class="hint">Use the admin password, or the staff password if your admin created one.</span>
+        </div>
+        <button class="btn primary" type="submit">Sign in</button>
+      </form>
+      <p class="hint">First time? The one-time password is shown in the window where {{.Product}} started, or in the file FIRST-RUN-PASSWORD.txt in the data folder.</p>
+      <p class="hint">Forgot the password? Close {{.Product}} and double-click Reset-Password.bat in the program folder. Your messages and contacts are kept.</p>
+    </div>
+  </div>
+</main>
+</body>
+</html>

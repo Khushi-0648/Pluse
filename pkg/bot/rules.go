@@ -3,272 +3,292 @@ package bot
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"whatsapp-automation/pkg/config"
-	"whatsapp-automation/pkg/contacts"
 )
 
-// MatchResult stores match status and formatted reply text
-type MatchResult struct {
-	Matched   bool
-	RuleName  string
-	ReplyText string
-	IsBuiltin bool
+// Normalize lowercases text, collapses whitespace and strips surrounding punctuation.
+func Normalize(text string) string {
+	t := strings.ToLower(strings.Join(strings.Fields(text), " "))
+	return strings.TrimFunc(t, func(r rune) bool {
+		return unicode.IsPunct(r) || unicode.IsSymbol(r) || unicode.IsSpace(r)
+	})
 }
 
-// isHandoverIntent checks whether the user is requesting live human support (C4)
-func isHandoverIntent(text string) bool {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	cleanWord := strings.Trim(lower, "!?.#* \t\r\n")
-	if cleanWord == "agent" || cleanWord == "!agent" || cleanWord == "human" || cleanWord == "support" || cleanWord == "representative" {
+var optOutWords = map[string]bool{
+	"stop": true, "stop all": true, "unsubscribe": true, "optout": true, "opt-out": true, "opt out": true,
+	"no more messages": true, "stop messages": true, "stop messaging": true, "remove me": true,
+	"rok do": true, "rokdo": true, "band karo": true, "bandh karo": true, "band kro": true, "band kar do": true,
+	"mat bhejo": true, "message mat bhejo": true, "messages mat bhejo": true,
+	"बंद करो": true, "बंद": true, "रोको": true, "रोक दो": true, "मत भेजो": true,
+}
+
+var optInWords = map[string]bool{
+	"start": true, "unstop": true, "subscribe": true, "resume": true,
+	"shuru": true, "shuru karo": true, "chalu karo": true, "chalu": true,
+	"शुरू": true, "शुरू करो": true, "चालू करो": true,
+}
+
+var handoverWords = map[string]bool{
+	"agent": true, "human": true, "person": true, "representative": true, "operator": true, "staff": true,
+	"real person": true, "live agent": true, "customer care": true, "customer support": true,
+	"insaan": true, "manager": true,
+}
+
+var handoverPhrases = []string{
+	"talk to a person", "talk to person", "talk to someone", "talk to a human", "talk to human", "talk to agent", "talk to an agent",
+	"speak to a person", "speak to someone", "speak to a human", "speak to human", "speak to agent", "speak to an agent",
+	"speak with a person", "speak with someone", "speak with agent", "speak with an agent", "speak with a human",
+	"connect me to", "need a human", "need human", "need a person", "want to talk to", "call me back", "please call me",
+	"baat karni hai", "baat karna hai", "kisi se baat", "insaan se baat",
+}
+
+// IsOptOut reports whether text is a request to stop messages.
+func IsOptOut(text string) bool { return optOutWords[Normalize(text)] }
+
+// IsOptIn reports whether text is a request to resume messages.
+func IsOptIn(text string) bool { return optInWords[Normalize(text)] }
+
+// IsHandoverRequest reports whether the customer is asking for a person.
+func IsHandoverRequest(text string) bool {
+	n := Normalize(text)
+	if handoverWords[n] {
 		return true
 	}
-	phrases := []string{
-		"talk to agent", "talk to an agent", "talk to human", "talk to a human",
-		"speak to agent", "speak to an agent", "speak to human", "speak to a human",
-		"speak with agent", "speak with human", "human agent", "live agent",
-		"customer care", "customer support", "need human", "connect to human", "connect to agent",
-	}
-	for _, p := range phrases {
-		if strings.Contains(lower, p) {
+	for _, p := range handoverPhrases {
+		if strings.Contains(n, p) {
 			return true
 		}
 	}
 	return false
 }
 
-// EvaluateMessage matches message text against configured rules and built-in commands
-func EvaluateMessage(text string, senderName string, senderPhone string, rules []config.Rule, startTime time.Time) MatchResult {
-	trimmed := strings.TrimSpace(text)
-	lower := strings.ToLower(trimmed)
-
-	// 1. Check Built-in Compliance Commands (STOP / START opt-in & opt-out)
-	cleanWord := strings.Trim(lower, "!?.#* \t\r\n")
-	if cleanWord == "stop" || cleanWord == "unsubscribe" || cleanWord == "optout" || cleanWord == "opt-out" || cleanWord == "cancel" || cleanWord == "quit" {
-		return MatchResult{
-			Matched:   true,
-			RuleName:  "system:opt_out",
-			IsBuiltin: true,
-			ReplyText: "🛑 You have been unsubscribed from automated messages. You will no longer receive broadcast notifications. Reply *START* anytime to resubscribe.",
+func isNumberToken(s string) bool {
+	if s == "" || len(s) > 2 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
 		}
 	}
-
-	if cleanWord == "start" || cleanWord == "unstop" || cleanWord == "subscribe" {
-		return MatchResult{
-			Matched:   true,
-			RuleName:  "system:opt_in",
-			IsBuiltin: true,
-			ReplyText: "✅ Welcome back! You have successfully resubscribed to automated updates. Reply *MENU* anytime to view services.",
-		}
-	}
-
-	// Human Agent Handover (C4)
-	if isHandoverIntent(text) {
-		return MatchResult{
-			Matched:   true,
-			RuleName:  "builtin:agent_handover",
-			IsBuiltin: true,
-			ReplyText: "👨‍💼 *Live Agent Requested*\n\nYour request has been forwarded to a human representative. Automated replies have been paused for this chat. An agent will respond shortly.",
-		}
-	}
-
-	// 2. Check Built-in Utility Commands
-	if strings.HasPrefix(lower, "!ping") {
-		return MatchResult{
-			Matched:   true,
-			RuleName:  "builtin:ping",
-			IsBuiltin: true,
-			ReplyText: fmt.Sprintf("🏓 *Pong!*\n⏰ Time: %s\n⏱️ Uptime: %s", time.Now().Format("15:04:05 MST"), time.Since(startTime).Round(time.Second)),
-		}
-	}
-
-	if strings.HasPrefix(lower, "!time") {
-		return MatchResult{
-			Matched:   true,
-			RuleName:  "builtin:time",
-			IsBuiltin: true,
-			ReplyText: fmt.Sprintf("🕒 *Server Time:*\n%s (%s)", time.Now().Format(time.RFC1123), time.Now().Location().String()),
-		}
-	}
-
-	if strings.HasPrefix(lower, "!info") {
-		return MatchResult{
-			Matched:   true,
-			RuleName:  "builtin:info",
-			IsBuiltin: true,
-			ReplyText: fmt.Sprintf("🤖 *WhatsApp Automation Bot*\n\n• Version: v1.3.0\n• Engine: Go + whatsmeow\n• Uptime: %s\n• Active Rules: %d", time.Since(startTime).Round(time.Second), len(rules)),
-		}
-	}
-
-
-	if strings.HasPrefix(lower, "!echo") {
-		payload := strings.TrimSpace(trimmed[len("!echo"):])
-		if payload == "" {
-			payload = "(empty text)"
-		}
-		return MatchResult{
-			Matched:   true,
-			RuleName:  "builtin:echo",
-			IsBuiltin: true,
-			ReplyText: fmt.Sprintf("📢 *Echo:* %s", payload),
-		}
-	}
-
-	// 2. Evaluate Configured Rules
-	for _, rule := range rules {
-		if !rule.Enabled {
-			continue
-		}
-
-		matched := matchRule(rule, trimmed, lower)
-		if matched {
-			reply := RenderTemplate(rule.Reply, senderName, senderPhone, trimmed)
-			return MatchResult{
-				Matched:   true,
-				RuleName:  rule.Name,
-				ReplyText: reply,
-			}
-		}
-	}
-
-	return MatchResult{Matched: false}
+	return true
 }
 
-// matchRule checks if the text matches the rule, supporting comma-separated patterns
-func matchRule(rule config.Rule, trimmed, lower string) bool {
-	rawPatterns := strings.Split(rule.Pattern, ",")
-	cleanTrimmed := strings.TrimRight(trimmed, "!?. \t\r\n")
-	cleanLower := strings.ToLower(cleanTrimmed)
+var regexCache sync.Map
 
-	for _, p := range rawPatterns {
-		pat := strings.TrimSpace(p)
-		if pat == "" {
-			continue
+func compiled(pat string) *regexp.Regexp {
+	if v, ok := regexCache.Load(pat); ok {
+		return v.(*regexp.Regexp)
+	}
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		regexCache.Store(pat, (*regexp.Regexp)(nil))
+		return nil
+	}
+	regexCache.Store(pat, re)
+	return re
+}
+
+// Keywords splits a rule pattern into its comma-separated keywords.
+func Keywords(pattern string) []string {
+	var out []string
+	for _, p := range strings.Split(pattern, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
-		patLower := strings.ToLower(pat)
+	}
+	return out
+}
 
+// MatchRule reports whether text triggers rule. Number keywords ("1", "2") only match
+// while a menu is active, so a stray "2" in conversation does not trigger a menu reply.
+func MatchRule(rule config.Rule, text string, menuActive bool) bool {
+	raw := strings.TrimSpace(text)
+	n := Normalize(raw)
+	if n == "" {
+		return false
+	}
+	for _, kw := range Keywords(rule.Pattern) {
+		k := Normalize(kw)
 		switch rule.Type {
-		case "exact":
-			if strings.EqualFold(trimmed, pat) || strings.EqualFold(cleanTrimmed, pat) {
-				return true
-			}
-			// Match if message starts with the greeting keyword as a distinct word (e.g. "hii bro", "hello there")
-			if strings.HasPrefix(cleanLower, patLower+" ") || strings.HasPrefix(cleanLower, patLower+",") {
-				return true
-			}
-		case "contains":
-			if strings.Contains(lower, patLower) {
-				return true
-			}
-		case "prefix":
-			if strings.HasPrefix(lower, patLower) {
-				return true
-			}
 		case "regex":
-			re, err := regexp.Compile(pat)
-			if err == nil && re.MatchString(trimmed) {
+			if re := compiled(kw); re != nil && re.MatchString(raw) {
+				return true
+			}
+		case "contains", "prefix":
+			if k == "" {
+				continue
+			}
+			if isNumberToken(k) {
+				// Numbers behave like menu choices whatever the match type.
+				if menuActive && n == k {
+					return true
+				}
+				continue
+			}
+			if rule.Type == "contains" && containsWord(n, k) || rule.Type == "prefix" && strings.HasPrefix(n, k) {
+				return true
+			}
+		default: // exact
+			if k == "" {
+				continue
+			}
+			if isNumberToken(k) {
+				if menuActive && n == k {
+					return true
+				}
+				continue
+			}
+			if n == k || strings.HasPrefix(n, k+" ") {
 				return true
 			}
 		}
 	}
-
 	return false
 }
 
-var (
-	reGreeting         = regexp.MustCompile(`(?i)\{\{?\s*greeting\s*\}?\}`)
-	reName             = regexp.MustCompile(`(?i)\{\{?\s*name\s*\}?\}`)
-	reFirstName        = regexp.MustCompile(`(?i)\{\{?\s*(first_name|firstname)\s*\}?\}`)
-	reSender           = regexp.MustCompile(`(?i)\{\{?\s*sender\s*\}?\}`)
-	reRecipient        = regexp.MustCompile(`(?i)\{\{?\s*recipient\s*\}?\}`)
-	rePhone            = regexp.MustCompile(`(?i)\{\{?\s*phone\s*\}?\}`)
-	reTime             = regexp.MustCompile(`(?i)\{\{?\s*time\s*\}?\}`)
-	reDate             = regexp.MustCompile(`(?i)\{\{?\s*date\s*\}?\}`)
-	reMessage          = regexp.MustCompile(`(?i)\{\{?\s*message\s*\}?\}`)
-	reRemainingUnknown = regexp.MustCompile(`\{\{[^}]+\}\}|\{[a-zA-Z0-9_]+\}`)
-)
+// containsWord reports whether k appears in n as whole words, so "hi" matches
+// "hi there" but not "which" or "this".
+func containsWord(n, k string) bool {
+	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) }
+	for from := 0; from <= len(n)-len(k); {
+		i := strings.Index(n[from:], k)
+		if i < 0 {
+			return false
+		}
+		i += from
+		before, _ := utf8.DecodeLastRuneInString(n[:i])
+		after, _ := utf8.DecodeRuneInString(n[i+len(k):])
+		if (i == 0 || !isWord(before)) && (i+len(k) == len(n) || !isWord(after)) {
+			return true
+		}
+		_, size := utf8.DecodeRuneInString(n[i:])
+		from = i + size
+	}
+	return false
+}
 
-// RenderTemplate substitutes {{greeting}}, {{name}}, {{first_name}}, {{sender}}, {{recipient}}, {{phone}}, {{time}}, {{date}}, {{message}}, and any custom variables
-func RenderTemplate(template string, senderName, senderPhone, originalMsg string, customVars ...map[string]string) string {
-	res := template
+// FindRule returns the first enabled rule (rules must already be priority-ordered) matching text.
+func FindRule(rules []config.Rule, text string, menuActive bool) (config.Rule, bool) {
+	for _, r := range rules {
+		if r.Enabled && MatchRule(r, text, menuActive) {
+			return r, true
+		}
+	}
+	return config.Rule{}, false
+}
 
-	// Substitute any custom key-value variables first (e.g. from CSV columns or CRM payloads)
-	for _, vars := range customVars {
-		for k, v := range vars {
-			res = strings.ReplaceAll(res, "{{"+k+"}}", v)
-			res = strings.ReplaceAll(res, "{{ "+k+" }}", v)
-			res = strings.ReplaceAll(res, "{"+k+"}", v)
-			// Case-insensitive token replacement
-			lowerK := strings.ToLower(k)
-			if lowerK != k {
-				res = strings.ReplaceAll(res, "{{"+lowerK+"}}", v)
-				res = strings.ReplaceAll(res, "{{ "+lowerK+" }}", v)
-				res = strings.ReplaceAll(res, "{"+lowerK+"}", v)
+// HasMenu reports whether a reply offers numbered options ("1. Services").
+var menuLineRe = regexp.MustCompile(`(?m)^\s*[1-9][.)]\s+\S`)
+
+func HasMenu(reply string) bool { return len(menuLineRe.FindAllString(reply, 2)) >= 2 }
+
+// RuleConflicts lists keywords shared by more than one enabled rule.
+func RuleConflicts(rules []config.Rule) []string {
+	owners := map[string][]string{}
+	for _, r := range rules {
+		if !r.Enabled || r.Type == "regex" {
+			continue
+		}
+		mine := map[string]bool{}
+		for _, kw := range Keywords(r.Pattern) {
+			k := Normalize(kw)
+			if k != "" && !mine[k] {
+				mine[k] = true
+				owners[k] = append(owners[k], r.Name)
 			}
 		}
 	}
-
-	displayName := strings.TrimSpace(senderName)
-	cleanPhoneDigits := regexp.MustCompile(`[^0-9]`).ReplaceAllString(senderPhone, "")
-	cleanNameDigits := regexp.MustCompile(`[^0-9]`).ReplaceAllString(displayName, "")
-
-	// C2: If name is missing, a placeholder, raw phone digits, WhatsApp LID, or non-name, use natural "there" fallback
-	isPhoneOrBlank := displayName == "" || displayName == "-" || displayName == senderPhone || displayName == "+"+senderPhone
-	if !isPhoneOrBlank {
-		lowerName := strings.ToLower(displayName)
-		if (len(cleanNameDigits) >= 7 && cleanNameDigits == cleanPhoneDigits) ||
-			contacts.IsLID(displayName) || contacts.IsLID(cleanNameDigits) ||
-			strings.HasSuffix(lowerName, "@lid") ||
-			(len(cleanNameDigits) >= 7 && cleanNameDigits == displayName) ||
-			lowerName == "there" || lowerName == "customer" || lowerName == "unknown" || lowerName == "null" || lowerName == "undefined" {
-			isPhoneOrBlank = true
+	out := []string{}
+	for k, names := range owners {
+		if len(names) > 1 {
+			out = append(out, fmt.Sprintf("%q is used by %s", k, strings.Join(names, " and ")))
 		}
 	}
-
-	firstName := "there"
-	if !isPhoneOrBlank {
-		parts := strings.Fields(displayName)
-		if len(parts) > 0 {
-			firstName = parts[0]
-		} else {
-			firstName = displayName
-		}
-	} else {
-		displayName = "there"
-	}
-
-	hour := time.Now().Hour()
-	greeting := "Hello"
-	if hour >= 5 && hour < 12 {
-		greeting = "Good morning"
-	} else if hour >= 12 && hour < 17 {
-		greeting = "Good afternoon"
-	} else if hour >= 17 && hour < 22 {
-		greeting = "Good evening"
-	}
-
-	res = reGreeting.ReplaceAllString(res, greeting)
-	res = reName.ReplaceAllString(res, displayName)
-	res = reFirstName.ReplaceAllString(res, firstName)
-	res = reSender.ReplaceAllString(res, displayName)
-	res = reRecipient.ReplaceAllString(res, displayName)
-	res = rePhone.ReplaceAllString(res, senderPhone)
-	res = reTime.ReplaceAllString(res, time.Now().Format("15:04:05"))
-	res = reDate.ReplaceAllString(res, time.Now().Format("2006-01-02"))
-	res = reMessage.ReplaceAllString(res, originalMsg)
-
-	// Clean up formatting artifacts if firstName or name resolved to "there"
-	if isPhoneOrBlank {
-		res = strings.ReplaceAll(res, "*there*", "there")
-		res = strings.ReplaceAll(res, "_there_", "there")
-		res = strings.ReplaceAll(res, ", there", " there")
-		res = strings.ReplaceAll(res, ",  there", " there")
-	}
-
-	// Clean any unrecognized template tokens (D10, C2)
-	res = reRemainingUnknown.ReplaceAllString(res, "")
-	return res
+	sort.Strings(out)
+	return out
 }
 
+// Location returns the configured business time zone.
+func Location(tz string) *time.Location {
+	tz = strings.TrimSpace(tz)
+	if tz == "" || strings.EqualFold(tz, "local") {
+		return time.Local
+	}
+	if l, err := time.LoadLocation(tz); err == nil {
+		return l
+	}
+	return time.Local
+}
+
+func parseClock(s string) (int, bool) {
+	var h, m int
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d:%d", &h, &m); err != nil || h < 0 || h > 24 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
+}
+
+// ValidClock reports whether s is HH:MM.
+func ValidClock(s string) bool { _, ok := parseClock(s); return ok }
+
+// IsOpen reports whether the business is open at now according to the weekly schedule
+// and holiday list. Windows that end before they start run past midnight.
+func IsOpen(bh config.BusinessHoursConfig, now time.Time) bool {
+	if !bh.Enabled {
+		return true
+	}
+	now = now.In(Location(bh.Timezone))
+	holiday := func(t time.Time) bool {
+		day := t.Format("2006-01-02")
+		for _, h := range bh.Holidays {
+			if strings.TrimSpace(h) == day {
+				return true
+			}
+		}
+		return false
+	}
+	// A shift that runs past midnight belongs to the day it started on.
+	todayOff, yesterdayOff := holiday(now), holiday(now.AddDate(0, 0, -1))
+	minute := now.Hour()*60 + now.Minute()
+	dayIdx := (int(now.Weekday()) + 6) % 7 // Monday = 0
+	sched := func(i int) (config.DaySchedule, bool) {
+		want := config.Weekdays[(i+7)%7]
+		for _, d := range bh.Days {
+			if d.Day == want {
+				return d, true
+			}
+		}
+		return config.DaySchedule{}, false
+	}
+	if d, ok := sched(dayIdx); ok && d.Open && !todayOff {
+		s, ok1 := parseClock(d.Start)
+		e, ok2 := parseClock(d.End)
+		if ok1 && ok2 {
+			if s < e && minute >= s && minute < e {
+				return true
+			}
+			if s > e && minute >= s {
+				return true
+			}
+			if s == e {
+				return true
+			}
+		}
+	}
+	if d, ok := sched(dayIdx - 1); ok && d.Open && !yesterdayOff {
+		s, ok1 := parseClock(d.Start)
+		e, ok2 := parseClock(d.End)
+		if ok1 && ok2 && s > e && minute < e {
+			return true
+		}
+	}
+	return false
+}

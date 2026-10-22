@@ -1,530 +1,818 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"runtime"
+	"runtime/debug"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"whatsapp-automation/pkg/ai"
 	"whatsapp-automation/pkg/bot"
 	"whatsapp-automation/pkg/campaign"
-	"whatsapp-automation/pkg/client"
+	"whatsapp-automation/pkg/cloudapi"
 	"whatsapp-automation/pkg/config"
 	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/desktop"
 	"whatsapp-automation/pkg/history"
+	"whatsapp-automation/pkg/msgtemplate"
+	"whatsapp-automation/pkg/notify"
 	"whatsapp-automation/pkg/scheduler"
+	"whatsapp-automation/pkg/securestore"
+	"whatsapp-automation/pkg/security"
 	"whatsapp-automation/pkg/server"
 	"whatsapp-automation/pkg/templates"
+	"whatsapp-automation/pkg/version"
+	"whatsapp-automation/pkg/webhook"
 )
 
-const version = "1.3.0"
-
 func main() {
-	if len(os.Args) < 2 {
-		runApp("config.yaml", "", 0)
-		return
+	cmd := "app"
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] != "" && args[0][0] != '-' {
+		cmd, args = args[0], args[1:]
 	}
+	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "configuration file")
+	session := fs.String("session", "", "separate profile for a second number, for example: sales")
+	port := fs.Int("port", 0, "dashboard port (default 8085)")
+	to := fs.String("to", "", "recipient phone number with country code (send)")
+	msg := fs.String("msg", "", "message text (send)")
+	_ = fs.Parse(args)
+	*cfgPath = resolveConfigPath(fs, *cfgPath)
+	cliPort = *port // every command (stop, send, status...) talks to the copy on this port
 
-	command := os.Args[1]
-
-	switch command {
+	switch cmd {
 	case "app":
-		appFlags := flag.NewFlagSet("app", flag.ExitOnError)
-		cfgPath := appFlags.String("config", "config.yaml", "Path to YAML configuration file")
-		session := appFlags.String("session", "", "Multi-session account profile name (e.g. sales, support)")
-		port := appFlags.Int("port", 0, "Custom HTTP server port (e.g. 8086)")
-		_ = appFlags.Parse(os.Args[2:])
-		runApp(*cfgPath, *session, *port)
-
+		run(*cfgPath, *session, *port, true)
 	case "serve", "server":
-		serveFlags := flag.NewFlagSet("serve", flag.ExitOnError)
-		cfgPath := serveFlags.String("config", "config.yaml", "Path to YAML configuration file")
-		session := serveFlags.String("session", "", "Multi-session account profile name (e.g. sales, support)")
-		port := serveFlags.Int("port", 0, "Custom HTTP server port (e.g. 8086)")
-		_ = serveFlags.Parse(os.Args[2:])
-		runServe(*cfgPath, *session, *port)
-
-
+		run(*cfgPath, *session, *port, false)
+	case "send":
+		if *to == "" || *msg == "" {
+			fmt.Println("Usage: whatsapp-auto send -to +919876543210 -msg \"Hello\"")
+			os.Exit(2)
+		}
+		runSend(*cfgPath, *session, *to, *msg)
+	case "pair":
+		fmt.Printf("%s now uses Meta's official WhatsApp Business API, so there is no phone to pair.\nEnter your own Business API details in the dashboard: Settings > WhatsApp connection.\n", version.Product)
+		os.Exit(2)
+	case "status":
+		runStatus(*cfgPath, *session)
+	case "disconnect", "unlink", "logout":
+		runDisconnect(*cfgPath, *session)
+	case "reset-password":
+		runResetPassword(*cfgPath, *session)
+	case "stop":
+		runStop(*cfgPath, *session)
 	case "shortcut":
 		if err := desktop.EnsureDesktopShortcut(""); err != nil {
-			fmt.Printf("Error creating shortcut: %v\n", err)
+			fmt.Println("Could not create the shortcut:", err)
 			os.Exit(1)
 		}
-		fmt.Println("Desktop shortcut created successfully on your Windows Desktop.")
-
-	case "send":
-		sendFlags := flag.NewFlagSet("send", flag.ExitOnError)
-		cfgPath := sendFlags.String("config", "config.yaml", "Path to configuration file")
-		to := sendFlags.String("to", "", "Recipient phone number with country code (e.g. +14155552671)")
-		msg := sendFlags.String("msg", "", "Message text content")
-		_ = sendFlags.Parse(os.Args[2:])
-
-		if *to == "" || *msg == "" {
-			fmt.Println("Error: both -to and -msg flags are required.")
-			sendFlags.Usage()
-			os.Exit(1)
-		}
-		runSend(*cfgPath, *to, *msg)
-
-	case "broadcast":
-		bFlags := flag.NewFlagSet("broadcast", flag.ExitOnError)
-		cfgPath := bFlags.String("config", "config.yaml", "Path to configuration file")
-		csvFile := bFlags.String("file", "contacts.csv", "Path to contacts CSV file")
-		template := bFlags.String("msg", "Hello {{name}}!", "Message template")
-		minDelay := bFlags.Int("min-delay", 4, "Minimum randomized delay between sends (seconds)")
-		maxDelay := bFlags.Int("max-delay", 10, "Maximum randomized delay between sends (seconds)")
-		_ = bFlags.Parse(os.Args[2:])
-
-		runBroadcast(*cfgPath, *csvFile, *template, *minDelay, *maxDelay)
-
-	case "pair":
-		pairFlags := flag.NewFlagSet("pair", flag.ExitOnError)
-		cfgPath := pairFlags.String("config", "config.yaml", "Path to configuration file")
-		phone := pairFlags.String("phone", "", "Phone number with country code (e.g. 14155552671)")
-		_ = pairFlags.Parse(os.Args[2:])
-
-		if *phone == "" {
-			fmt.Println("Error: -phone flag is required.")
-			pairFlags.Usage()
-			os.Exit(1)
-		}
-		runPair(*cfgPath, *phone)
-
-	case "status":
-		cfgPath := "config.yaml"
-		if len(os.Args) > 2 {
-			cfgPath = os.Args[2]
-		}
-		runStatus(cfgPath)
-
+		fmt.Println("Desktop shortcut created.")
 	case "version", "-v", "--version":
-		fmt.Printf("whatsapp-auto version %s\n", version)
-
+		fmt.Printf("%s %s\n", version.Product, version.Version)
 	case "help", "-h", "--help":
 		printHelp()
-
 	default:
-		fmt.Printf("Unknown command '%s'. Run 'whatsapp-auto help' for usage.\n", command)
-		os.Exit(1)
+		fmt.Printf("Unknown command %q. Run \"whatsapp-auto help\".\n", cmd)
+		os.Exit(2)
 	}
 }
 
-func printHelp() {
-	fmt.Printf(`WhatsApp Automation Tool (Go) v%s
+// configGiven is true when -config was passed explicitly; cliPort holds -port.
+var (
+	configGiven bool
+	cliPort     int
+)
 
-Usage:
-  whatsapp-auto [command] [flags]
-
-Commands:
-  serve       Start the automation bot daemon, web dashboard & REST API (default)
-  send        Send a one-off text message via CLI
-  broadcast   Send bulk personalized messages from a CSV file with anti-ban delays
-  pair        Generate an 8-digit WhatsApp pairing code for a phone number
-  status      Inspect session store and connection status
-  version     Show application version
-  help        Show this help message
-
-Flags for serve:
-  -config string    Path to config.yaml (default "config.yaml")
-
-Flags for send:
-  -to string        Recipient phone number (e.g. +14155552671)
-  -msg string       Text message body
-  -config string    Path to config.yaml (default "config.yaml")
-
-Flags for broadcast:
-  -file string      Contacts CSV file path (default "contacts.csv")
-  -msg string       Message template with {{name}}, {{phone}}, etc.
-  -min-delay int    Min delay in seconds between messages (default 4)
-  -max-delay int    Max delay in seconds between messages (default 10)
-  -config string    Path to config.yaml (default "config.yaml")
-
-Flags for pair:
-  -phone string     Phone number with country code (e.g. 14155552671)
-  -config string    Path to config.yaml (default "config.yaml")
-`, version)
+// sessionConfig gives each extra number (-session sales) its own settings file next to
+// the main one, so two running copies never overwrite each other's settings. The first
+// time, it starts as a copy of the main settings (rules, business details, password);
+// fresh reports that, so the copy's WhatsApp Business API details can be cleared: every
+// profile connects with its own number and token.
+func sessionConfig(mainPath, suffix string) (path string, fresh bool) {
+	if suffix == "" || configGiven {
+		return mainPath, false
+	}
+	p := filepath.Join(filepath.Dir(mainPath), "config"+suffix+".yaml")
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		if data, err := os.ReadFile(mainPath); err == nil {
+			fresh = os.WriteFile(p, data, 0600) == nil
+		}
+	}
+	return p, fresh
 }
 
-func runApp(cfgPath string, sessionName string, customPort int) {
-	runApplication(cfgPath, sessionName, customPort, true)
-}
-
-func runServe(cfgPath string, sessionName string, customPort int) {
-	runApplication(cfgPath, sessionName, customPort, false)
-}
-
-func runApplication(cfgPath string, sessionName string, customPort int, launchDesktopApp bool) {
-	fmt.Println("==================================================")
-	if launchDesktopApp {
-		fmt.Printf("🚀 Starting Web Auto v%s\n", version)
-	} else {
-		fmt.Printf("🤖 Starting Web Auto Server v%s\n", version)
+// resolveConfigPath uses the config.yaml next to the program when none was given and
+// the current folder has none, so commands run from another folder (for example
+// reset-password) change the real settings instead of creating a new, unused file.
+func resolveConfigPath(fs *flag.FlagSet, p string) string {
+	given := false
+	fs.Visit(func(f *flag.Flag) { given = given || f.Name == "config" })
+	configGiven = given
+	if given {
+		return p
 	}
-	fmt.Println("==================================================")
-
-	// Ensure Desktop shortcut exists when running in app mode
-	if launchDesktopApp {
-		_ = desktop.EnsureDesktopShortcut("")
+	if _, err := os.Stat(p); err == nil {
+		return p
 	}
-
-	cfg, err := config.LoadConfig(cfgPath)
-	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
-		os.Exit(1)
-	}
-
-	// C15: Multi-session and environment overrides
-	if sessionName == "" {
-		sessionName = os.Getenv("WA_SESSION_NAME")
-	}
-	if customPort <= 0 {
-		if envPort := os.Getenv("WA_PORT"); envPort != "" {
-			if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
-				customPort = p
+	if exe, err := os.Executable(); err == nil {
+		if next := filepath.Join(filepath.Dir(exe), "config.yaml"); next != p {
+			if _, err := os.Stat(next); err == nil {
+				return next
 			}
 		}
 	}
-	if customPort > 0 {
-		cfg.Server.Port = customPort
-	}
+	return p
+}
 
-	sessionSuffix := ""
-	if sessionName != "" && sessionName != "default" {
-		safeSession := regexp.MustCompile(`[^a-zA-Z0-9_\-]`).ReplaceAllString(sessionName, "")
-		if safeSession != "" {
-			sessionSuffix = "-" + safeSession
-			cfg.WhatsApp.SessionName = safeSession
-			cfg.WhatsApp.DBPath = fmt.Sprintf("whatsapp%s.db", sessionSuffix)
-			fmt.Printf("📱 Multi-Session Profile: %s (DB: %s, Port: %d)\n", safeSession, cfg.WhatsApp.DBPath, cfg.Server.Port)
+func printHelp() {
+	fmt.Printf(`%s %s - %s
+
+Usage: whatsapp-auto [command] [flags]
+
+Commands:
+  app        Start and open the dashboard window (default)
+  serve      Start without opening a window (for running in the background)
+  stop       Close a running Pulse normally (everything is saved first)
+  status     Check the connection to the WhatsApp Business API
+  disconnect Remove this computer's WhatsApp Business API details (token, app secret)
+  send       Send one message from the command line
+  reset-password  Forgot the admin password? Creates a new one-time password
+  shortcut   Create a desktop shortcut
+  version    Show the version
+
+Flags:
+  -config string    configuration file (default "config.yaml")
+  -session string   separate profile for another number, e.g. -session sales
+  -port int         dashboard port (default 8085)
+  -to, -msg         recipient and text for "send"
+
+Data (messages, contacts) is stored, encrypted, in the folder shown at start-up.
+The access token and app secret are stored sealed with your Windows account.
+`, version.Product, version.Version, version.Tagline)
+}
+
+type env struct {
+	cfg     *config.Config
+	dataDir string
+	box     *securestore.Box
+	suffix  string
+	// oldSession lists where versions before 2.0 kept the linked-device WhatsApp
+	// session. Those files are no longer used; the owner can delete them in Settings.
+	oldSession []string
+}
+
+// oldSessionFiles returns the places a linked-device version may have left its session
+// database for this profile: the data folder and, from older versions still, the folder
+// of the settings file. Nothing here is opened or changed automatically.
+func oldSessionFiles(dataDir, cfgDir, suffix string) []string {
+	var out []string
+	for _, dir := range []string{dataDir, cfgDir} {
+		base := filepath.Join(dir, "whatsapp"+suffix+".db")
+		for _, ext := range []string{"", "-wal", "-shm", ".sealed", ".sealed.bak", ".tmp"} {
+			out = append(out, base+ext)
 		}
 	}
+	return out
+}
 
-	contactsFile := fmt.Sprintf("contacts%s.json", sessionSuffix)
-	templatesFile := fmt.Sprintf("templates%s.json", sessionSuffix)
-	messagesFile := fmt.Sprintf("messages%s.json", sessionSuffix)
-	scheduledFile := fmt.Sprintf("scheduled%s.json", sessionSuffix)
+var sessionRe = regexp.MustCompile(`[^a-zA-Z0-9_\-]`)
 
-	genPass, isNew := cfg.EnsureAdminPassword()
-	if isNew {
-		fmt.Println()
-		fmt.Println("==========================================================================")
-		fmt.Println("  [SECURITY NOTICE] FIRST-TIME RUN: MASTER PASSWORD GENERATED")
-		fmt.Println("==========================================================================")
-		fmt.Println("  No master password was configured in config.yaml.")
-		fmt.Println("  A secure random password has been generated for your first login:")
-		fmt.Println()
-		fmt.Printf("      Master Password:   %s\n", genPass)
-		fmt.Println()
-		fmt.Printf("  >> Web Dashboard:      http://%s:%d/login\n", cfg.Server.Host, cfg.Server.Port)
-		fmt.Println("  >> You will be prompted to set your permanent password on first login.")
-		fmt.Println("==========================================================================")
-		fmt.Println()
-	} else if cfg.Server.MustChangePassword {
-		fmt.Println()
-		fmt.Println("[SECURITY NOTICE] Master password change is required upon login.")
-		fmt.Printf(">> Dashboard Login: http://%s:%d/login\n", cfg.Server.Host, cfg.Server.Port)
-		fmt.Println()
+func defaultDataDir(suffix string) string {
+	if d := os.Getenv("PULSE_DATA_DIR"); d != "" {
+		return d
 	}
+	base, err := os.UserConfigDir()
+	if err != nil || base == "" {
+		base = "."
+	}
+	return filepath.Join(base, version.Product+suffix)
+}
 
-	waClient, err := client.NewWhatsAppClient(cfg)
+// setup loads the configuration and opens the data folder. Data files from older
+// versions are looked for next to the configuration file (never the current directory)
+// and are only moved when migrate is true and no other copy of the app is running.
+func setup(cfgPath, session string, port int, migrate bool) env {
+	absCfg, err := filepath.Abs(cfgPath)
 	if err != nil {
-		fmt.Printf("Error initializing WhatsApp client: %v\n", err)
-		os.Exit(1)
+		fail("Invalid configuration path %s: %v", cfgPath, err)
 	}
-
-	// Initialize contact, template, and history stores
-	contactStore, err := contacts.NewStore(contactsFile)
+	baseDir := filepath.Dir(absCfg)
+	if session == "" {
+		session = os.Getenv("WA_SESSION_NAME")
+	}
+	if port <= 0 {
+		port = cliPort
+	}
+	if port <= 0 {
+		port, _ = strconv.Atoi(os.Getenv("WA_PORT"))
+	}
+	suffix := ""
+	if s := sessionRe.ReplaceAllString(session, ""); s != "" && s != "default" {
+		suffix = "-" + s
+	}
+	absCfg, fresh := sessionConfig(absCfg, suffix)
+	cfg, err := config.LoadConfig(absCfg)
 	if err != nil {
-		fmt.Printf("Warning: contacts store error: %v\n", err)
+		fail("Could not load the configuration: %v", err)
 	}
+	if fresh {
+		_ = cfg.Update(func(c *config.Config) error {
+			c.CloudAPI = config.CloudAPIConfig{}
+			c.Automation.Enabled = false
+			c.Setup.WebhookSeenAt, c.Setup.TestMessageSentAt = nil, nil
+			return nil
+		})
+	}
+	snap := cfg.Snapshot()
+	dataDir := snap.Storage.DataDir
+	if dataDir == "" {
+		dataDir = defaultDataDir(suffix)
+	} else if suffix != "" {
+		dataDir = filepath.Join(dataDir, suffix[1:])
+	}
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		fail("Could not create the data folder %s: %v", dataDir, err)
+	}
+	securestore.RestrictToUser(dataDir)
 
-	templateStore, err := templates.NewStore(templatesFile)
+	effPort := snap.Server.Port
+	if port > 0 {
+		effPort = port
+	}
+	if migrate && portInUse("127.0.0.1", effPort) {
+		migrate = false // another copy (possibly an older version) is using these files
+	}
+	backupDir := filepath.Join(dataDir, "old-version-backup", time.Now().Format("20060102-150405"))
+	cfg.SetRuntime(effPort)
+
+	var box *securestore.Box
+	if snap.Storage.Encrypt {
+		box, err = securestore.OpenBox(dataDir)
+		if err != nil {
+			fail("%v", err)
+		}
+	}
+	securestore.SetDefault(box)
+	e := env{cfg: cfg, dataDir: dataDir, box: box, suffix: suffix, oldSession: oldSessionFiles(dataDir, baseDir, suffix)}
+	if migrate {
+		for _, name := range []string{"contacts", "messages", "scheduled", "templates"} {
+			e.migrateJSON(filepath.Join(baseDir, name+suffix+".json"), e.path(name), backupDir)
+		}
+	}
+	return e
+}
+
+func (e env) path(name string) string { return filepath.Join(e.dataDir, name+".json") }
+
+// migrateJSON copies a plaintext data file from an older version into the data folder,
+// encrypted. Once the copy reads back correctly, the plaintext originals are moved into
+// backupDir (inside the protected data folder) rather than deleted.
+func (e env) migrateJSON(legacy, target, backupDir string) {
+	data, err := os.ReadFile(legacy)
+	if err != nil || len(bytes.TrimSpace(data)) == 0 {
+		return
+	}
+	if _, err := os.Stat(target); err == nil {
+		fmt.Printf("[Data] %s was not imported because the data folder already has newer data. It was left where it is.\n", legacy)
+		return
+	}
+	if err := e.box.WriteFile(target, data); err != nil {
+		fmt.Printf("[Data] Could not import %s: %v. The original was kept.\n", legacy, err)
+		return
+	}
+	back, err := e.box.ReadFile(target)
+	if err != nil || !bytes.Equal(back, data) {
+		_ = os.Remove(target)
+		fmt.Printf("[Data] Import check for %s failed. The original was kept.\n", legacy)
+		return
+	}
+	_ = os.Remove(target + ".bak")
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		fmt.Printf("[Data] Imported %s; the original stays in place (%v).\n", legacy, err)
+		return
+	}
+	for _, p := range []string{legacy, legacy + ".bak"} {
+		if _, err := os.Stat(p); err == nil {
+			dst := filepath.Join(backupDir, filepath.Base(p))
+			if err := moveFile(p, dst); err != nil {
+				fmt.Printf("[Data] Could not move %s into the backup folder: %v\n", p, err)
+			}
+		}
+	}
+	fmt.Printf("[Data] Imported %s. The unencrypted original is in %s; delete it once you have checked your data.\n", filepath.Base(legacy), backupDir)
+}
+
+// moveFile renames src to dst, falling back to a verified copy across volumes.
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	data, err := os.ReadFile(src)
 	if err != nil {
-		fmt.Printf("Warning: template store error: %v\n", err)
+		return err
 	}
+	if err := os.WriteFile(dst, data, 0600); err != nil {
+		return err
+	}
+	if back, err := os.ReadFile(dst); err != nil || !bytes.Equal(back, data) {
+		return errors.New("copy could not be verified; original kept")
+	}
+	return os.Remove(src)
+}
 
-	histStore, err := history.NewStore(messagesFile, 2000)
+// failCleanups run, newest first, before fail exits, because os.Exit skips deferred
+// calls: the data is saved first (F10).
+var (
+	failMu       sync.Mutex
+	failCleanups []func()
+)
+
+func atFail(f func()) {
+	failMu.Lock()
+	failCleanups = append(failCleanups, f)
+	failMu.Unlock()
+}
+
+func runFailCleanups() {
+	failMu.Lock()
+	fs := failCleanups
+	failCleanups = nil
+	failMu.Unlock()
+	for i := len(fs) - 1; i >= 0; i-- {
+		fs[i]()
+	}
+}
+
+func fail(format string, a ...any) {
+	runFailCleanups()
+	fmt.Printf("Error: "+format+"\n", a...)
+	if runtime.GOOS == "windows" && isTerminal() {
+		fmt.Println("Press Enter to close.")
+		_, _ = fmt.Scanln()
+	}
+	os.Exit(1)
+}
+
+func isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func announcePassword(e env, pass string) {
+	notice := filepath.Join(e.dataDir, server.FirstRunNoticeName)
+	snap := e.cfg.Snapshot()
+	body := fmt.Sprintf("%s one-time password: %s\r\n\r\nOpen http://127.0.0.1:%d and sign in with it. You will then choose your own password and this file is deleted.\r\n", version.Product, pass, snap.ListenPort())
+	_ = os.WriteFile(notice, []byte(body), 0600)
+	fmt.Println()
+	fmt.Println("==================================================================")
+	fmt.Println(" FIRST START: sign in with a one-time password")
+	if isTerminal() {
+		fmt.Printf(" One-time password:  %s\n", pass)
+	}
+	fmt.Printf(" It is also saved in: %s\n", notice)
+	fmt.Printf(" Dashboard:          http://127.0.0.1:%d\n", snap.ListenPort())
+	fmt.Println("==================================================================")
+	fmt.Println()
+}
+
+func portInUse(host string, port int) bool {
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 500*time.Millisecond)
 	if err != nil {
-		fmt.Printf("Warning: history store error: %v\n", err)
+		return false
+	}
+	c.Close()
+	return true
+}
+
+func run(cfgPath, session string, port int, window bool) {
+	fmt.Printf("%s %s starting...\n", version.Product, version.Version)
+	e := setup(cfgPath, session, port, true)
+	snap := e.cfg.Snapshot()
+	url := fmt.Sprintf("http://127.0.0.1:%d", snap.ListenPort())
+	if portInUse("127.0.0.1", snap.ListenPort()) {
+		fmt.Printf("%s is already running at %s.\n", version.Product, url)
+		if window {
+			_, _ = desktop.LaunchAppWindow(url)
+		}
+		return
+	}
+	if snap.Server.Host != "127.0.0.1" && snap.Server.Host != "localhost" && snap.Server.Host != "::1" {
+		fmt.Printf("[Security] The dashboard listens on %s, so other devices on the network can reach the sign-in page. Use 127.0.0.1 unless you need remote access.\n", snap.Server.Host)
+	}
+	fmt.Printf("[Data] Folder: %s (encrypted: %v)\n", e.dataDir, e.box != nil)
+
+	security.OpenAuditLog(e.path("audit"), e.box)
+	// A crash (rather than a normal stop) writes its details here, so the cause of an
+	// unexplained stop can be found (D26).
+	if f, err := os.OpenFile(filepath.Join(e.dataDir, "crash.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+		_ = debug.SetCrashOutput(f, debug.CrashOptions{})
+		f.Close()
+	}
+	security.LogAudit("APP_STARTED", "local", "system", version.Product+" "+version.Version+" started", "success")
+	if pass, isNew := e.cfg.EnsureAdminPassword(); isNew {
+		announcePassword(e, pass)
 	}
 
-	// Initialize AI smart reply engine
-	aiEngine := ai.NewEngine(ai.Config{
-		Enabled:      cfg.AI.Enabled,
-		APIKey:       cfg.AI.APIKey,
-		Model:        cfg.AI.Model,
-		SystemPrompt: cfg.AI.SystemPrompt,
+	wa := newCloud(e.cfg)
+	atFail(wa.Stop)
+	cs, err := contacts.NewStore(e.path("contacts"))
+	if err != nil {
+		fail("%v", err)
+	}
+	ts, err := templates.NewStore(e.path("templates"))
+	if err != nil {
+		fail("%v", err)
+	}
+	hs, err := history.NewStore(e.path("messages"), snap.Storage.MaxMessages)
+	if err != nil {
+		fail("%v", err)
+	}
+	hooks := webhook.New(e.cfg, e.path("webhook-failed"))
+	hooks.Start()
+	notifier := notify.NewDesktop(func() bool { return e.cfg.Snapshot().Notifications.Desktop })
+
+	runner, err := campaign.NewRunner(e.path("campaigns"), wa, e.cfg, cs, hs)
+	if err != nil {
+		fail("%v", err)
+	}
+	sched, err := scheduler.NewScheduler(e.path("scheduled"), wa, e.cfg, cs, hs)
+	if err != nil {
+		fail("%v", err)
+	}
+
+	wa.OnReceipt(func(r cloudapi.Receipt) {
+		if r.Status == "failed" {
+			hs.MarkFailed(r.MessageID, r.Error)
+			runner.OnFailed(r.MessageID, r.Error)
+			return
+		}
+		hs.UpdateStatus(r.MessageID, r.Status)
+		runner.OnReceipt([]string{r.MessageID}, r.Status)
+	})
+	hs.OnRecord(func(m history.MessageRecord) {
+		if m.Direction == history.DirectionIncoming && !m.Imported {
+			runner.OnIncoming(m.Phone, m.Timestamp)
+		}
+	})
+	engine := bot.NewEngine(wa, e.cfg, cs, hs, hooks, notifier)
+	wa.OnMessage(func(m cloudapi.Message) {
+		engine.Receive(bot.Incoming{ID: m.ID, Phone: m.From, PushName: m.Name, Text: m.Text, Media: m.Media, SentAt: m.Timestamp})
 	})
 
-	// Initialize message scheduler
-	msgScheduler, err := scheduler.NewScheduler(scheduledFile, waClient, contactStore, histStore)
-	if err != nil {
-		fmt.Printf("Warning: scheduler store error: %v\n", err)
-	}
-
-	// Context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	sched.Start(ctx)
 
-	if msgScheduler != nil {
-		msgScheduler.Start(ctx)
+	quitCh := make(chan struct{})
+	var quitOnce sync.Once
+	control := security.RandomToken(24)
+	if err := os.WriteFile(filepath.Join(e.dataDir, controlFile), []byte(control), 0600); err != nil {
+		fmt.Printf("[Data] The stop command will not work: %v\n", err)
+	}
+	defer os.Remove(filepath.Join(e.dataDir, controlFile))
+	srv := server.New(server.Deps{Config: e.cfg, Client: wa, Contacts: cs, Templates: ts, History: hs, Scheduler: sched, Campaigns: runner, Engine: engine, Hooks: hooks, Alerts: notifier,
+		Quit: func() { quitOnce.Do(func() { close(quitCh) }) }, ControlToken: control, DataDir: e.dataDir, Encrypted: e.box != nil, OldSessionFiles: e.oldSession})
+
+	go retention(ctx, e.cfg, hs)
+	go srv.RunAutoBackups(ctx)
+
+	wa.Start(ctx)
+	if snap.CloudAPI.Ready() {
+		fmt.Printf("[WhatsApp] Business API number ID %s. Incoming messages arrive at %s\n", snap.CloudAPI.PhoneNumberID, orNotSet(snap.CloudAPI.WebhookURL()))
+	} else {
+		fmt.Println("[WhatsApp] Not connected yet: enter your WhatsApp Business API details in Settings > WhatsApp connection.")
 	}
 
-	// Initialize bot engine
-	engine := bot.NewEngine(waClient, cfg, contactStore, histStore, aiEngine)
-	engine.Start()
-
-	// Initialize HTTP server
-	httpSrv := server.NewServer(cfg, waClient, contactStore, templateStore, histStore, msgScheduler, aiEngine)
-	httpSrv.SetBotEngine(engine)
-
-	// Connect WhatsApp client
-	if err := waClient.Start(ctx); err != nil {
-		fmt.Printf("Error starting WhatsApp client: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Note: User contacts and CRM history are preserved across restarts and unlinked states
-
-
-	// Background migration: resolve any historical messages or contacts with LIDs to real phone numbers
+	errCh := make(chan error, 1)
 	go func() {
-		time.Sleep(2 * time.Second)
-		resolver := func(target string) string {
-			return waClient.ResolveString(context.Background(), target)
-		}
-		nameResolver := func(target string) string {
-			return waClient.GetContactName(context.Background(), target)
-		}
-		if histStore != nil {
-			histStore.FixPhoneNumbers(resolver, nameResolver)
-		}
-		if contactStore != nil {
-			contactStore.FixPhoneNumbers(resolver, nameResolver)
+		// If the dashboard stops on its own after running fine (D26), start it again
+		// instead of shutting Pulse down; only a failure at start-up ends the app.
+		for attempt := 0; ; attempt++ {
+			started := time.Now()
+			err := srv.Start()
+			if err == nil || time.Since(started) < 10*time.Second || attempt >= 5 {
+				errCh <- err
+				return
+			}
+			security.LogAudit("DASHBOARD_RESTARTED", "local", "system", "The dashboard stopped unexpectedly and was restarted: "+err.Error(), "warning")
+			time.Sleep(2 * time.Second)
 		}
 	}()
-
-	// Start HTTP server in background
-	go func() {
-		if err := httpSrv.Start(); err != nil {
-			fmt.Printf("HTTP server error: %v\n", err)
-		}
-	}()
-
-	// Listen for termination signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// If launchDesktopApp is requested, wait for server and open native standalone window
-	if launchDesktopApp {
+	fmt.Printf("[Dashboard] %s\n", url)
+	if window {
 		go func() {
-			appURL := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port)
-			if desktop.WaitForServer(appURL+"/login", 10*time.Second) {
-				fmt.Printf("[Desktop App] Opening application window: %s\n", appURL)
-				_, err := desktop.LaunchAppWindow(appURL)
-				if err != nil {
-					fmt.Printf("[Desktop App] Note: %v. You can open %s directly in your browser.\n", err, appURL)
+			if desktop.WaitForServer(url+"/login", 10*time.Second) {
+				if _, err := desktop.LaunchAppWindow(url); err != nil {
+					fmt.Printf("Open %s in your browser.\n", url)
 				}
 			}
 		}()
 	}
 
-	if launchDesktopApp {
-		fmt.Println("[System] Application running. Press Ctrl+C in this console to stop.")
-	} else {
-		fmt.Println("[System] Automation server running. Press Ctrl+C in this console to stop.")
-	}
-	<-sigChan
-
-	fmt.Println("\n[System] Graceful shutdown initiated...")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-
-	if msgScheduler != nil {
-		msgScheduler.Stop()
-	}
-	_ = httpSrv.Stop(shutdownCtx)
-	waClient.Stop()
-	fmt.Println("[System] Shutdown complete.")
-}
-
-func runSend(cfgPath, to, msg string) {
-	cfg, err := config.LoadConfig(cfgPath)
-	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
-		os.Exit(1)
-	}
-
-	waClient, err := client.NewWhatsAppClient(cfg)
-	if err != nil {
-		fmt.Printf("Error initializing WhatsApp client: %v\n", err)
-		os.Exit(1)
-	}
-	defer waClient.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := waClient.Start(ctx); err != nil {
-		fmt.Printf("Error connecting: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Wait up to 5 seconds for connection
-	for i := 0; i < 10; i++ {
-		st := waClient.GetStatus()
-		if st.Connected {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	msgID, err := waClient.SendTextMessage(ctx, to, msg)
-	if err != nil {
-		fmt.Printf("❌ Failed to send message to %s: %v\n", to, err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("✅ Message dispatched successfully to %s! ID: %s\n", to, msgID)
-}
-
-func runBroadcast(cfgPath, csvFile, template string, minDelay, maxDelay int) {
-	cfg, err := config.LoadConfig(cfgPath)
-	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
-		os.Exit(1)
-	}
-
-	contacts, err := campaign.LoadContactsFromCSV(csvFile)
-	if err != nil {
-		fmt.Printf("Error loading contacts from %s: %v\n", csvFile, err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Loaded %d contacts from %s\n", len(contacts), csvFile)
-
-	waClient, err := client.NewWhatsAppClient(cfg)
-	if err != nil {
-		fmt.Printf("Error initializing WhatsApp client: %v\n", err)
-		os.Exit(1)
-	}
-	defer waClient.Stop()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		fmt.Println("\n[Broadcast] Cancellation received, stopping broadcast...")
-		cancel()
-	}()
-
-	if err := waClient.Start(ctx); err != nil {
-		fmt.Printf("Error connecting: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Wait for connection
-	for i := 0; i < 10; i++ {
-		st := waClient.GetStatus()
-		if st.Connected {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	bCfg := campaign.BroadcastConfig{
-		MinDelaySeconds: minDelay,
-		MaxDelaySeconds: maxDelay,
-		BatchSize:       20,
-		BatchPauseSec:   30,
-	}
-
-	broadcaster := campaign.NewBroadcaster(waClient)
-	result := broadcaster.RunBroadcast(ctx, contacts, template, bCfg, func(curr, total, succ, fail int, phone string, err error) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	fmt.Println("Running. Press Ctrl+C to stop.")
+	reason := ""
+	select {
+	case <-quitCh:
+		reason = "Stopped with the stop command"
+	case s := <-sig:
+		// Ctrl+C, closing this window, signing out of Windows or shutting down.
+		reason = "Stopped by Windows or the user (" + s.String() + ")"
+	case err := <-errCh:
+		reason = "The dashboard stopped"
 		if err != nil {
-			fmt.Printf("[%d/%d] ❌ %s: %v\n", curr, total, phone, err)
-		} else {
-			fmt.Printf("[%d/%d] ✅ %s\n", curr, total, phone)
+			var opErr *net.OpError
+			if errors.As(err, &opErr) {
+				fmt.Printf("The dashboard could not start on port %d: %v\n", snap.ListenPort(), err)
+			} else {
+				fmt.Printf("Server error: %v\n", err)
+			}
+			reason += ": " + err.Error()
 		}
-	})
+	}
+	// Recorded so an unexpected stop can be explained afterwards (Settings > Account > Activity log).
+	security.LogAudit("APP_STOPPED", "local", "system", reason, "success")
 
-	fmt.Println("\n================ Broadcast Summary ================")
-	fmt.Printf("Total Contacts: %d\n", result.TotalContacts)
-	fmt.Printf("Successfully Sent: %d\n", result.SuccessCount)
-	fmt.Printf("Failed: %d\n", result.FailureCount)
-	fmt.Printf("Duration: %v\n", result.Duration)
-	fmt.Println("===================================================")
+	fmt.Println("Stopping...")
+	shut, done := context.WithTimeout(context.Background(), 8*time.Second)
+	defer done()
+	_ = srv.Stop(shut)
+	sched.Stop()
+	runner.CancelAll("Pulse was stopped. Press Resume to continue.")
+	// Messages already received are handled (at least stored, with opt-outs applied)
+	// before the final save (F16); the webhook stopped with the dashboard above.
+	drain, drained := context.WithTimeout(context.Background(), 5*time.Second)
+	engine.Stop(drain)
+	drained()
+	wa.Stop()
+	hooks.Stop()
+	cancel()
+	for _, f := range []func() error{cs.Flush, hs.Flush, runner.Flush} {
+		if err := f(); err != nil {
+			fmt.Printf("[Data] Save failed: %v\n", err)
+		}
+	}
+	security.FlushAuditLog()
+	fmt.Println("Stopped.")
 }
 
-func runPair(cfgPath, phone string) {
-	cfg, err := config.LoadConfig(cfgPath)
-	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
-		os.Exit(1)
+func orNotSet(s string) string {
+	if s == "" {
+		return "(not set: add the public address in Settings > WhatsApp connection)"
 	}
+	return s
+}
 
-	cfg.WhatsApp.PairPhone = phone
-
-	waClient, err := client.NewWhatsAppClient(cfg)
-	if err != nil {
-		fmt.Printf("Error initializing WhatsApp client: %v\n", err)
-		os.Exit(1)
+// retention deletes old messages once a day according to the storage settings.
+func retention(ctx context.Context, cfg *config.Config, hs *history.Store) {
+	t := time.NewTimer(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		st := cfg.Snapshot().Storage
+		hs.SetMaxItems(st.MaxMessages)
+		if st.RetentionDays > 0 {
+			if n := hs.PurgeOlderThan(st.RetentionDays); n > 0 {
+				security.LogAudit("RETENTION", "local", "system", fmt.Sprintf("Deleted %d messages older than %d days", n, st.RetentionDays), "success")
+			}
+		}
+		t.Reset(24 * time.Hour)
 	}
-	defer waClient.Stop()
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func runSend(cfgPath, session, to, text string) {
+	e := setup(cfgPath, session, 0, false)
+	snap := e.cfg.Snapshot()
+	if portInUse("127.0.0.1", snap.ListenPort()) {
+		fail("%s is running. Send the message from the dashboard instead (the data files can only be used by one program).", version.Product)
+	}
+	cs, err := contacts.NewStore(e.path("contacts"))
+	if err != nil {
+		fail("%v", err)
+	}
+	hs, err := history.NewStore(e.path("messages"), snap.Storage.MaxMessages)
+	if err != nil {
+		fail("%v", err)
+	}
+	security.OpenAuditLog(e.path("audit"), e.box)
+	save := func() {
+		for _, f := range []func() error{cs.Flush, hs.Flush} {
+			if err := f(); err != nil {
+				fmt.Printf("[Data] Save failed: %v\n", err)
+			}
+		}
+		security.FlushAuditLog()
+	}
+	atFail(save)
+	phone := contacts.CleanPhone(to)
+	if len(phone) < 7 || len(phone) > 15 {
+		fail("Enter a valid phone number with country code, for example +919876543210.")
+	}
+	// The same rules as every other way of sending: opt-out, blocked numbers, test mode,
+	// the 24-hour window, the daily limit and practice mode.
+	var ct contacts.Contact
+	if c, ok := cs.Get(phone); ok {
+		ct, phone = *c, c.Phone
+	}
+	a := snap.Automation
+	switch {
+	case ct.IsDND:
+		fail("This customer opted out of messages.")
+	case containsPhone(a.BlacklistPhones, phone):
+		fail("This number is on the blocked list (Settings > Safety).")
+	case a.AllowListOnly && !containsPhone(a.AllowList, phone):
+		fail("Test mode is on: messages can only go to the test numbers in Settings > Safety.")
+	case campaign.NeedsTemplate(&ct, time.Now()):
+		fail("%s", campaign.OutsideWindowMessage)
+	case campaign.DailyRemaining(snap, hs, time.Now()) <= 0:
+		fail("Today's sending limit has been reached.")
+	}
+	rendered, missing := msgtemplate.Render(text, msgtemplate.Vars{Name: ct.Name, Phone: phone, Business: snap.Business, Extra: map[string]string{"email": ct.Email, "notes": ct.Notes}})
+	if len(missing) > 0 {
+		fail("%v", msgtemplate.MissingError(missing))
+	}
+	rec := history.MessageRecord{Direction: history.DirectionOutgoing, Type: history.TypeDirectSend, Phone: phone, Text: rendered, SentBy: "command line"}
+	if a.DryRun {
+		rec.ID, rec.Status = "dry_"+security.RandomToken(6), history.StatusDryRun
+		hs.Record(rec)
+		save()
+		fmt.Println("Practice mode is on: the message was recorded but not sent.")
+		return
+	}
+	defer save()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
-	if err := waClient.Start(ctx); err != nil {
-		fmt.Printf("Error starting client: %v\n", err)
-		os.Exit(1)
+	id, err := newCloud(e.cfg).SendTextMessage(ctx, phone, rendered)
+	if err != nil {
+		fail("%v", err)
 	}
-
-	// Wait for pair code
-	for i := 0; i < 30; i++ {
-		st := waClient.GetStatus()
-		if st.PairCode != "" {
-			fmt.Printf("\n>>> Pairing Code: %s <<<\n", st.PairCode)
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
+	// Recorded so it shows in the inbox and counts towards the daily limit.
+	rec.ID, rec.Status, rec.Phone = id, history.StatusSent, phone
+	hs.Record(rec)
+	cs.Upsert(phone, "", "manual")
+	cs.UpdateLastContacted(phone)
+	fmt.Println("Sent. Message ID:", id)
 }
 
-func runStatus(cfgPath string) {
-	cfg, err := config.LoadConfig(cfgPath)
-	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
-		os.Exit(1)
+func containsPhone(list []string, phone string) bool {
+	for _, p := range list {
+		if c := contacts.CleanPhone(p); c != "" && c == phone {
+			return true
+		}
 	}
+	return false
+}
 
-	waClient, err := client.NewWhatsAppClient(cfg)
-	if err != nil {
-		fmt.Printf("Error reading store: %v\n", err)
-		os.Exit(1)
+func runStatus(cfgPath, session string) {
+	e := setup(cfgPath, session, 0, false)
+	snap := e.cfg.Snapshot()
+	ca := snap.CloudAPI
+	fmt.Printf("%s %s\nData folder: %s\n", version.Product, version.Version, e.dataDir)
+	if !ca.Ready() {
+		fmt.Println("WhatsApp Business API: not set up. Enter your details in Settings > WhatsApp connection.")
+	} else {
+		fmt.Printf("Phone number ID: %s\nIncoming messages arrive at: %s\n", ca.PhoneNumberID, orNotSet(ca.WebhookURL()))
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		st, err := newCloud(e.cfg).Check(ctx)
+		cancel()
+		if err != nil {
+			fmt.Println("Connection check: " + err.Error())
+		} else {
+			fmt.Printf("Connected: %s (%s), quality rating %s\n", st.DisplayPhone, st.VerifiedName, st.QualityRating)
+		}
 	}
-	defer waClient.Stop()
+	fmt.Printf("Auto-reply rules: %d\n", len(e.cfg.GetRules()))
+}
 
-	status := waClient.GetStatus()
-	fmt.Println("WhatsApp Automation Session Status:")
-	fmt.Printf("• Database Path: %s\n", cfg.WhatsApp.DBPath)
-	fmt.Printf("• Logged In:     %t\n", status.LoggedIn)
-	if status.JID != "" {
-		fmt.Printf("• Account JID:   %s\n", status.JID)
-		fmt.Printf("• Phone Number:  %s\n", status.Phone)
+const controlFile = "control.token"
+
+// runStop asks a running Pulse to close normally, so its data is saved and the
+// session file encrypted (used by the stop/uninstall scripts instead of killing it).
+func runStop(cfgPath, session string) {
+	e := setup(cfgPath, session, 0, false)
+	port := e.cfg.Snapshot().ListenPort()
+	if !portInUse("127.0.0.1", port) {
+		fmt.Printf("%s is not running.\n", version.Product)
+		return
 	}
-	if status.PushName != "" {
-		fmt.Printf("• Push Name:     %s\n", status.PushName)
+	token, err := os.ReadFile(filepath.Join(e.dataDir, controlFile))
+	if err != nil {
+		fail("Could not find the running copy's stop key (%v). Close its window instead.", err)
 	}
-	fmt.Printf("• Rules Configured: %d\n", len(cfg.GetRules()))
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/control/quit", port), nil)
+	req.Header.Set("X-Pulse-Control", strings.TrimSpace(string(token)))
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		fail("Could not reach %s: %v", version.Product, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fail("%s refused the stop request (HTTP %d). Close its window instead.", version.Product, resp.StatusCode)
+	}
+	for i := 0; i < 30 && portInUse("127.0.0.1", port); i++ {
+		time.Sleep(500 * time.Millisecond)
+	}
+	time.Sleep(2 * time.Second) // final save and encryption run after the dashboard closes
+	fmt.Printf("%s was closed normally. Everything was saved.\n", version.Product)
+}
+
+func runResetPassword(cfgPath, session string) {
+	e := setup(cfgPath, session, 0, false)
+	if portInUse("127.0.0.1", e.cfg.Snapshot().ListenPort()) {
+		fail("%s is running. Close it first (Ctrl+C in its window), then run this again.", version.Product)
+	}
+	if !isTerminal() {
+		fail("Run this from Reset-Password.bat or a command window.")
+	}
+	security.OpenAuditLog(e.path("audit"), e.box)
+	// Being signed in to Windows is not enough to take over Pulse: the reset must run
+	// with Windows administrator rights. (The business number cannot send a code to
+	// itself through the official API, so there is no phone check any more.)
+	if !isElevated() {
+		fail("Resetting the admin password needs Windows administrator rights.\nClose this window, right-click Reset-Password.bat and choose \"Run as administrator\".")
+	}
+	proof := "run as Windows administrator"
+	pass, err := e.cfg.ResetAdminPassword()
+	if err != nil {
+		fail("%v", err)
+	}
+	security.LogAudit("PASSWORD_RESET", "local", "admin", "Admin password reset with the reset tool ("+proof+")", "warning")
+	security.FlushAuditLog()
+	announcePassword(e, pass)
+	fmt.Println("Messages, contacts and the WhatsApp connection were not changed. Start the app and sign in with this password.")
+}
+
+// runDisconnect removes this computer's WhatsApp Business API details (number ID,
+// access token, app secret) after the owner confirms. Messages and contacts are kept.
+func runDisconnect(cfgPath, session string) {
+	e := setup(cfgPath, session, 0, false)
+	if portInUse("127.0.0.1", e.cfg.Snapshot().ListenPort()) {
+		fail("%s is running. Disconnect from the dashboard (Settings > WhatsApp connection) instead.", version.Product)
+	}
+	if !e.cfg.Snapshot().CloudAPI.Ready() {
+		fmt.Println("No WhatsApp Business API details are saved. Nothing to do.")
+		return
+	}
+	if !isTerminal() {
+		fail("Run this from Run-Unlink.bat or a command window, so you can confirm it.")
+	}
+	fmt.Print("This removes the access token and app secret from this computer. Pulse stops sending and receiving until you enter them again.\nType YES and press Enter to continue: ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if strings.TrimSpace(line) != "YES" {
+		fmt.Println("Nothing was changed.")
+		return
+	}
+	if err := e.cfg.ClearCloudCredentials(); err != nil {
+		fail("%v", err)
+	}
+	security.OpenAuditLog(e.path("audit"), e.box)
+	security.LogAudit("DISCONNECT", "local", "admin", "WhatsApp Business API details removed with the disconnect command", "success")
+	security.FlushAuditLog()
+	fmt.Println("Disconnected. Messages and contacts were kept; delete them in the dashboard if you need to.")
+}
+
+// newCloud creates the WhatsApp Business API client. PULSE_GRAPH_BASE_URL points it at
+// a stand-in Graph API on this computer for automated tests; only loopback addresses
+// are accepted, so the access token can never be sent anywhere but Meta or this PC.
+func newCloud(cfg *config.Config) *cloudapi.Client {
+	c := cloudapi.New(cfg)
+	if u := os.Getenv("PULSE_GRAPH_BASE_URL"); u != "" {
+		if loopbackURL(u) {
+			c.BaseURL = u
+		} else {
+			fmt.Println("[WhatsApp] PULSE_GRAPH_BASE_URL ignored: only http://127.0.0.1 addresses are allowed.")
+		}
+	}
+	return c
+}
+
+func loopbackURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && ip.IsLoopback()
 }

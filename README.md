@@ -1,58 +1,60 @@
-# Pulse WhatsApp Automation Platform (Go)
+# Pulse - messaging automation for small businesses
 
-A high-performance, enterprise-grade autonomous **WhatsApp Automation Platform** built with **Go (Golang)** and [whatsmeow](https://github.com/tulir/whatsmeow) (WhatsApp Multi-Device Web Protocol).
+Pulse is a single Windows program (also builds for macOS and Linux) that connects to **Meta's official WhatsApp Business Platform (Cloud API)** with your own Meta account and number, answers common questions automatically, hands chats to a person on request, and gives staff a shared inbox, contacts, templates, scheduled messages and opt-in campaigns.
 
-It allows organizations to automate customer support, notifications, and interactive chat workflows **without Meta Cloud API fees, per-conversation surcharges, or approval bottlenecks**.
+Every install uses its owner's own Meta app, phone number ID and access token; nothing is routed through anyone else. Version 2.0 removed the old linked-device (WhatsApp Web style) connection: the official platform is the way WhatsApp's terms allow businesses to automate messages. See [COMPLIANCE.md](COMPLIANCE.md) for Meta's rules and how Pulse follows them.
 
----
+## What it does
 
-## ✨ Enterprise Capabilities
-* **Two-Way Live Team Inbox**: Real-time WhatsApp-style chat interface with message bubbles, status indicators, and 1-click Canned Quick Reply chips.
-* **Human Agent Handover**: Automatically pauses bot auto-replies for 24 hours when a customer requests a live agent (`option_agent`, `support`, `human`).
-* **Meta & Anti-Ban Compliance**: Full support for `STOP` / `UNSUBSCRIBE` opt-outs, randomized jitter delays (4–10s), warmup mode, and automatic circuit breaker aborts after 5 consecutive delivery failures.
-* **Media & PDF Document Dispatch**: Dispatch images (PNG, JPEG, WebP) and documents (PDF, DOCX) up to 16 MB with automatic MIME-type validation.
-* **Inbound & Outbound CRM Webhooks**: Real-time integration with Shopify, Zapier, Make.com, n8n, and custom backends with HMAC-SHA256 signature signing and SSRF protection.
-* **Google Gemini AI Assistant**: Automatic conversational fallback when no fixed keyword rules match.
-* **Scheduled Reminders**: Schedule follow-ups and appointment reminders for specific future timestamps.
-* **GDPR & DPDP Privacy Tools**: Automated message retention purges (30/60/90 days) and full customer data export bundle.
-* **Hardened Security**: Bcrypt master password hashing, localhost-only binding (`127.0.0.1`), CSP and security headers, double-submit CSRF protection, and system audit trail.
+- **Inbox** with unread counts, previews, "needs a person" filter, search, drafts, attachments (PNG, JPEG, WebP, PDF) and quick templates.
+- **Auto-replies** with keyword rules, a numbered menu that only reacts to numbers while the menu is open, priority order, an on/off switch per rule, a live tester and warnings for overlapping keywords.
+- **Hand-over to a person**: customers type AGENT (or "talk to someone", "baat karni hai", ...). The bot pauses in that chat, the chat is flagged under *Needs attention*, and the dashboard plays an alert.
+- **Opt-out and opt-in** in English, Hindi and Hinglish (STOP, "rok do", "band karo", START, "shuru karo").
+- **Contacts** with consent records, tags, bulk actions and CSV import with column mapping.
+- **Campaigns** that only go to opted-in contacts, send your Meta-approved template to customers outside the 24-hour window, explain who was left out and why, pace themselves, pause on failures or opt-out spikes, and report sent / delivered / read / replied.
+- **Scheduled messages** with an optional approved template for customers who have not written in 24 hours.
+- **Account health** panel with Meta's quality rating, and a daily sending limit with a warm-up mode.
+- **Integrations**: signed outbound webhooks with retries and replay, an inbound endpoint for shops and CRMs, and an API key that can send messages and read data but cannot change settings or the WhatsApp connection.
+- **Privacy**: data is stored encrypted in your user profile; the access token and app secret are sealed with your Windows account and never shown again; per-customer export and deletion; retention period.
 
----
+## Quick start (Windows)
 
-## 🚀 Quick Start
-### 1. Launch the Desktop App
-Double-click `whatsapp-auto.exe` or `Run-App.bat`. This automatically starts the secure engine and launches the native standalone desktop application window.
+1. Double-click `whatsapp-auto.exe` (or `Run-App.bat`).
+2. Sign in with the one-time password shown in the window (also saved in `FIRST-RUN-PASSWORD.txt` in the data folder) and choose your own password.
+3. Follow [docs/meta-whatsapp-setup.md](docs/meta-whatsapp-setup.md) to create your Meta app, get the phone number ID and a permanent token, start an https tunnel (for example `cloudflared tunnel --url http://127.0.0.1:8085`), and enter everything in **Settings > WhatsApp connection**.
+4. On **Home**, finish the **Get started** checklist and switch automatic replies on.
 
-### 2. Browser Dashboard
-Access the dashboard in your web browser:
+The dashboard is at `http://127.0.0.1:8085` and is only reachable from the same computer. Through the tunnel, only the webhook address `/cloud/webhook` answers.
+
+**Incoming messages need the tunnel.** Meta delivers them to the public https address; while the tunnel (or the computer) is off, Meta retries for a while, and messages arrive when it is back.
+
+## Where data is stored
+
+| What | Where |
+| --- | --- |
+| Settings and rules | `config.yaml` next to the program (the access token and app secret are stored sealed, not readable) |
+| Messages, contacts, templates, campaigns, schedule, activity log | `%APPDATA%\Pulse\` (encrypted with a key protected by your Windows account) |
+
+When you upgrade from 1.x, everything is kept. The old WhatsApp session files are no longer used; Settings > Privacy and data offers to delete them.
+
+## Commands
+
 ```
-http://127.0.0.1:8085
+whatsapp-auto app        start and open the dashboard window (default)
+whatsapp-auto serve      start in the background, no window
+whatsapp-auto status     check the connection to the WhatsApp Business API
+whatsapp-auto disconnect remove the access token and app secret from this computer
+whatsapp-auto send -to +919876543210 -msg "Hello"   (customer must have written in the last 24 hours)
+whatsapp-auto -session sales -port 8086   second number with its own settings and data
 ```
-* **Default Admin Password**: `admin` *(Update immediately in the Settings tab upon first login)*.
 
-### 3. Pairing Your WhatsApp Account
-1. On the Dashboard tab, choose **QR Code Scan** or **8-Digit Phone Pairing Code**.
-2. In WhatsApp on your mobile phone, navigate to **Settings > Linked Devices > Link a Device**.
-3. Scan the QR code or enter the pairing code. Connection establishes within 2-4 seconds.
+## Documentation
 
----
+- [docs/meta-whatsapp-setup.md](docs/meta-whatsapp-setup.md) - connecting your Meta app and number.
+- [SETUP-GUIDE.md](SETUP-GUIDE.md) - setup, keeping it running, upgrading.
+- [COMPLIANCE.md](COMPLIANCE.md) - Meta's policies, opt-in, templates, quality.
+- [BUILD.md](BUILD.md) - building, testing and packaging.
+- [DEPENDENCIES.md](DEPENDENCIES.md) - libraries and the update routine.
+- [docs/architecture.md](docs/architecture.md) and [docs/security.md](docs/security.md).
 
-## 📚 Documentation & Guides
-* **[COMPLIANCE.md](COMPLIANCE.md)**: WhatsApp & Meta anti-spam policies, opt-in rules, and anti-ban warmup schedule.
-* **[SETUP-GUIDE.md](SETUP-GUIDE.md)**: Pairing instructions, 24/7 always-on deployment (preventing Windows sleep, NSSM service), and multi-instance hosting.
-* **[BUILD.md](BUILD.md)**: Instructions for compiling with `-trimpath -ldflags="-s -w"`, running tests, and binary hardening.
-* **[DEPENDENCIES.md](DEPENDENCIES.md)**: Third-party library inventory, security review, and vulnerability update plan.
-* **[LICENSE](LICENSE)**: MIT License.
-
----
-
-## 🔒 Security Architecture
-1. **SSRF Mitigation**: Outbound webhook URLs are validated against private, loopback (RFC 1918/4193), and cloud metadata (`169.254.169.254`) ranges.
-2. **CSRF Mitigation**: State-changing API endpoints require valid `X-CSRF-Token` headers matched against unguessable session tokens.
-3. **Audit Logging**: All administrative operations (logins, broadcasts, exports, rule changes) are recorded in an in-memory audit ring buffer.
-4. **Input Sanitization**: All incoming chat messages and contact names are HTML-escaped to prevent Stored XSS attacks.
-
----
-
-## ⚖️ Legal Disclaimer
-Pulse WhatsApp Automation Platform is an independent automation software solution. It is not affiliated, associated, authorized, endorsed by, or in any way officially connected with WhatsApp LLC, Meta Platforms, Inc., or any of their subsidiaries or affiliates.
+Pulse is independent software. It is not affiliated with, authorised, maintained, sponsored or endorsed by WhatsApp LLC or Meta Platforms, Inc.

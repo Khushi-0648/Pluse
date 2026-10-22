@@ -1,39 +1,55 @@
-# WhatsApp Connection & Protocol Guide
+# Connecting Pulse to the WhatsApp Business Platform
 
-This guide details how Pulse connects to WhatsApp using the Multi-Device companion protocol.
+From version 2.0, Pulse connects only through **Meta's official WhatsApp Business Platform (Cloud API)**. This is the way WhatsApp's terms allow businesses to automate messages. Every Pulse install uses the owner's **own** Meta app, number and access token: nothing goes through the Pulse publisher, and each `-session` profile (for a second number) is set up separately with its own details.
 
----
+The linked-device (WhatsApp Web style, QR code) connection of Pulse 1.x has been removed.
 
-## 1. Connection Architecture
+## What you need
 
-Pulse utilizes the **WhatsApp Web Multi-Device Protocol** (implemented in Go via `go.mau.fi/whatsmeow`).
+- A Meta (Facebook) account and a Meta Business portfolio for your business.
+- A phone number for the business that is **not** in use in the WhatsApp or WhatsApp Business app (or one you move to the platform). Meta sends it a verification code by SMS or call.
+- A way to make Pulse reachable over https from the internet, so Meta can deliver incoming messages, for example Cloudflare Tunnel (free).
 
-### How It Works:
-1. Pulse registers as a companion device (secondary client) associated with your primary WhatsApp phone.
-2. The initial pairing handshake is authenticated either via:
-   - **QR Code Scan**: Scanned directly using WhatsApp on your primary phone.
-   - **8-Digit Pairing Code**: Generated on your PC and entered in WhatsApp on your phone.
-3. Once paired, cryptographic keys are persisted in local SQLite storage (`whatsapp.db`).
-4. Pulse establishes an independent, end-to-end encrypted noise connection to WhatsApp servers without needing WhatsApp Web to stay open in a browser.
+## Step by step
 
----
+1. **Create the app.** At [developers.facebook.com](https://developers.facebook.com), choose *My Apps > Create app*, pick the type **Business**, and connect it to your business portfolio.
+2. **Add WhatsApp.** In the app, add the **WhatsApp** product. Under *WhatsApp > API Setup*, add your business phone number and verify it.
+3. **Copy the two IDs.** On *WhatsApp > API Setup*, copy the **Phone number ID** and the **WhatsApp Business account ID**. (They are long numbers. The phone number ID is not your phone number.)
+4. **Create a permanent access token.** The token shown on API Setup expires after 24 hours. Instead, in [Meta Business settings](https://business.facebook.com/settings) > *Users > System users*, add a system user (role Admin), use *Assign assets* to give it your app and your WhatsApp account (full control), then *Generate new token* for your app with the permissions **whatsapp_business_messaging** and **whatsapp_business_management**, and expiry *Never*. Copy the token; Meta shows it only once.
+5. **Copy the app secret.** In the app, *App settings > Basic*, press *Show* next to **App secret** and copy it. Pulse uses it to check that incoming messages really come from Meta.
+6. **Expose Pulse over https (Webhook Ingress).** Meta needs a public https URL to deliver incoming customer messages to Pulse:
 
-## 2. Comparison: Multi-Device Protocol vs. Meta Cloud API
+   - **Quick Test (Changes on restart):** `cloudflared tunnel --url http://127.0.0.1:8085` prints a temporary address (e.g. `https://xyz.trycloudflare.com`). **Note:** Quick tunnels generate a new address each time they restart, which breaks Meta's webhook delivery until updated.
+   - **Production (Fixed Hostname):** Set up a free **Named Cloudflare Tunnel** with a permanent custom domain (e.g. `webhook.yourcompany.com`) or reserve a free static ngrok domain (`ngrok http 8085 --domain=your-name.ngrok-free.app`). These retain the exact same URL across reboots and run as an automatic Windows service.
+   - **Tunnel Privacy Disclosure:** Managed tunnels (Cloudflare, ngrok) terminate TLS at their edge, meaning the tunnel provider technically decrypts the incoming webhook payload (customer numbers, names, and messages) before forwarding it to your computer. For strict data sovereignty (healthcare, legal, finance), terminate TLS directly on your own infrastructure using a local reverse proxy (such as Caddy or Nginx with Let's Encrypt), or use a private TCP pass-through stream proxy.
+   - **Isolation:** Only Pulse's webhook address (`/cloud/webhook`) answers through the public tunnel; the dashboard and sign-in page remain private (they answer 404 under the tunnel's hostname).
+7. **Enter the details in Pulse.** In the dashboard, open *Settings > WhatsApp connection*. Paste the phone number ID, the WhatsApp Business account ID, the access token, the app secret and, as **Public address of this computer**, the https address of the tunnel. Press **Test connection**: Pulse shows your number and the name WhatsApp displays to customers. Press **Save** and enter your admin password.
+8. **Set up the webhook in Meta.** Pulse now shows the **Webhook address** (the public address followed by `/cloud/webhook`) and a **Verify token**. In the app, *WhatsApp > Configuration*, press *Edit* next to Webhook, paste both, and press *Verify and save*. Then, under *Webhook fields*, **subscribe to `messages`**. Send a message from another phone to your business number: it appears in the Pulse inbox, and the *Get started* list on Home ticks off "Receive messages".
+9. **Create message templates.** WhatsApp lets you reply freely for **24 hours** after a customer's last message. To reach anyone outside that window (campaigns, reminders), create templates in [WhatsApp Manager](https://business.facebook.com/wa/manage/message-templates/) and wait for Meta to approve them. In Pulse, enter the template name, language code and which values fill `{{1}}`, `{{2}}`... under *Official WhatsApp template* in a campaign or scheduled message.
+10. **Billing.** Meta charges per message for some categories (mostly templates: marketing, utility, authentication); replies within the 24-hour window are generally free. Add a payment method in WhatsApp Manager and check Meta's current pricing for your country.
 
-| Aspect | Pulse Multi-Device Protocol | Meta Cloud API |
-| :--- | :--- | :--- |
-| **Setup Complexity** | Zero setup; scan QR or enter code | Requires Meta Business verification & developer app |
-| **Per-Message Costs** | Free (uses your existing SIM/number) | Paid per conversation tier to Meta |
-| **Message History** | Syncs with your mobile WhatsApp app | Standalone Cloud inbox only |
-| **Number Mobility** | Uses your existing personal or business number | Requires dedicated phone number not on normal app |
-| **Anti-Ban Requirements** | Requires warming up & pacing limits | Subject to Meta template approval & quality rating |
+## How Pulse follows the platform's rules
 
----
+| Rule | What Pulse does |
+| --- | --- |
+| 24-hour customer service window | Free text (auto-replies, inbox, the `send` command, the integration endpoint) only goes to customers who wrote in the last 24 hours; otherwise it is refused before anything is sent. Campaigns and scheduled messages send your approved template instead, or skip the customer. |
+| Opt-in | Campaigns go only to contacts with a recorded opt-in (on by default). |
+| Opt-out | STOP and similar words are honoured at once on every way of sending. |
+| Quality rating | Shown on Home. A red rating counts as "at risk": running campaigns are paused and new ones are blocked. |
+| Messaging limits | Meta limits how many people a new number can message per day. Keep the Careful pace while the limit grows. |
+| Rate limits | Requests that Meta refuses with "too many requests" or a server error are retried after a pause; a request that may already have reached Meta is never repeated, so customers never get duplicates. |
 
-## 3. Best Practices & Policy Compliance
+## Troubleshooting
 
-To ensure reliable, uninterrupted operation:
-1. **Explicit Consent**: Only message contacts who have opted in.
-2. **Respect STOP / Unsubscribe**: The system automatically honors `STOP` by setting Do-Not-Disturb on contacts.
-3. **Warm-Up New Numbers**: For newly registered numbers, start with 20–50 messages daily before increasing broadcast volume.
-4. **Natural Jitter**: Maintain default delay settings (4–10 seconds between outgoing broadcast dispatches).
+| Pulse says | What to do |
+| --- | --- |
+| The access token has expired or is wrong | Create a permanent system-user token (step 4) and paste it in Settings > WhatsApp connection. |
+| More than 24 hours have passed... | Use an approved template (campaign or scheduled message), or wait for the customer to write. |
+| WhatsApp refused the template | Check the template name, language code and number of values in WhatsApp Manager, and that it is approved. |
+| This number is not on your test number's list | You are using Meta's test number: add the recipient under API Setup, or register your real number. |
+| Messages are being sent too fast | Wait a few minutes; slow the pace in Settings > Safety and pace. |
+| Nothing arrives in the inbox | Check that the tunnel is running and its address matches the Public address, that the webhook is verified in Meta and subscribed to `messages`, and that the app secret is saved. Rejected deliveries are listed in the activity log as "Blocked a webhook call that did not come from Meta". |
+
+## Moving from Pulse 1.x (linked device)
+
+Contacts, messages, templates, campaigns, scheduled messages and settings are kept. The old WhatsApp session files (`whatsapp.db`, `whatsapp.db.sealed`) are no longer used and are not touched automatically; *Settings > Privacy and data* offers to delete them (admin password required). On the phone, remove "Pulse" from *WhatsApp > Linked devices*. Note that a number registered on the Cloud API can no longer be used in the WhatsApp app on a phone at the same time.
