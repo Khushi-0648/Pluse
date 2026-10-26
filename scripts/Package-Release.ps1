@@ -13,7 +13,7 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 
 $files = 'whatsapp-auto.exe', 'SHA256SUMS.txt', 'HOW-TO-RUN.txt', 'BUILD.md', 'SETUP-GUIDE.md', 'COMPLIANCE.md', 'LICENSE',
     'config.example.yaml', 'contacts.example.csv', 'Run-App.bat', 'Run-Server.bat', 'Run-Unlink.bat', 'Reset-Password.bat',
-    'Create-Desktop-Shortcut.bat', 'Unblock-Pulse.bat', 'scripts\Install-Service.ps1', 'scripts\Uninstall-Service.ps1',
+    'Create-Desktop-Shortcut.bat', 'Unblock-Pulse.bat', 'install.ps1', 'scripts\Install-Service.ps1', 'scripts\Uninstall-Service.ps1',
     'scripts\Stop-Background.ps1', 'scripts\Check-SmartAppControl.bat', 'docs\meta-whatsapp-setup.md', 'docs\architecture.md',
     'docs\security.md'
 

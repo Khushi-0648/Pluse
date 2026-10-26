@@ -96,6 +96,7 @@ copy /y LICENSE whatsapp-auto-exe\ >nul
 copy /y contacts.example.csv whatsapp-auto-exe\ >nul
 copy /y config.example.yaml whatsapp-auto-exe\ >nul
 copy /y Unblock-Pulse.bat whatsapp-auto-exe\ >nul
+copy /y install.ps1 whatsapp-auto-exe\ >nul
 copy /y HOW-TO-RUN.txt whatsapp-auto-exe\ >nul
 copy /y Run-App.bat whatsapp-auto-exe\ >nul
 copy /y Run-Server.bat whatsapp-auto-exe\ >nul
