@@ -15,12 +15,12 @@
 # update $Version and the checksums for each release (dist\*.zip.sha256 from Build.bat).
 
 $ErrorActionPreference = 'Stop'
-$Version = '2.1.1'
+$Version = '2.1.2'
 $BaseUrl = 'https://pulse.yourdomain.com/downloads'   # <-- your https download folder
 $Sha256 = @{
-    'x64'   = '0aac06b1205c0f36836e9152510872f24c6a3c714d3fa61a374079168c10876c'
-    'arm64' = 'cb3a417c23b3cd1de7a60db33c4430dd0dd3394301c6f3a7fcd0c6f42bed389a'
-    'x86'   = '1a1c11bb49305cb2b5b4e3d3440832191a276c8be126f426928e099869c669db'
+    'x64'   = 'c2a5036d7d07e041f66b3ccce1d15390f31be139302f0383ce2c75885e36c401'
+    'arm64' = 'bd1dfb9562784a869198e27bbe9e46c319ffe8331ba1c4391d8bb69ff98ae52b'
+    'x86'   = '3b2679a836bd5e8337e9cd74496c0853c2a902d78777d0bdf9923428b6bdabb9'
 }
 # For testing only: $env:PULSE_INSTALL_BASEURL replaces $BaseUrl (must still be https,
 # except http://127.0.0.1 for a local test server), $env:PULSE_INSTALL_DIR the folder,
