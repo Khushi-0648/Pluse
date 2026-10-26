@@ -1,6 +1,8 @@
 package history
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,7 +43,14 @@ const (
 	StatusSent      = "sent"
 	StatusDelivered = "delivered"
 	StatusRead      = "read"
+	// StatusSending is the placeholder written just before a send (Placeholder), so a send
+	// cut off by a crash still counts towards the daily limit and can be corrected by its
+	// label. Settle replaces it with the outcome.
+	StatusSending = "sending"
 )
+
+// interruptedSend explains a placeholder found at start-up: Pulse stopped mid-send.
+const interruptedSend = "Pulse stopped while this message was being sent. It may have reached the customer: check the chat before sending it again."
 
 var statusRank = map[string]int{StatusSent: 1, StatusDelivered: 2, StatusRead: 3}
 
@@ -61,6 +70,13 @@ type MessageRecord struct {
 	Error         string           `json:"error,omitempty"`
 	Imported      bool             `json:"imported,omitempty"`
 	SentBy        string           `json:"sent_by,omitempty"`
+	// Label is the label the message was sent with (cloudapi.WithCallbackData), so a
+	// send recorded as failed can be corrected when Meta reports it delivered after all.
+	Label string `json:"label,omitempty"`
+	// Uncertain marks a failed send that may still have reached the customer (a timeout,
+	// an interrupted send): it counts towards the daily limit, and ResolveLabel corrects it
+	// when Meta reports the message.
+	Uncertain bool `json:"uncertain,omitempty"`
 }
 
 // legacyRecord reads files written by versions before 1.4.
@@ -81,6 +97,15 @@ type Store struct {
 	maxItems int
 	saver    *securestore.Saver
 	onRecord []func(MessageRecord)
+	onSaved  []func(snapshotAt time.Time)
+}
+
+// OnSaved registers f to run after each successful save; snapshotAt is when the saved
+// copy was taken, so every message recorded before it is on disk.
+func (s *Store) OnSaved(f func(snapshotAt time.Time)) {
+	s.mu.Lock()
+	s.onSaved = append(s.onSaved, f)
+	s.mu.Unlock()
 }
 
 // NewStore loads history from filePath. maxItems caps the number of stored messages.
@@ -130,6 +155,10 @@ func migrate(lr legacyRecord) MessageRecord {
 	}
 	if m.Type == "ai_reply" {
 		m.Type = TypeAutoReply
+	}
+	if m.Status == StatusSending {
+		// Pulse stopped mid-send: unknown whether it went out.
+		m.Status, m.Error, m.Uncertain = StatusFailed, interruptedSend, true
 	}
 	if m.Status == "" {
 		if m.Direction == DirectionIncoming {
@@ -196,13 +225,21 @@ func (s *Store) reindexLocked() {
 func (s *Store) Flush() error { return s.saver.Flush() }
 
 func (s *Store) persist() error {
+	snapshotAt := time.Now() // everything recorded before this is in the copy below
 	s.mu.RLock()
 	data, err := json.Marshal(s.messages)
+	saved := append([]func(time.Time){}, s.onSaved...)
 	s.mu.RUnlock()
 	if err != nil {
 		return err
 	}
-	return s.box.WriteFile(s.filePath, data)
+	if err := s.box.WriteFile(s.filePath, data); err != nil {
+		return err
+	}
+	for _, f := range saved {
+		f(snapshotAt)
+	}
+	return nil
 }
 
 // Record stores a message. Records with an ID that is already stored are ignored.
@@ -281,10 +318,143 @@ func (s *Store) MarkFailed(id, reason string) bool {
 		s.mu.Unlock()
 		return false
 	}
-	s.messages[i].Status, s.messages[i].Error = StatusFailed, reason
+	s.messages[i].Status, s.messages[i].Error, s.messages[i].Uncertain = StatusFailed, reason, false
 	s.mu.Unlock()
 	s.saver.Trigger()
 	return true
+}
+
+// Placeholder records rec as "sending" just before it is sent and returns its temporary
+// ID. A send cut off by a crash then still counts towards the daily limit (it is loaded
+// as an uncertain failure) and is corrected by its label (ResolveLabel) when Meta reports
+// the message. Settle records the outcome.
+func (s *Store) Placeholder(rec MessageRecord) string {
+	rec.ID, rec.Status, rec.Error, rec.Uncertain = "pending_"+randomID(), StatusSending, "", false
+	s.Record(rec)
+	return rec.ID
+}
+
+// Settle replaces the placeholder id with the send's outcome: the real message ID and
+// status, or a failure (uncertain when it may still have reached the customer). A
+// placeholder that a delivery update already corrected is left as it is. It reports
+// whether the placeholder was found.
+func (s *Store) Settle(id, messageID, status, errText string, uncertain bool) bool {
+	s.mu.Lock()
+	i, ok := s.byID[id]
+	if !ok || i >= len(s.messages) || s.messages[i].ID != id {
+		s.mu.Unlock()
+		return false
+	}
+	m := &s.messages[i]
+	if m.Status == StatusSending {
+		if _, taken := s.byID[messageID]; messageID != "" && messageID != id && !taken {
+			delete(s.byID, id)
+			m.ID = messageID
+			s.byID[messageID] = i
+		}
+		m.Status, m.Error, m.Uncertain = status, errText, uncertain
+	}
+	s.mu.Unlock()
+	s.saver.Trigger()
+	return true
+}
+
+// Unsend removes the placeholder id when nothing was sent after all (WhatsApp was not
+// connected), so the chat does not show a message that never left.
+func (s *Store) Unsend(id string) {
+	s.mu.Lock()
+	i, ok := s.byID[id]
+	if ok && i < len(s.messages) && s.messages[i].ID == id && s.messages[i].Status == StatusSending {
+		s.messages = append(s.messages[:i], s.messages[i+1:]...)
+		s.reindexLocked()
+	} else {
+		ok = false
+	}
+	s.mu.Unlock()
+	if ok {
+		s.saver.Trigger()
+	}
+}
+
+// randomID is a short random suffix for placeholder IDs.
+func randomID() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// ResolveLabel corrects a send that was recorded as failed (its answer was lost) once
+// Meta reports the message with that label sent, delivered or read: the record takes the
+// real message ID and status, so later updates find it, the inbox shows it as sent, and
+// the daily limit counts it. It reports whether a record was corrected.
+func (s *Store) ResolveLabel(label, messageID, status string) bool {
+	if label == "" || messageID == "" || statusRank[status] == 0 {
+		return false
+	}
+	s.mu.Lock()
+	if _, taken := s.byID[messageID]; taken {
+		s.mu.Unlock()
+		return false // already recorded under the real ID
+	}
+	found := false
+	for i := len(s.messages) - 1; i >= 0; i-- {
+		m := &s.messages[i]
+		if m.Label == label && m.Direction == DirectionOutgoing && (m.Status == StatusFailed || m.Status == StatusSending) {
+			delete(s.byID, m.ID)
+			m.ID, m.Status, m.Error, m.Uncertain = messageID, status, "", false
+			s.byID[messageID] = i
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if found {
+		s.saver.Trigger()
+	}
+	return found
+}
+
+// HasLabel reports whether an outgoing message sent with label, which may have reached
+// the customer, was recorded at or after since: a placeholder, a send, or a failure
+// that may still have gone out. A send that certainly failed does not count.
+func (s *Store) HasLabel(label string, since time.Time) bool {
+	if label == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := len(s.messages) - 1; i >= 0; i-- {
+		m := s.messages[i]
+		if m.Timestamp.Before(since) && !m.Imported {
+			break
+		}
+		if m.Label == label && m.Direction == DirectionOutgoing && !m.Timestamp.Before(since) && (m.Status != StatusFailed || m.Uncertain) {
+			return true
+		}
+	}
+	return false
+}
+
+// RenamePhone moves every message of oldPhone to newPhone (a contact saved by Pulse 2.0
+// under a wrong number moved to the number Meta sends). It returns how many moved.
+func (s *Store) RenamePhone(oldPhone, newPhone string) int {
+	oldPhone, newPhone = digits(oldPhone), digits(newPhone)
+	if oldPhone == "" || newPhone == "" || oldPhone == newPhone {
+		return 0
+	}
+	s.mu.Lock()
+	n := 0
+	for i := range s.messages {
+		if s.messages[i].Phone == oldPhone {
+			s.messages[i].Phone = newPhone
+			n++
+		}
+	}
+	s.mu.Unlock()
+	if n > 0 {
+		s.saver.Trigger()
+	}
+	return n
 }
 
 // Get returns a message by ID.
@@ -297,12 +467,13 @@ func (s *Store) Get(id string) (MessageRecord, bool) {
 	return MessageRecord{}, false
 }
 
-// normPhone applies the same rules as contact numbers (a bare 10-digit Indian mobile gets 91).
+// normPhone applies the same rules as contact numbers: stored digits are kept as they
+// are (the Singapore 6591234567 is not India's 916591234567), typed ones are cleaned.
 func normPhone(p string) string {
 	if strings.TrimSpace(p) == "" {
 		return ""
 	}
-	return contacts.CleanPhone(p)
+	return contacts.NormalizePhone(p)
 }
 
 func phoneMatch(stored, filter string) bool {
@@ -327,9 +498,20 @@ type Query struct {
 	Imported *bool
 }
 
-// Query returns matching messages, newest first.
+// Query returns matching messages, newest first. A phone filter matches the stored
+// number exactly; only when nothing matches is it read as typed (9876543210 finds
+// 919876543210).
 func (s *Store) Query(q Query) []MessageRecord {
-	phone := normPhone(q.Phone)
+	out := s.query(q, normPhone(q.Phone))
+	if len(out) == 0 && strings.TrimSpace(q.Phone) != "" {
+		if typed := contacts.CleanPhone(q.Phone); typed != normPhone(q.Phone) {
+			out = s.query(q, typed)
+		}
+	}
+	return out
+}
+
+func (s *Store) query(q Query, phone string) []MessageRecord {
 	search := strings.ToLower(strings.TrimSpace(q.Search))
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -500,7 +682,9 @@ func (s *Store) Stats(since time.Time) Stats {
 	return st
 }
 
-// SentSince counts messages the app actually sent since t (dry runs and failures excluded).
+// SentSince counts messages the app sent since t. Dry runs and failures are excluded,
+// but a send still on its way or one that may have reached the customer (Uncertain) is
+// counted, so a crash or a timeout cannot push the day over its limit.
 func (s *Store) SentSince(t time.Time) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -514,7 +698,8 @@ func (s *Store) SentSince(t time.Time) int {
 			continue
 		}
 		// Messages the owner typed on the phone itself do not use up Pulse's daily limit.
-		if m.Direction == DirectionOutgoing && !m.Imported && m.SentBy != "phone" && statusRank[m.Status] > 0 {
+		counts := statusRank[m.Status] > 0 || m.Status == StatusSending || (m.Status == StatusFailed && m.Uncertain)
+		if m.Direction == DirectionOutgoing && !m.Imported && m.SentBy != "phone" && counts {
 			n++
 		}
 	}
@@ -542,13 +727,77 @@ func (s *Store) AutoRepliesTo(phone string, t time.Time) int {
 	return n
 }
 
-// LastAutoReply returns the most recent automated reply to phone.
-func (s *Store) LastAutoReply(phone string) (MessageRecord, bool) {
+// RuleRepliesTo counts automated replies to phone since t that came from one of rules
+// (for example the opt-out and opt-in confirmations).
+func (s *Store) RuleRepliesTo(phone string, t time.Time, rules ...string) int {
+	phone = digits(phone)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for i := len(s.messages) - 1; i >= 0; i-- {
+		m := s.messages[i]
+		if m.Timestamp.Before(t) {
+			if !m.Imported {
+				break
+			}
+			continue
+		}
+		if m.Type != TypeAutoReply || !phoneMatch(m.Phone, phone) || m.Status == StatusFailed {
+			continue
+		}
+		for _, r := range rules {
+			if m.RuleTriggered == r {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+// RuleFailuresTo counts automated replies to phone since t from one of rules that could
+// not be sent.
+func (s *Store) RuleFailuresTo(phone string, t time.Time, rules ...string) int {
+	phone = digits(phone)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for i := len(s.messages) - 1; i >= 0; i-- {
+		m := s.messages[i]
+		if m.Timestamp.Before(t) {
+			if !m.Imported {
+				break
+			}
+			continue
+		}
+		if m.Type != TypeAutoReply || !phoneMatch(m.Phone, phone) || m.Status != StatusFailed {
+			continue
+		}
+		for _, r := range rules {
+			if m.RuleTriggered == r {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+// LastAutoReply returns the most recent automated reply to phone sent since t. The
+// search stops at t, so a customer without recent replies does not cost a scan of the
+// whole history on every message.
+func (s *Store) LastAutoReply(phone string, t time.Time) (MessageRecord, bool) {
 	phone = digits(phone)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for i := len(s.messages) - 1; i >= 0; i-- {
 		m := s.messages[i]
+		if m.Timestamp.Before(t) {
+			if !m.Imported {
+				break
+			}
+			continue
+		}
 		if m.Type == TypeAutoReply && phoneMatch(m.Phone, phone) && m.Status != StatusFailed {
 			return m, true
 		}
@@ -556,14 +805,20 @@ func (s *Store) LastAutoReply(phone string) (MessageRecord, bool) {
 	return MessageRecord{}, false
 }
 
-// RecentIncoming returns the last n incoming texts from phone, newest first.
-func (s *Store) RecentIncoming(phone string, n int) []MessageRecord {
+// RecentIncoming returns up to n incoming texts from phone received since t, newest first.
+func (s *Store) RecentIncoming(phone string, n int, t time.Time) []MessageRecord {
 	phone = digits(phone)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []MessageRecord
 	for i := len(s.messages) - 1; i >= 0 && len(out) < n; i-- {
 		m := s.messages[i]
+		if m.Timestamp.Before(t) {
+			if !m.Imported {
+				break
+			}
+			continue
+		}
 		if m.Direction == DirectionIncoming && !m.Imported && phoneMatch(m.Phone, phone) {
 			out = append(out, m)
 		}
@@ -608,7 +863,10 @@ func (s *Store) removeWhere(pred func(MessageRecord) bool) int {
 	s.mu.Unlock()
 	if removed > 0 {
 		s.saver.Trigger()
-		_ = s.saver.Flush()
+		if err := s.saver.Flush(); err != nil {
+			// Retried in the background (Saver); callers can check Flush() for the result.
+			fmt.Printf("[History] Deleting messages is not saved yet (%v); retrying.\n", err)
+		}
 		securestore.RemoveBackup(s.filePath) // deleted messages must not survive in the backup copy
 	}
 	return removed

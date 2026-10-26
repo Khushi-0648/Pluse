@@ -6,6 +6,10 @@
 <meta name="color-scheme" content="light dark">
 <title>Choose your password - {{.Product}}</title>
 <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/assets/icon-192.png">
+<meta name="theme-color" content="#0d7a5f">
+<script src="/assets/js/pwa.js" defer></script>
 <link rel="stylesheet" href="/assets/app.css">
 <script src="/assets/js/auth.js" defer></script>
 </head>
@@ -26,11 +30,11 @@
             <input type="password" id="new_password" name="new_password" required minlength="8" maxlength="128" autocomplete="new-password" aria-describedby="pw-rules" autofocus>
             <button class="btn" type="button" data-toggle-password="new_password" aria-controls="new_password" aria-pressed="false">Show</button>
           </div>
-          <ul class="rules-list" id="pw-rules">
-            <li data-rule="length">At least 8 characters</li>
-            <li data-rule="mix">Letters and numbers</li>
-            <li data-rule="words">No easy words such as admin, password or 12345678</li>
-            <li data-rule="variety">At least 4 different characters</li>
+          <ul class="rules-list" id="pw-rules" aria-live="polite">
+            <li data-rule="length">At least 8 characters <span class="sr-only rule-state">(not met)</span></li>
+            <li data-rule="mix">Letters and numbers <span class="sr-only rule-state">(not met)</span></li>
+            <li data-rule="words">No easy words such as admin, password or 12345678 <span class="sr-only rule-state">(not met)</span></li>
+            <li data-rule="variety">At least 4 different characters <span class="sr-only rule-state">(not met)</span></li>
           </ul>
         </div>
         <div class="field">

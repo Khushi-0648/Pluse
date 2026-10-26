@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -316,5 +317,158 @@ func TestSetAndClearCloudCredentials(t *testing.T) {
 	}
 	if err := c.ClearCloudCredentials(); err != nil || c.Snapshot().CloudAPI.Ready() || c.Snapshot().CloudAPI.AppSecret != "" {
 		t.Fatal("clear failed")
+	}
+}
+
+// The rule editor sends no priority: editing a rule must keep its place in the order.
+func TestEditingARuleKeepsItsPriority(t *testing.T) {
+	c := DefaultConfig()
+	var before Rule
+	for _, r := range c.GetRules() {
+		if r.Name == "greeting_menu" {
+			before = r
+		}
+	}
+	if before.Priority == 0 {
+		t.Fatal("the starter greeting rule should have a priority")
+	}
+	edited := before
+	edited.Priority = 0
+	edited.Reply = "Hello {{first_name}}! Reply MENU for options."
+	if err := c.AddOrUpdateRule(edited, before.Name); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range c.GetRules() {
+		if r.Name == before.Name && r.Priority != before.Priority {
+			t.Fatalf("priority changed from %d to %d", before.Priority, r.Priority)
+		}
+	}
+}
+
+// Priority decides first; at equal priority the more specific match type goes first.
+func TestRuleOrderPriorityThenMatchType(t *testing.T) {
+	c := DefaultConfig()
+	c.Rules = []Rule{
+		{Name: "broad", Type: "contains", Pattern: "price", Priority: 3, Enabled: true},
+		{Name: "starts", Type: "prefix", Pattern: "price", Priority: 3, Enabled: true},
+		{Name: "pattern", Type: "regex", Pattern: "^price", Priority: 3, Enabled: true},
+		{Name: "exact", Type: "exact", Pattern: "price", Priority: 3, Enabled: true},
+		{Name: "urgent", Type: "contains", Pattern: "price", Priority: 9, Enabled: true},
+	}
+	var got []string
+	for _, r := range c.GetRules() {
+		got = append(got, r.Name)
+	}
+	if want := "urgent,exact,pattern,starts,broad"; strings.Join(got, ",") != want {
+		t.Fatalf("rule order %v, want %s", got, want)
+	}
+}
+
+// S37: after Disconnect neither config.yaml nor config.yaml.bak holds the token.
+func TestDisconnectClearsTokenFromBackupCopy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := DefaultConfig()
+	cfg.FilePath = path
+	_ = cfg.Update(func(c *Config) error {
+		c.CloudAPI.AccessToken, c.CloudAPI.AppSecret, c.CloudAPI.PhoneNumberID = "sealed-token-xyz", "sealed-secret-xyz", "123456789"
+		return nil
+	})
+	_ = cfg.Save() // the backup copy now holds the token too
+	if err := cfg.ClearCloudCredentials(); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{path, path + ".bak"} {
+		b, _ := os.ReadFile(p)
+		if strings.Contains(string(b), "sealed-token-xyz") || strings.Contains(string(b), "sealed-secret-xyz") {
+			t.Errorf("%s still holds the credentials", filepath.Base(p))
+		}
+	}
+}
+
+// B8: an empty settings file next to existing data is refused, not replaced by defaults.
+func TestEmptySettingsWithDataKeyIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("  \n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Without data it is a damaged fresh install: defaults are fine.
+	if _, err := LoadConfig(path); err != nil {
+		t.Fatalf("empty settings without data: %v", err)
+	}
+	_ = os.WriteFile(path, nil, 0600)
+	_ = os.Remove(path + ".bak")
+	if err := os.WriteFile(filepath.Join(dir, "store.key"), []byte("key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); !errors.Is(err, ErrEmptySettings) {
+		t.Fatalf("empty settings next to store.key: err = %v, want ErrEmptySettings", err)
+	}
+	// A usable backup still restores them.
+	good := DefaultConfig()
+	good.Business.Name = "Bella"
+	good.FilePath = path + ".bak"
+	if err := good.Save(); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil || cfg.Snapshot().Business.Name != "Bella" {
+		t.Fatalf("backup not used: %v", err)
+	}
+}
+
+// S7: the inbound integration secret is separate from the outbound signing key.
+func TestInboundSecretFallsBackToOutboundSecret(t *testing.T) {
+	cfg := DefaultConfig()
+	if s, legacy := cfg.InboundSecret(); s != "" || legacy {
+		t.Fatalf("no secrets: %q %v", s, legacy)
+	}
+	_ = cfg.Update(func(c *Config) error { c.Webhook.Secret = "outbound-secret-123456"; return nil })
+	if s, legacy := cfg.InboundSecret(); s != "outbound-secret-123456" || !legacy {
+		t.Fatalf("fallback: %q %v", s, legacy)
+	}
+	_ = cfg.Update(func(c *Config) error { c.Webhook.InboundSecret = "inbound-secret-123456"; return nil })
+	if s, legacy := cfg.InboundSecret(); s != "inbound-secret-123456" || legacy {
+		t.Fatalf("inbound: %q %v", s, legacy)
+	}
+	if cfg.SafeClone().Webhook.InboundSecret != mask {
+		t.Fatal("the inbound secret must be masked for the settings API")
+	}
+	// Sending the mask back keeps the stored value.
+	_ = cfg.Update(func(c *Config) error { c.Webhook.InboundSecret = mask; return nil })
+	if s, _ := cfg.InboundSecret(); s != "inbound-secret-123456" {
+		t.Fatalf("mask overwrote the secret: %q", s)
+	}
+}
+
+// S4: phone access was approved for one https address. Changing or clearing the address,
+// or disconnecting, switches it off, so the dashboard is never served somewhere new.
+func TestRemoteAccessFollowsThePublicAddress(t *testing.T) {
+	cfg := DefaultConfig()
+	creds := CloudCredentials{PhoneNumberID: "123456789", AccessToken: "EAAtoken123", PublicURL: "https://pulse.example.com"}
+	if err := cfg.SetCloudCredentials(creds); err != nil {
+		t.Fatal(err)
+	}
+	on := func() { _ = cfg.Update(func(c *Config) error { c.Server.RemoteAccess = true; return nil }) }
+	on()
+	if err := cfg.SetCloudCredentials(creds); err != nil || !cfg.Snapshot().Server.RemoteAccess {
+		t.Fatalf("saving the same address must keep phone access on: %v", err)
+	}
+	creds.PublicURL = "https://other.example.com"
+	if err := cfg.SetCloudCredentials(creds); err != nil || cfg.Snapshot().Server.RemoteAccess {
+		t.Fatalf("a new address must switch phone access off: %v", err)
+	}
+	on()
+	_ = cfg.Update(func(c *Config) error { c.CloudAPI.PublicURL = ""; return nil })
+	if cfg.Snapshot().Server.RemoteAccess {
+		t.Fatal("without an https address phone access must be off")
+	}
+	_ = cfg.Update(func(c *Config) error {
+		c.CloudAPI.PublicURL = "https://pulse.example.com"
+		c.Server.RemoteAccess = true
+		return nil
+	})
+	if err := cfg.ClearCloudCredentials(); err != nil || cfg.Snapshot().Server.RemoteAccess {
+		t.Fatalf("disconnecting must switch phone access off: %v", err)
 	}
 }

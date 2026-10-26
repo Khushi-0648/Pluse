@@ -7,6 +7,8 @@ package cloudapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,8 +28,13 @@ import (
 // DefaultBaseURL is Meta's Graph API.
 const DefaultBaseURL = "https://graph.facebook.com"
 
-// checkEvery is how often the connection is checked in the background.
-const checkEvery = 10 * time.Minute
+// checkEvery is how often a working connection is checked in the background; a failed
+// check is repeated after retryCheck, so a PC that starts before its internet connection
+// does not refuse to send for ten minutes.
+const (
+	checkEvery = 10 * time.Minute
+	retryCheck = time.Minute
+)
 
 // Status is the connection state shown in the dashboard.
 type Status struct {
@@ -42,6 +49,9 @@ type Status struct {
 	LastCheck     *time.Time `json:"last_check,omitempty"`
 	LastWebhook   *time.Time `json:"last_webhook,omitempty"`
 	Problem       string     `json:"problem,omitempty"`
+	// Warning is a setup step that still needs the owner while sending works, for
+	// example when Meta may not deliver incoming messages yet.
+	Warning string `json:"warning,omitempty"`
 }
 
 // PhoneInfo is what Meta reports about the business number.
@@ -68,6 +78,53 @@ type Receipt struct {
 	Phone     string
 	Status    string // "sent", "delivered", "read" or "failed"
 	Error     string // plain-language reason when Status is "failed"
+	Code      int    // Meta's error code when Status is "failed" (for example CodeMarketingOptOut)
+	// CallbackData is the label the message was sent with (see WithCallbackData).
+	CallbackData string
+}
+
+// CodeMarketingOptOut is Meta's error 131050: the customer stopped marketing messages
+// from businesses in WhatsApp. Their contact is then left out of campaigns.
+const CodeMarketingOptOut = 131050
+
+// ErrorCode returns Meta's error code of a failed send, or 0.
+func ErrorCode(err error) int {
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return ae.Code
+	}
+	return 0
+}
+
+// uncertainError is a send whose outcome is unknown: the request may have reached Meta
+// (a timeout, a dropped connection, an unreadable answer, a server error).
+type uncertainError struct{ msg string }
+
+func (e *uncertainError) Error() string { return e.msg }
+
+// MaybeSent reports whether a failed send may still have reached the customer, so it
+// must not be repeated blindly. It is recorded with its label (WithCallbackData) and
+// corrected when Meta reports the message after all.
+func MaybeSent(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *uncertainError
+	if errors.As(err, &ue) {
+		return true
+	}
+	var ae *APIError
+	return errors.As(err, &ae) && ae.HTTPStatus >= 500
+}
+
+type callbackKey struct{}
+
+// WithCallbackData labels the messages sent with ctx. Meta repeats the label in every
+// delivery update for them (biz_opaque_callback_data), so a send whose answer was lost,
+// for example in a crash, can still be matched to its updates and shown as sent. Meta has
+// no idempotency key: the label does not stop a repeated request from being sent twice.
+func WithCallbackData(ctx context.Context, label string) context.Context {
+	return context.WithValue(ctx, callbackKey{}, label)
 }
 
 // Client talks to the Graph API for one business number.
@@ -88,6 +145,9 @@ type Client struct {
 	refresh     chan struct{}
 	cancel      context.CancelFunc
 	stopOnce    sync.Once
+	// subscribed is the account and token for which the app subscription succeeded, so
+	// it is repeated only after the settings change.
+	subscribed string
 }
 
 // New creates a client that reads its settings from cfg.
@@ -124,12 +184,23 @@ func (c *Client) Start(ctx context.Context) {
 	c.cancel = cancel
 	c.mu.Unlock()
 	go func() {
-		t := time.NewTicker(checkEvery)
+		t := time.NewTimer(checkEvery)
 		defer t.Stop()
 		for {
 			cctx, done := context.WithTimeout(ctx, 30*time.Second)
-			_, _ = c.Check(cctx)
+			st, _ := c.Check(cctx)
 			done()
+			next := checkEvery
+			if st.Configured && !st.Connected {
+				next = retryCheck
+			}
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
+			t.Reset(next)
 			select {
 			case <-ctx.Done():
 				return
@@ -165,6 +236,7 @@ func (c *Client) Forget() {
 	c.mu.Lock()
 	c.status = Status{}
 	c.lastInbound = map[string]string{}
+	c.subscribed = ""
 	c.mu.Unlock()
 }
 
@@ -180,7 +252,7 @@ func (c *Client) GetStatus() Status {
 	st.Configured = snap.CloudAPI.Ready()
 	if !st.Configured {
 		st.Connected = false
-		st.Problem = ""
+		st.Problem, st.Warning = "", ""
 	}
 	return st
 }
@@ -223,6 +295,10 @@ func (c *Client) Check(ctx context.Context) (Status, error) {
 		return c.GetStatus(), err
 	}
 	info, err := c.Probe(ctx, snap.CloudAPI.APIVersion, snap.CloudAPI.PhoneNumberID, tok)
+	warning := ""
+	if err == nil {
+		warning = c.ensureSubscribed(ctx, snap.CloudAPI.APIVersion, snap.CloudAPI.BusinessAccountID, tok)
+	}
 	now := time.Now()
 	c.mu.Lock()
 	c.status.LastCheck = &now
@@ -230,12 +306,56 @@ func (c *Client) Check(ctx context.Context) (Status, error) {
 		c.status.Connected = false
 		c.status.Problem = err.Error()
 	} else {
-		c.status.Connected, c.status.Problem = true, ""
+		c.status.Connected, c.status.Problem, c.status.Warning = true, "", warning
 		c.status.DisplayPhone, c.status.VerifiedName, c.status.QualityRating = info.DisplayPhone, info.VerifiedName, info.QualityRating
 		c.status.Phone = contacts.CleanPhone(info.DisplayPhone)
 	}
 	c.mu.Unlock()
 	return c.GetStatus(), err
+}
+
+// ensureSubscribed subscribes the owner's Meta app to the WhatsApp Business account.
+// Meta delivers a real number's incoming messages only to subscribed apps: the
+// "messages" webhook field alone is not enough, and a number added after the app was
+// set up is often not subscribed. Meta treats a repeat as success, but it is only sent
+// once per account and token. It returns a warning for the owner, or "".
+func (c *Client) ensureSubscribed(ctx context.Context, version, waba, token string) string {
+	if waba == "" {
+		c.mu.RLock()
+		seen := c.status.LastWebhook != nil
+		c.mu.RUnlock()
+		if seen {
+			return ""
+		}
+		return "Enter the WhatsApp Business account ID in Settings > WhatsApp connection, so Pulse can make sure Meta sends your customers' messages here."
+	}
+	sum := sha256.Sum256([]byte(token))
+	key := waba + ":" + hex.EncodeToString(sum[:8])
+	c.mu.RLock()
+	done := c.subscribed == key
+	c.mu.RUnlock()
+	if done {
+		return ""
+	}
+	if version == "" {
+		version = config.DefaultGraphVersion
+	}
+	var out struct {
+		Success bool `json:"success"`
+	}
+	u := strings.TrimRight(c.BaseURL, "/") + "/" + version + "/" + waba + "/subscribed_apps"
+	if err := c.do(ctx, http.MethodPost, u, token, "", nil, &out); err != nil {
+		return "Pulse could not make sure Meta sends incoming messages to your app, so customers' messages may not arrive: " + err.Error() +
+			" Check the WhatsApp Business account ID, and that the token has the whatsapp_business_management permission."
+	}
+	if !out.Success {
+		return "Meta did not confirm that your app receives this account's messages. Check the WhatsApp Business account ID."
+	}
+	c.mu.Lock()
+	c.subscribed = key
+	c.mu.Unlock()
+	fmt.Println("[WhatsApp] Your Meta app is subscribed to the WhatsApp Business account's messages.")
+	return ""
 }
 
 // Probe checks a phone number ID and token without saving anything ("Test connection").
@@ -286,8 +406,28 @@ func plainError(code int, msg string) string {
 		return "The access token is missing a permission. Give it whatsapp_business_messaging and whatsapp_business_management."
 	case 100:
 		return "WhatsApp did not accept a value Pulse sent. Check the phone number ID and the customer's number."
-	case 131000, 1, 2:
+	case 131000, 1, 2, 131016:
 		return "WhatsApp had a temporary problem. Try again in a few minutes."
+	case 133010, 131045:
+		return "This business number is not registered for the WhatsApp Business API yet. In Meta, open WhatsApp > API Setup, and register the number (Meta asks for a 6-digit PIN), then try again."
+	case 131048:
+		return "WhatsApp is limiting this number because too many people blocked or reported its messages. Send less, and only to customers who asked for your messages."
+	case 131049:
+		return "WhatsApp held back this marketing message, because this customer has received many marketing messages lately. Try again in a few days."
+	case 131050:
+		return "This customer has stopped marketing messages from businesses on WhatsApp."
+	case 131021:
+		return "A message cannot be sent to your own business number."
+	case 131051:
+		return "WhatsApp does not support this kind of message."
+	case 131052, 131053:
+		return "WhatsApp could not process the attached file. Check that it is a JPG, PNG or PDF, and that a photo is under 5 MB."
+	case 131042:
+		return "There is a payment problem on your WhatsApp Business account. Check the payment method in WhatsApp Manager."
+	case 131008, 131009:
+		return "The values for the template do not match it. Check how many {{1}}, {{2}}... values the template needs in WhatsApp Manager."
+	case 368:
+		return "Meta has temporarily blocked this number from sending because of a policy issue. Check WhatsApp Manager for details."
 	}
 	if msg != "" {
 		return "WhatsApp did not accept the request: " + msg
@@ -296,10 +436,13 @@ func plainError(code int, msg string) string {
 }
 
 // do sends one Graph API request and decodes the JSON answer into out. A request that
-// WhatsApp refused with "too many requests" or a server error is tried again, because
-// nothing was accepted. A request that may have reached Meta (a timeout or a dropped
-// connection after sending) is never repeated, so a customer never gets a message twice.
+// WhatsApp refused with "too many requests" is tried again, because nothing was
+// accepted. A server error (5xx) is only retried for reads and media uploads: Meta may
+// have queued a message before failing, and there is no way to send it idempotently.
+// A request that may have reached Meta (a timeout or a dropped connection after
+// sending) is never repeated, so a customer never gets a message twice.
 func (c *Client) do(ctx context.Context, method, url, token, contentType string, body []byte, out any) error {
+	repeatable := method == http.MethodGet || strings.HasSuffix(url, "/media")
 	for attempt := 0; ; attempt++ {
 		var rd io.Reader
 		if body != nil {
@@ -322,19 +465,23 @@ func (c *Client) do(ctx context.Context, method, url, token, contentType string,
 			if notSent(err) {
 				return ErrNotConnected
 			}
-			return errors.New("WhatsApp took too long to answer. Check the chat before sending again, so the customer does not get it twice.")
+			return &uncertainError{"WhatsApp took too long to answer. Check the chat before sending again, so the customer does not get it twice."}
 		}
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if out != nil && len(data) > 0 {
 				if err := json.Unmarshal(data, out); err != nil {
+					if !repeatable {
+						// Meta answered "OK", so the message may well have gone out.
+						return &uncertainError{"WhatsApp accepted the request but sent an answer Pulse could not read. Check the chat before sending again."}
+					}
 					return errors.New("WhatsApp sent an answer Pulse could not read.")
 				}
 			}
 			return nil
 		}
-		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && attempt < len(c.retryWait) && c.wait(ctx, attempt) {
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 && repeatable) && attempt < len(c.retryWait) && c.wait(ctx, attempt) {
 			continue
 		}
 		var e struct {
@@ -354,6 +501,9 @@ func (c *Client) do(ctx context.Context, method, url, token, contentType string,
 		}
 		fmt.Printf("[WhatsApp] Meta answered HTTP %d, code %d: %s\n", resp.StatusCode, e.Error.Code, msg)
 		ae := &APIError{HTTPStatus: resp.StatusCode, Code: e.Error.Code, Message: msg, Plain: plainError(e.Error.Code, e.Error.Message)}
+		if resp.StatusCode >= 500 && !repeatable {
+			ae.Plain = "WhatsApp had a problem and may or may not have sent this message. Check the chat before sending it again."
+		}
 		if ae.Code == 190 {
 			c.setProblem(ae.Plain)
 		}
@@ -389,8 +539,10 @@ func IsNotConnected(err error) bool {
 }
 
 // digits returns a recipient as Meta expects it: country code and number, digits only.
+// Recipients are stored contact numbers (or already cleaned), so no country code is
+// guessed: the Singapore contact 6591234567 is not sent to India's 916591234567.
 func digits(to string) (string, error) {
-	d := contacts.CleanPhone(to)
+	d := contacts.NormalizePhone(to)
 	if len(d) < 7 || len(d) > 15 {
 		return "", fmt.Errorf("%q is not a phone number with country code.", to)
 	}
@@ -404,6 +556,9 @@ func (c *Client) send(ctx context.Context, payload map[string]any) (string, erro
 		return "", err
 	}
 	payload["messaging_product"] = "whatsapp"
+	if label, _ := ctx.Value(callbackKey{}).(string); label != "" && len(label) <= 512 {
+		payload["biz_opaque_callback_data"] = label
+	}
 	body, _ := json.Marshal(payload)
 	var out struct {
 		Messages []struct {
@@ -414,7 +569,7 @@ func (c *Client) send(ctx context.Context, payload map[string]any) (string, erro
 		return "", err
 	}
 	if len(out.Messages) == 0 || out.Messages[0].ID == "" {
-		return "", errors.New("WhatsApp accepted the request but returned no message ID. Check the chat before sending again.")
+		return "", &uncertainError{"WhatsApp accepted the request but returned no message ID. Check the chat before sending again."}
 	}
 	return out.Messages[0].ID, nil
 }
@@ -444,16 +599,60 @@ func (c *Client) SendReply(ctx context.Context, to, text, quotedID string) (stri
 	return c.send(ctx, p)
 }
 
-// SendTemplate sends a Meta-approved template; bodyParams fill {{1}}, {{2}}... in order.
-// Templates are the only messages allowed more than 24 hours after the customer wrote.
-func (c *Client) SendTemplate(ctx context.Context, to, name, lang string, bodyParams []string) (string, error) {
+// TemplateParts are the values that fill a Meta-approved template.
+type TemplateParts struct {
+	Header      []string // variables of a text header
+	HeaderMedia string   // https link to the photo, video or document of a media header
+	Body        []string // {{1}}, {{2}}... in the body, in order
+	// URLButtons holds the variable end of each dynamic URL button, by button position;
+	// an empty entry is a button without a variable (for example a quick reply).
+	URLButtons []string
+}
+
+// HeaderMediaKind says how WhatsApp should treat a header link, from its file type.
+func HeaderMediaKind(link string) string {
+	l := strings.ToLower(link)
+	if i := strings.IndexAny(l, "?#"); i >= 0 {
+		l = l[:i]
+	}
+	switch {
+	case strings.HasSuffix(l, ".jpg"), strings.HasSuffix(l, ".jpeg"), strings.HasSuffix(l, ".png"):
+		return "image"
+	case strings.HasSuffix(l, ".mp4"), strings.HasSuffix(l, ".3gp"):
+		return "video"
+	}
+	return "document"
+}
+
+func textParams(values []string) []map[string]string {
+	out := make([]map[string]string, 0, len(values))
+	for _, v := range values {
+		out = append(out, map[string]string{"type": "text", "text": v})
+	}
+	return out
+}
+
+// SendTemplate sends a Meta-approved template filled with parts. Templates are the only
+// messages allowed more than 24 hours after the customer wrote.
+func (c *Client) SendTemplate(ctx context.Context, to, name, lang string, parts TemplateParts) (string, error) {
 	tpl := map[string]any{"name": name, "language": map[string]string{"code": lang}}
-	if len(bodyParams) > 0 {
-		params := make([]map[string]string, 0, len(bodyParams))
-		for _, v := range bodyParams {
-			params = append(params, map[string]string{"type": "text", "text": v})
+	var comps []map[string]any
+	if parts.HeaderMedia != "" {
+		kind := HeaderMediaKind(parts.HeaderMedia)
+		comps = append(comps, map[string]any{"type": "header", "parameters": []map[string]any{{"type": kind, kind: map[string]string{"link": parts.HeaderMedia}}}})
+	} else if len(parts.Header) > 0 {
+		comps = append(comps, map[string]any{"type": "header", "parameters": textParams(parts.Header)})
+	}
+	if len(parts.Body) > 0 {
+		comps = append(comps, map[string]any{"type": "body", "parameters": textParams(parts.Body)})
+	}
+	for i, v := range parts.URLButtons {
+		if v != "" {
+			comps = append(comps, map[string]any{"type": "button", "sub_type": "url", "index": fmt.Sprint(i), "parameters": textParams([]string{v})})
 		}
-		tpl["components"] = []map[string]any{{"type": "body", "parameters": params}}
+	}
+	if len(comps) > 0 {
+		tpl["components"] = comps
 	}
 	p, err := c.message(to, "template", tpl)
 	if err != nil {
@@ -499,7 +698,8 @@ func (c *Client) SendMediaMessage(ctx context.Context, to string, data []byte, f
 		return "", errors.New("WhatsApp did not accept the file. Try again.")
 	}
 	var p map[string]any
-	if mimeType == "image/jpeg" || mimeType == "image/png" {
+	// WhatsApp refuses photos over 5 MB; a larger one goes as a document instead.
+	if (mimeType == "image/jpeg" || mimeType == "image/png") && len(data) <= maxPhotoBytes {
 		img := map[string]any{"id": up.ID}
 		if caption != "" {
 			img["caption"] = caption
@@ -520,6 +720,9 @@ func (c *Client) SendMediaMessage(ctx context.Context, to string, data []byte, f
 	}
 	return c.send(ctx, p)
 }
+
+// maxPhotoBytes is the largest photo WhatsApp accepts as an image message.
+const maxPhotoBytes = 5 << 20
 
 func safeName(n string) string {
 	n = strings.Map(func(r rune) rune {
@@ -548,7 +751,7 @@ func (c *Client) MarkAsRead(ctx context.Context, messageID string) error {
 // no known message it does nothing.
 func (c *Client) ShowTyping(ctx context.Context, phone string) error {
 	c.mu.RLock()
-	id := c.lastInbound[contacts.CleanPhone(phone)]
+	id := c.lastInbound[contacts.NormalizePhone(phone)]
 	c.mu.RUnlock()
 	if id == "" {
 		return nil

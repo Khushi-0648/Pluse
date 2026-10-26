@@ -2,12 +2,14 @@
 package msgtemplate
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"whatsapp-automation/pkg/config"
 )
@@ -60,6 +62,20 @@ type Vars struct {
 	Extra    map[string]string
 	Now      time.Time
 	Location *time.Location
+}
+
+// Location returns the business time zone from the opening-hours settings, so
+// {{greeting}}, {{date}} and {{time}} follow the business's clock in every sender, not
+// the computer's. An empty, "local" or unknown zone is the computer's own.
+func Location(tz string) *time.Location {
+	tz = strings.TrimSpace(tz)
+	if tz == "" || strings.EqualFold(tz, "local") {
+		return time.Local
+	}
+	if l, err := time.LoadLocation(tz); err == nil {
+		return l
+	}
+	return time.Local
 }
 
 // IsPlaceholderName reports whether a name is missing or is really a phone number,
@@ -137,16 +153,27 @@ func (v Vars) values() map[string]string {
 	return vals
 }
 
+// nameBeforePunct is a name variable right before punctuation, with an optional comma
+// in front: ", {{first_name}}." or " {{name}},".
+var nameBeforePunct = regexp.MustCompile(`,?\s*\{\{\s*(?i:first_name|name)\s*\}\}([.,!?])`)
+
 // Render substitutes placeholders. Missing lists variables that are unknown or empty;
 // callers must not send text with missing variables.
 func Render(text string, v Vars) (out string, missing []string) {
+	if IsPlaceholderName(v.Name) {
+		// With no name, "Thank you, there." reads oddly: drop the name where punctuation
+		// follows ("Thank you." / "Goodbye, have a good day."); "Hello there" stays.
+		text = nameBeforePunct.ReplaceAllString(text, "$1")
+	}
 	vals := v.values()
 	seen := map[string]bool{}
 	out = tokenRe.ReplaceAllStringFunc(text, func(tok string) string {
 		key := canonical(tokenRe.FindStringSubmatch(tok)[1])
 		val, ok := vals[key]
 		if !ok || val == "" {
-			if key != "message" && !seen[key] {
+			// {{message}} is empty only where there is no customer message to quote (a
+			// campaign, a scheduled or typed message): reported, so it is never sent as a gap.
+			if !seen[key] {
 				seen[key] = true
 				missing = append(missing, key)
 			}
@@ -202,6 +229,40 @@ func Used(text string) []string {
 func Validate(text string, extra ...string) error {
 	if bad := Unknown(text, extra...); len(bad) > 0 {
 		return fmt.Errorf("Unknown variable %s. Use the variable list to insert one of: %s.", quoteList(bad), knownList(extra))
+	}
+	return nil
+}
+
+// ValidateOutgoing is Validate for messages Pulse starts itself (campaigns, scheduled
+// messages, saved templates, integrations): there is no customer message to quote, so
+// {{message}} is refused up front instead of failing for every recipient later.
+func ValidateOutgoing(text string, extra ...string) error {
+	if err := Validate(text, extra...); err != nil {
+		return err
+	}
+	for _, k := range Used(text) {
+		if k == "message" {
+			return errors.New("{{message}} is the customer's own message and only works in automatic replies. Remove it from this message.")
+		}
+	}
+	return nil
+}
+
+// WhatsApp's limits, counted in characters (a Hindi letter is one character but three
+// bytes, so counting bytes would refuse long Hindi messages far too early).
+const (
+	MaxTextChars    = 4096 // a text message
+	MaxCaptionChars = 1024 // the caption of a photo or document
+)
+
+// LengthError reports a message too long for WhatsApp; withMedia applies the caption limit.
+func LengthError(text string, withMedia bool) error {
+	limit, what := MaxTextChars, "message"
+	if withMedia {
+		limit, what = MaxCaptionChars, "caption of a photo or document"
+	}
+	if n := utf8.RuneCountInString(text); n > limit {
+		return fmt.Errorf("The %s is too long: %d characters, WhatsApp allows %d.", what, n, limit)
 	}
 	return nil
 }

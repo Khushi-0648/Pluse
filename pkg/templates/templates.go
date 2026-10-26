@@ -168,7 +168,7 @@ func (s *Store) Save(t Template) (Template, error) {
 	if len(t.Content) > 4000 || len(t.Name) > 80 || len(t.Category) > 40 || len(t.Description) > 200 {
 		return t, errors.New("The template is too long.")
 	}
-	if err := msgtemplate.Validate(t.Content, ContactVariables...); err != nil {
+	if err := msgtemplate.ValidateOutgoing(t.Content, ContactVariables...); err != nil {
 		return t, err
 	}
 	t.ID = SlugID(t.ID)

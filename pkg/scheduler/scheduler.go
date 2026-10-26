@@ -60,10 +60,13 @@ type Scheduler struct {
 	cfg      *config.Config
 	contacts *contacts.Store
 	hist     *history.Store
-	cancel   context.CancelFunc
-	sending  bool
-	fails    int       // failed sends in a row
-	pausedTo time.Time // sending waits until then after too many failures in a row
+	// confirmed holds message IDs Meta reported (by label) while a job's send was still
+	// waiting for its answer; a send that then times out is recorded as sent with it.
+	confirmed map[string]string
+	cancel    context.CancelFunc
+	sending   bool
+	fails     int       // failed sends in a row
+	pausedTo  time.Time // sending waits until then after too many failures in a row
 }
 
 // failPause is how long scheduled sending waits after 5 failures in a row.
@@ -90,7 +93,32 @@ func NewScheduler(filePath string, s campaign.Sender, cfg *config.Config, cs *co
 			sc.jobs[i].Error = "Pulse stopped while sending. Check the chat before retrying."
 		}
 	}
+	if cs != nil {
+		cs.OnRenamed(sc.RenamePhone)
+	}
 	return sc, nil
+}
+
+// RenamePhone moves waiting messages from the number Pulse 2.0 saved for a contact to
+// their real number, when the contact is moved (contacts.OnRenamed). Otherwise a message
+// scheduled under 2.0 would still go to the mis-prefixed number, which may be a stranger.
+func (s *Scheduler) RenamePhone(oldPhone, newPhone string) {
+	s.mu.Lock()
+	changed := false
+	for i := range s.jobs {
+		if j := &s.jobs[i]; j.Recipient == oldPhone && j.Status == StatusPending {
+			j.Recipient = newPhone
+			changed = true
+		}
+	}
+	var err error
+	if changed {
+		err = s.saveLocked()
+	}
+	s.mu.Unlock()
+	if err != nil {
+		fmt.Printf("[Schedule] Could not save the corrected number for scheduled messages: %v\n", err)
+	}
 }
 
 func (s *Scheduler) saveLocked() error {
@@ -135,10 +163,10 @@ func (s *Scheduler) Validate(recipient, message string, at time.Time, tmpl *camp
 	if message == "" {
 		return "", nil, errors.New("Write the message.")
 	}
-	if len(message) > 4000 {
-		return "", nil, errors.New("The message is too long (4000 characters at most).")
+	if err := msgtemplate.LengthError(message, false); err != nil {
+		return "", nil, err
 	}
-	if err := msgtemplate.Validate(message, "email", "notes"); err != nil {
+	if err := msgtemplate.ValidateOutgoing(message, "email", "notes"); err != nil {
 		return "", nil, err
 	}
 	if at.Before(time.Now().Add(-time.Minute)) {
@@ -149,11 +177,16 @@ func (s *Scheduler) Validate(recipient, message string, at time.Time, tmpl *camp
 	}
 	var warn []string
 	if s.contacts != nil {
-		if c, ok := s.contacts.Get(phone); ok {
+		// Looked up as typed first, so a saved contact keeps its own number (the form sends
+		// the Singapore contact 6591234567 as digits, which CleanPhone would read as Indian).
+		if c, ok := s.contacts.Get(recipient); ok {
+			phone = c.Phone
 			if c.IsDND {
 				return "", nil, errors.New("This customer opted out. Messages to them are blocked.")
 			}
-			if !c.Consent {
+			if !c.Consent && s.cfg != nil && s.cfg.Snapshot().Automation.RequireOptIn {
+				warn = append(warn, "This customer has no opt-in recorded, and \"Require opt-in\" is on, so the message will be skipped. Record their consent first.")
+			} else if !c.Consent {
 				warn = append(warn, "This customer has no opt-in recorded. Unless they write to you in the 24 hours before the scheduled time, the message will be skipped.")
 			} else if tmpl == nil && (c.LastInboundAt == nil || at.Sub(*c.LastInboundAt) >= 24*time.Hour) {
 				warn = append(warn, "Unless this customer writes to you in the 24 hours before the scheduled time, WhatsApp only allows an approved template, and the message will be skipped. Add an official WhatsApp template to be sure it goes out.")
@@ -349,18 +382,21 @@ func (s *Scheduler) processDue(ctx context.Context) {
 			}
 		}
 		switch {
-		case ct != nil && ct.IsDND:
+		case ct != nil && ct.IsDND, ct == nil && s.contacts != nil && s.contacts.WasOptedOut(j.Recipient):
 			s.finish(j.ID, StatusSkipped, "", "Not sent: the customer opted out.")
 			continue
 		case inList(a.BlacklistPhones, j.Recipient):
 			s.finish(j.ID, StatusSkipped, "", "Not sent: the number is on the blocked list.")
 			continue
-		case a.AllowListOnly && !inList(a.AllowList, j.Recipient):
+		case a.AllowListOnly && !s.contacts.AllowListed(a.AllowList, j.Recipient):
 			s.finish(j.ID, StatusSkipped, "", "Not sent: test mode is on and this is not one of the test numbers.")
 			continue
-		// "Require opt-in" applies as for messages sent from the dashboard: without a
-		// recorded opt-in, only customers who wrote in the last 24 hours can be messaged.
-		case (a.Enforce24hWindow || a.RequireOptIn) && (ct == nil || (!ct.Consent && !ct.InServiceWindow(time.Now()))):
+		// "Require opt-in" applies as for campaigns: a message Pulse starts on its own needs
+		// a recorded opt-in, even when the customer wrote recently.
+		case a.RequireOptIn && (ct == nil || !ct.Consent):
+			s.finish(j.ID, StatusSkipped, "", "Not sent: no opt-in is recorded for this customer, and \"Require opt-in\" is on.")
+			continue
+		case a.Enforce24hWindow && (ct == nil || (!ct.Consent && !ct.InServiceWindow(time.Now()))):
 			s.finish(j.ID, StatusSkipped, "", "Not sent: no opt-in recorded and the customer has not written in the last 24 hours.")
 			continue
 		}
@@ -369,52 +405,74 @@ func (s *Scheduler) processDue(ctx context.Context) {
 			s.unclaim(j.ID) // try again after midnight
 			continue
 		}
-		mv := msgtemplate.Vars{Name: name, Phone: j.Recipient, Business: cfg.Business, Extra: vars}
+		// {{greeting}}, {{date}} and {{time}} follow the business's time zone.
+		mv := msgtemplate.Vars{Name: name, Phone: j.Recipient, Business: cfg.Business, Extra: vars, Now: time.Now(), Location: msgtemplate.Location(cfg.BusinessHours.Timezone)}
 		text, missing := msgtemplate.Render(j.Message, mv)
 		// Outside the 24-hour window WhatsApp only delivers an approved template.
 		useTemplate := campaign.NeedsTemplate(ct, time.Now())
-		var params []string
+		var parts cloudapi.TemplateParts
 		if useTemplate {
 			if j.Template == nil {
 				releaseDaily()
 				s.finish(j.ID, StatusSkipped, "", "Not sent: "+campaign.OutsideWindowMessage)
 				continue
 			}
-			params, missing = j.Template.Render(mv)
-			text = j.Template.Describe(params)
+			parts, missing = j.Template.Render(mv)
+			text = j.Template.Describe(parts)
 		}
 		if len(missing) > 0 {
 			releaseDaily()
 			s.finish(j.ID, StatusFailed, "", msgtemplate.MissingError(missing).Error())
 			continue
 		}
-		rec := history.MessageRecord{Direction: history.DirectionOutgoing, Type: history.TypeScheduled, Phone: j.Recipient, Text: text, SentBy: j.CreatedBy}
+		rec := history.MessageRecord{Direction: history.DirectionOutgoing, Type: history.TypeScheduled, Phone: j.Recipient, Text: text, SentBy: j.CreatedBy, Label: Label + j.ID}
 		if a.DryRun {
 			rec.ID, rec.Status = "dry_"+security.RandomToken(6), history.StatusDryRun
 			s.finish(j.ID, StatusSkipped, "", "Practice mode: shown in the inbox but not sent.")
+			if s.hist != nil {
+				s.hist.Record(rec)
+			}
 		} else {
+			// The history gets a "sending" record first: if Pulse dies mid-send it still
+			// counts towards the daily limit, and its label corrects it later.
+			placeholder := ""
+			if s.hist != nil {
+				placeholder = s.hist.Placeholder(rec)
+				releaseDaily() // the history counts it from here on
+			}
 			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+			sctx = cloudapi.WithCallbackData(sctx, Label+j.ID) // lets Reconcile fix a crash-interrupted send
 			var id string
 			var err error
 			if useTemplate {
-				id, err = campaign.SendTemplate(sctx, s.sender, j.Recipient, *j.Template, params)
+				id, err = campaign.SendTemplate(sctx, s.sender, j.Recipient, *j.Template, parts)
 			} else {
 				id, err = s.sender.SendTextMessage(sctx, j.Recipient, text)
 			}
 			cancel()
+			if confirmedID := s.takeConfirmed(j.ID); err != nil && confirmedID != "" {
+				id, err = confirmedID, nil // Meta reported it sent while the answer was lost
+			}
 			if cloudapi.IsNotConnected(err) {
+				if s.hist != nil {
+					s.hist.Unsend(placeholder) // nothing left Pulse
+				}
 				releaseDaily()
 				s.unclaim(j.ID) // connection dropped: retry on the next tick instead of failing
 				return
 			}
 			if err != nil {
-				rec.ID, rec.Status, rec.Error = "fail_"+security.RandomToken(6), history.StatusFailed, err.Error()
+				if s.hist != nil {
+					s.hist.Settle(placeholder, "fail_"+security.RandomToken(6), history.StatusFailed, err.Error(), cloudapi.MaybeSent(err))
+				}
 				s.finish(j.ID, StatusFailed, "", err.Error())
 				s.mu.Lock()
 				s.fails++
 				s.mu.Unlock()
 			} else {
-				rec.ID, rec.Status = id, history.StatusSent
+				if s.hist != nil {
+					s.hist.Settle(placeholder, id, history.StatusSent, "", false)
+				}
 				s.finish(j.ID, StatusSent, id, "")
 				if s.contacts != nil {
 					s.contacts.UpdateLastContacted(j.Recipient)
@@ -424,9 +482,6 @@ func (s *Scheduler) processDue(ctx context.Context) {
 				s.mu.Unlock()
 				sent++
 			}
-		}
-		if s.hist != nil {
-			s.hist.Record(rec)
 		}
 		releaseDaily() // the history counts it from here on
 		if a.DryRun {
@@ -453,7 +508,7 @@ func (s *Scheduler) processDue(ctx context.Context) {
 
 func inList(list []string, phone string) bool {
 	for _, p := range list {
-		if contacts.CleanPhone(p) == phone {
+		if contacts.MatchesTyped(p, phone) {
 			return true
 		}
 	}
@@ -471,14 +526,67 @@ func (s *Scheduler) unclaim(id string) {
 	}
 }
 
+// Label prefixes the label every scheduled message is sent with (biz_opaque_callback_data).
+const Label = "pulse:s:"
+
+// Reconcile applies a delivery update that carries a scheduled message's label. A job
+// whose send was cut off (Pulse stopped, or Meta's answer never arrived) is saved as
+// failed without a message ID, so nobody resends it blindly; when Meta then reports it
+// sent, delivered or read, the job is shown as sent after all. It reports whether the
+// label was a scheduled message's.
+func (s *Scheduler) Reconcile(label, messageID, status string) bool {
+	id, ok := strings.CutPrefix(label, Label)
+	if !ok {
+		return false
+	}
+	if status != "sent" && status != "delivered" && status != "read" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.jobs {
+		if j := &s.jobs[i]; j.ID == id && j.Status == StatusSending {
+			// The send is still waiting for its answer: remember the ID for it.
+			if s.confirmed == nil {
+				s.confirmed = map[string]string{}
+			}
+			s.confirmed[id] = messageID
+		}
+		if j := &s.jobs[i]; j.ID == id && j.Status == StatusFailed && j.MessageID == "" {
+			now := time.Now()
+			j.Status, j.MessageID, j.SentAt, j.Error = StatusSent, messageID, &now, ""
+			if err := s.saveLocked(); err != nil {
+				fmt.Printf("[Schedule] Could not save that message %s was delivered: %v\n", id, err)
+			}
+		}
+	}
+	return true
+}
+
+// takeConfirmed returns (and forgets) a message ID Meta reported for job id while its
+// send was waiting.
+func (s *Scheduler) takeConfirmed(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mid := s.confirmed[id]
+	delete(s.confirmed, id)
+	return mid
+}
+
 // claim marks a pending job as being sent; it fails if the job was cancelled or removed.
+// The mark must be on disk before the send: after a crash a job still saved as pending
+// would be sent a second time, so if it cannot be saved the job waits for the next tick.
 func (s *Scheduler) claim(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.jobs {
 		if s.jobs[i].ID == id && s.jobs[i].Status == StatusPending {
 			s.jobs[i].Status = StatusSending
-			_ = s.saveLocked()
+			if err := s.saveLocked(); err != nil {
+				s.jobs[i].Status = StatusPending
+				fmt.Printf("[Schedule] Not sending yet: the schedule could not be saved (%v). Trying again shortly.\n", err)
+				return false
+			}
 			return true
 		}
 	}

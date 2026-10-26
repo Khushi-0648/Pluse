@@ -11,7 +11,17 @@
   function patterned(a, b) {
     const x = a.codePointAt(0), y = b.codePointAt(0);
     if (x === y || y === x + 1 || y === x - 1) return true;
-    return ROWS.some((row) => { const i = row.indexOf(a), j = row.indexOf(b); return i >= 0 && j >= 0 && Math.abs(i - j) === 1; });
+    const [ra, ca] = keyPos(a), [rb, cb] = keyPos(b);
+    if (ra < 0 || rb < 0) return false;
+    if (ra === rb) return Math.abs(ca - cb) === 1;
+    // The key above or below (rows are staggered: 1 over q, q over a, a over z).
+    if (rb === ra + 1) return cb === ca || cb === ca - 1;
+    if (rb === ra - 1) return cb === ca || cb === ca + 1;
+    return false;
+  }
+  function keyPos(c) {
+    for (let i = 0; i < ROWS.length; i++) { const j = ROWS[i].indexOf(c); if (j >= 0) return [i, j]; }
+    return [-1, -1];
   }
   function guessable(lower) {
     const rs = Array.from(lower);
@@ -23,7 +33,10 @@
     }
     if (allRuns) return true;
     const letters = lower.replace(/[^a-z]/g, ''), d = Array.from(lower.replace(/[^0-9]/g, ''));
-    if (!COMMON.has(letters)) return false;
+    if (!COMMON.has(letters)) {
+      // A common word with one or two letters added (hello2024x) is just as easy.
+      return d.length <= 4 && [...COMMON].some((w) => w.length >= 4 && letters.includes(w) && letters.length - w.length <= 2);
+    }
     if (d.length <= 4) return true;
     return d.every((c, i) => i === 0 || patterned(d[i - 1], c));
   }
@@ -58,9 +71,18 @@
     const text = document.getElementById('client-error-text');
     const update = () => {
       const r = check(p1.value.trim());
-      document.querySelectorAll('#pw-rules li').forEach((li) => li.classList.toggle('ok', !!r[li.dataset.rule]));
+      // Not by colour alone: the CSS adds a check mark, and screen readers hear (met).
+      document.querySelectorAll('#pw-rules li').forEach((li) => {
+        const met = !!r[li.dataset.rule];
+        if (li.classList.contains('ok') === met && li.dataset.checked) return; // announce changes only
+        li.dataset.checked = '1';
+        li.classList.toggle('ok', met);
+        const s = li.querySelector('.rule-state');
+        if (s) s.textContent = met ? '(met)' : '(not met)';
+      });
     };
     p1.addEventListener('input', update);
+    update();
     form.addEventListener('submit', (e) => {
       const r = check(p1.value.trim());
       let msg = '';

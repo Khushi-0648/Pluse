@@ -40,14 +40,20 @@ type Dispatcher struct {
 	pending  []*Delivery
 	failed   []Delivery
 	path     string
-	pendPath string // events not yet delivered, saved at Stop and sent at the next start
-	box      *securestore.Box
-	wake     chan struct{}
-	client   func(time.Duration) *http.Client
-	cached   *http.Client
-	cachedTO time.Duration
-	stop     chan struct{}
-	stopOnce sync.Once
+	pendPath string // events not yet delivered, kept on disk and sent at the next start
+	// pendSaver writes the queue about a second after every change, so a crash, a forced
+	// stop or a reboot does not lose events (such as contact.opted_out) still waiting.
+	pendSaver *securestore.Saver
+	box       *securestore.Box
+	wake      chan struct{}
+	client    func(time.Duration) *http.Client
+	cached    *http.Client
+	cachedTO  time.Duration
+	stop      chan struct{}
+	stopOnce  sync.Once
+	// dropped counts events lost to a full queue since dropLoggedAt (not yet logged).
+	dropped      int
+	dropLoggedAt time.Time
 }
 
 const maxFailed = 200
@@ -72,8 +78,8 @@ func New(cfg *config.Config, failedPath string) *Dispatcher {
 				d.pending = saved
 			}
 		}
-		// Loaded into memory; the file is written again at the next normal close.
-		d.removePendingFile()
+		// The file stays until those events are delivered; every change rewrites it.
+		d.pendSaver = securestore.NewSaver(time.Second, d.persistPending)
 	}
 	return d
 }
@@ -86,16 +92,42 @@ func (d *Dispatcher) Stop() {
 	d.stopOnce.Do(func() {
 		close(d.stop)
 		d.mu.Lock()
-		defer d.mu.Unlock()
-		if d.pendPath == "" || len(d.pending) == 0 {
+		unlogged := d.dropped
+		d.dropped = 0
+		d.mu.Unlock()
+		if unlogged > 0 {
+			logDropped(unlogged)
+		}
+		if d.pendSaver == nil {
 			return
 		}
-		if data, err := json.Marshal(d.pending); err == nil {
-			if err := d.box.WriteFileNoBackup(d.pendPath, data); err != nil {
-				fmt.Printf("[Webhook] %d events could not be saved for delivery later: %v\n", len(d.pending), err)
-			}
+		if err := d.pendSaver.Flush(); err != nil {
+			fmt.Printf("[Webhook] %d events could not be saved for delivery later: %v\n", d.PendingCount(), err)
 		}
 	})
+}
+
+// pendingChanged schedules saving the queue.
+func (d *Dispatcher) pendingChanged() {
+	if d.pendSaver != nil {
+		d.pendSaver.Trigger()
+	}
+}
+
+// persistPending writes the queue (or removes the file when it is empty).
+func (d *Dispatcher) persistPending() error {
+	d.mu.Lock()
+	if len(d.pending) == 0 {
+		d.removePendingFile()
+		d.mu.Unlock()
+		return nil
+	}
+	data, err := json.Marshal(d.pending)
+	d.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return d.box.WriteFileNoBackup(d.pendPath, data)
 }
 
 func (d *Dispatcher) removePendingFile() {
@@ -131,12 +163,33 @@ func (d *Dispatcher) Send(event string, data any) {
 		return
 	}
 	d.mu.Lock()
-	if len(d.pending) >= 1000 {
+	var report int
+	if len(d.pending) >= maxPending {
+		// The other system has been unreachable for a long time: the oldest event is lost.
+		// Recorded in the activity log, at most once a minute with a count.
 		d.pending = d.pending[1:]
+		d.dropped++
+		if now := time.Now(); now.Sub(d.dropLoggedAt) >= dropLogEvery {
+			report, d.dropped, d.dropLoggedAt = d.dropped, 0, now
+		}
 	}
 	d.pending = append(d.pending, &Delivery{ID: env.ID, Event: event, CreatedAt: env.Time, Payload: body, next: time.Now()})
 	d.mu.Unlock()
+	if report > 0 {
+		logDropped(report)
+	}
+	d.pendingChanged()
 	d.poke()
+}
+
+const (
+	maxPending   = 1000
+	dropLogEvery = time.Minute
+)
+
+// logDropped records lost events in the activity log (overridable in tests).
+var logDropped = func(n int) {
+	security.LogAudit("WEBHOOK_EVENT_DROPPED", "local", "system", fmt.Sprintf("%d event(s) for the other system were dropped because %d were already waiting (the other system has not answered for a long time)", n, maxPending), "failed")
 }
 
 func (d *Dispatcher) poke() {
@@ -184,14 +237,24 @@ func (d *Dispatcher) flushDue() {
 			return
 		default:
 		}
+		wh := d.cfg.Snapshot().Webhook
 		d.mu.Lock()
+		// Switched off (or no address) since these were queued: the owner no longer wants
+		// customer messages to leave Pulse this way, so nothing queued is sent any more.
+		if (!wh.Enabled || wh.URL == "") && len(d.pending) > 0 {
+			n := len(d.pending)
+			d.pending = nil
+			d.mu.Unlock()
+			d.pendingChanged()
+			security.LogAudit("WEBHOOK_QUEUE_DROPPED", "local", "system", fmt.Sprintf("Dropped %d queued events because sending events to another system is switched off", n), "success")
+			return
+		}
 		if len(d.pending) == 0 || d.pending[0].next.After(time.Now()) {
 			d.mu.Unlock()
 			return
 		}
 		p := d.pending[0]
 		d.mu.Unlock()
-		wh := d.cfg.Snapshot().Webhook
 		code, err := d.deliver(wh, p.Payload)
 		d.mu.Lock()
 		if !d.isPendingLocked(p) {
@@ -237,6 +300,7 @@ func (d *Dispatcher) removePendingLocked(p *Delivery) {
 	for i, q := range d.pending {
 		if q == p {
 			d.pending = append(d.pending[:i], d.pending[i+1:]...)
+			d.pendingChanged() // only schedules the save, which takes d.mu itself later
 			return
 		}
 	}
@@ -343,24 +407,27 @@ func (d *Dispatcher) Replay(id string) int {
 	d.failed = append([]Delivery(nil), kept...)
 	d.saveLocked()
 	d.mu.Unlock()
+	d.pendingChanged()
 	d.poke()
 	return n
 }
 
-// Forget drops queued and failed events that mention text (a phone number), or every
-// event when text is empty.
-func (d *Dispatcher) Forget(text string) {
+// Forget drops queued and failed events for one customer (phone, with or without the
+// leading +), or every event when phone is empty. Only an event whose "phone" field is
+// exactly that number matches: +1415555010 must not also erase +14155550100's events,
+// nor an event that merely quotes the number in a message text.
+func (d *Dispatcher) Forget(phone string) {
 	d.mu.Lock()
 	keepP := d.pending[:0:0]
 	for _, p := range d.pending {
-		if text != "" && !strings.Contains(string(p.Payload), text) {
+		if phone != "" && !eventForPhone(p.Payload, phone) {
 			keepP = append(keepP, p)
 		}
 	}
 	d.pending = keepP
 	keepF := d.failed[:0:0]
 	for _, f := range d.failed {
-		if text != "" && !strings.Contains(string(f.Payload), text) {
+		if phone != "" && !eventForPhone(f.Payload, phone) {
 			keepF = append(keepF, f)
 		}
 	}
@@ -369,8 +436,22 @@ func (d *Dispatcher) Forget(text string) {
 	if d.path != "" {
 		securestore.RemoveBackup(d.path)
 	}
-	d.removePendingFile()
+	d.removePendingFile() // erased at once; the remaining events are written again below
 	d.mu.Unlock()
+	d.pendingChanged()
+}
+
+// eventForPhone reports whether an event envelope's data.phone is phone.
+func eventForPhone(payload []byte, phone string) bool {
+	var env struct {
+		Data struct {
+			Phone string `json:"phone"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(payload, &env) != nil || env.Data.Phone == "" {
+		return false
+	}
+	return strings.TrimPrefix(env.Data.Phone, "+") == strings.TrimPrefix(phone, "+")
 }
 
 // ClearFailed deletes the failed-delivery list.

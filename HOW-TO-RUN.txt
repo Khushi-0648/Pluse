@@ -3,9 +3,26 @@ Pulse - messaging automation
 
 The version number is in VERSION.txt and in the dashboard under Help.
 
+WHICH DOWNLOAD
+  Pulse runs on Windows 10 and 11. Pick the zip for the computer:
+  - Pulse-<version>.zip         most PCs and laptops (64-bit Intel or AMD)
+  - Pulse-<version>-arm64.zip   Windows on ARM (Snapdragon laptops, Surface Pro X)
+  - Pulse-<version>-x86.zip     32-bit Windows 10 (older PCs)
+  Not sure? Settings > System > About > System type says "x64-based", "ARM-based" or "32-bit".
+
 START
   Double-click Run-App.bat (or whatsapp-auto.exe). The dashboard opens in its own window.
   Run-Server.bat starts Pulse without a window; open http://127.0.0.1:8085 in your browser.
+
+USE PULSE ON AN ANDROID PHONE
+  Pulse keeps running on this computer (Meta delivers customer messages to it); the phone
+  opens the dashboard through your fixed https address and can install it as an app.
+  1. Set up the fixed https address for the webhook first (see CONNECT WHATSAPP below).
+  2. On this computer: Settings > Account > Use Pulse on your phone > Switch on phone access.
+  3. On the phone: open Chrome, go to your https address, sign in, then Chrome menu >
+     Install app (or Add to Home screen).
+  Phone access is off until you switch it on; anyone who knows the address then sees the
+  sign-in page, so keep strong passwords. Nothing is stored on the phone.
 
 FIRST SIGN-IN
   Pulse creates a one-time password the first time it starts. It is shown in the black
@@ -14,9 +31,22 @@ FIRST SIGN-IN
   There is no built-in master password.
 
 FORGOT THE PASSWORD?
-  Close Pulse, right-click Reset-Password.bat and choose "Run as administrator".
-  You get a new one-time password. Messages, contacts and the WhatsApp connection are kept.
-  The dashboard shows a notice for 7 days.
+  Close Pulse and double-click Reset-Password.bat. Windows asks for administrator
+  permission; choose "Yes". You get a new one-time password. Messages, contacts and the WhatsApp connection are kept.
+  The dashboard shows a notice for 7 days. Use your own Windows account; do not elevate
+  with another account's password.
+
+  Forgot the password on a standard account (not an administrator)?
+  Pulse's data can only be opened by the Windows account that created it, so the reset
+  must run as that account. Typing an administrator's password when Windows asks runs
+  the reset as the administrator, which finds no Pulse data and changes nothing.
+  The supported way:
+    1. An administrator signs in and makes your account an administrator for a moment:
+       Settings > Accounts > Other users > your account > Change account type > Administrator.
+    2. Sign in as yourself (sign out and in again so the change applies), close Pulse,
+       and double-click Reset-Password.bat. Choose "Yes".
+    3. Sign in to Pulse with the new one-time password and choose your own.
+    4. The administrator changes your account back to Standard user.
 
 CRITICAL: PHONE NUMBER & SETUP REQUIREMENTS BEFORE YOU START
   Pulse connects through Meta's official WhatsApp Business Platform (Cloud API).
@@ -34,7 +64,8 @@ CRITICAL: PHONE NUMBER & SETUP REQUIREMENTS BEFORE YOU START
   2. META PREREQUISITES ("HEAVY SETUP"):
      To connect Pulse, you need:
      - A Meta Developer Account (developers.facebook.com) and Meta Business Portfolio.
-     - A permanent System User Access Token with whatsapp_business_messaging permissions.
+     - A permanent System User Access Token with whatsapp_business_messaging and
+       whatsapp_business_management permissions.
      - A fixed HTTPS tunnel (e.g., a Named Cloudflare Tunnel or static ngrok domain) to
        receive incoming customer messages (Meta delivers incoming messages via webhooks).
      - Approved message templates in WhatsApp Manager for outbound broadcasts (outside 24 hrs).
@@ -42,7 +73,8 @@ CRITICAL: PHONE NUMBER & SETUP REQUIREMENTS BEFORE YOU START
 
 CONNECT WHATSAPP
   From developers.facebook.com, you need: the phone number ID, the WhatsApp Business account ID,
-  a permanent access token (Business settings > System users), and the app secret
+  a permanent access token (Business settings > System users) with the
+  whatsapp_business_messaging and whatsapp_business_management permissions, and the app secret
   (App settings > Basic).
   Incoming messages need a fixed https address or tunnel (e.g. a named Cloudflare
   tunnel with a fixed domain, a static ngrok domain, or a reverse proxy like Caddy).
@@ -83,33 +115,48 @@ OTHER FILES
   Reset-Password.bat           new one-time admin password if you forgot yours
   Run-Unlink.bat               disconnect: remove the WhatsApp access token from this computer
   Create-Desktop-Shortcut.bat  put a Pulse shortcut on the desktop
-  Unblock-Pulse.bat            unblock downloaded files from Windows SmartScreen
+  Unblock-Pulse.bat            check the checksum, then unblock the downloaded files
   scripts\Install-Service.ps1  keep Pulse running in the background and restart it if it stops
   scripts\Stop-Background.ps1  close a background Pulse normally (everything is saved)
   scripts\Uninstall-Service.ps1  stop running Pulse in the background
-  scripts\Sign-Executable.ps1  sign the executable with a code-signing certificate
-  scripts\Create-DevCertificate.ps1 create and trust a self-signed dev certificate
+                               (run the scripts with right-click > Run with PowerShell;
+                               they need no administrator rights)
   BUILD.md                     instructions for building from source and code-signing
   SETUP-GUIDE.md               full setup guide, keeping Pulse running, upgrading
   COMPLIANCE.md                WhatsApp's rules: opt-in, 24 hours, templates, quality
   contacts.example.csv         example file for Contacts > Import
-  SHA256SUMS.txt               checksum to confirm whatsapp-auto.exe was not changed
+  SHA256SUMS.txt               checksum of whatsapp-auto.exe (compare with the one on the download page)
   VERSION.txt                  the version of this package
 
 WINDOWS BLOCKS THE PROGRAM?
   Unless this copy was signed with a trusted code-signing certificate, Windows may stop it:
   - SmartScreen ("Windows protected your PC"): choose "More info" > "Run anyway", but only if
-    the checksum in SHA256SUMS.txt matches (PowerShell: Get-FileHash whatsapp-auto.exe).
-    Run Unblock-Pulse.bat to remove the internet download flag.
-  - Smart App Control blocks unsigned programs completely and cannot be bypassed for one
-    program on Windows 11. Use an official signed release or trust your organization's
-    certificate (BUILD.md).
+    the checksum matches the one published on the download page (PowerShell:
+    Get-FileHash whatsapp-auto.exe). A checksum inside the zip alone proves nothing.
+    Unblock-Pulse.bat shows the checksum and removes the internet download flag.
+  - Smart App Control (Windows 11) blocks unsigned programs completely and cannot make an
+    exception for one program. Run-App.bat and Run-Server.bat check for it: when it is on,
+    they explain the choice and can open Windows Security, where you can switch it off
+    (App & browser control > Smart App Control settings). Only do this if you trust where
+    Pulse came from: it lowers the computer's protection, and on most Windows versions it
+    cannot be switched back on without resetting Windows. A signed release avoids this.
   To check a copy: right-click whatsapp-auto.exe > Properties > Digital Signatures.
 
 UPGRADING
-  Close the old version first. From 1.x, contacts, messages and settings are kept; connect
+  Close the old version first, then unzip the new version into any folder. Settings, the
+  password and the WhatsApp connection are kept in %APPDATA%\Pulse\config.yaml. From 2.0.0
+  (which kept config.yaml in the program folder): copy the old config.yaml next to the new
+  whatsapp-auto.exe before the first start, and Pulse moves it into %APPDATA%\Pulse.
+  From 1.x, contacts, messages and settings are kept; connect
   the Business API as above. The old WhatsApp Web session files are no longer used:
   Settings > Privacy and data offers to delete them. Remove Pulse from the phone's
   Linked devices list. Pulse imports contacts and messages from versions before 1.4 into
   the encrypted data folder and keeps the unencrypted originals in
   %APPDATA%\Pulse\old-version-backup until you delete them.
+
+  NO WAY BACK TO 2.0.x: Pulse 2.1 writes the encrypted data files in a form that 2.0.x
+  cannot open (2.1 still opens the files 2.0.x wrote). Going back to 2.0.x after running
+  2.1 is not supported. Before the first start of 2.1, close Pulse and copy the whole
+  %APPDATA%\Pulse folder somewhere safe. To return to 2.0.x, close Pulse and put that
+  copy back (or a backup made by 2.0); changes made since the upgrade are lost. Never
+  start 2.0.x on a data folder that 2.1 has used.

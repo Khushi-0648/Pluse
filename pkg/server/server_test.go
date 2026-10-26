@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,7 +23,9 @@ import (
 	"whatsapp-automation/pkg/config"
 	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/history"
+	"whatsapp-automation/pkg/msgtemplate"
 	"whatsapp-automation/pkg/scheduler"
+	"whatsapp-automation/pkg/securestore"
 	"whatsapp-automation/pkg/security"
 	"whatsapp-automation/pkg/templates"
 	"whatsapp-automation/pkg/webhook"
@@ -77,6 +80,9 @@ func (f *fakeWA) SendTextMessage(ctx context.Context, to, text string) (string, 
 	}
 	f.sent = append(f.sent, to+":"+text)
 	return "msg" + to, nil
+}
+func (f *fakeWA) SendTemplate(ctx context.Context, to, name, lang string, parts cloudapi.TemplateParts) (string, error) {
+	return f.SendTextMessage(ctx, to, "TEMPLATE "+name+"/"+lang+": "+strings.Join(parts.Body, ","))
 }
 func (f *fakeWA) SendMediaMessage(ctx context.Context, to string, data []byte, name, mime, caption string) (string, error) {
 	return f.SendTextMessage(ctx, to, "[media "+name+"] "+caption)
@@ -255,6 +261,93 @@ func TestOperatorRole(t *testing.T) {
 	if w, _ := h.api("GET", "/settings", nil); w.Code != http.StatusForbidden {
 		t.Fatal("staff must not read the settings (S25)")
 	}
+	if w, _ := h.api("GET", "/rules", nil); w.Code != http.StatusForbidden {
+		t.Fatal("staff must not read the auto-reply rules")
+	}
+	if w, _ := h.api("POST", "/rules/test", map[string]any{"message": "hi"}); w.Code != http.StatusForbidden {
+		t.Fatal("staff must not test the auto-reply rules")
+	}
+}
+
+// The alert needs the newest hand-over even though the list is oldest first and cut at 5.
+func TestOverviewLatestAttention(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	for i := 0; i < 7; i++ {
+		h.cs.PauseBot(fmt.Sprintf("1415555090%d", i), time.Hour, "Asked for a person") // a hand-over
+		time.Sleep(2 * time.Millisecond)
+	}
+	_, out := h.api("GET", "/overview", nil)
+	latest, _ := out["latest_attention"].(map[string]any)
+	if latest == nil || latest["phone"] != "14155550906" || latest["since"] == nil {
+		t.Fatalf("latest_attention should be the newest request: %v", out["latest_attention"])
+	}
+	if n := len(out["attention"].([]any)); n != 5 {
+		t.Fatalf("the attention list stays cut at 5, got %d", n)
+	}
+}
+
+// A failed extra copy must not be reported as a failed backup: the main one was saved.
+func TestBackupNowReportsOnlyTheCopyFailing(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	notADir := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(notADir, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.cfg.Update(func(c *config.Config) error { c.Storage.BackupCopyDir = notADir; return nil })
+	w, out := h.api("POST", "/backups/now", nil)
+	if w.Code != 200 || out["warning"] != true || !strings.Contains(fmt.Sprint(out["message"]), "Backup saved in the data folder") {
+		t.Fatalf("a failed copy should be a warning, not a failed backup: %d %v", w.Code, out)
+	}
+	if _, err := os.Stat(filepath.Join(h.s.backupDir(), "pulse-backup-"+time.Now().Format("2006-01-02")+".json")); err != nil {
+		t.Fatalf("the main backup must exist: %v", err)
+	}
+}
+
+// until= pages from the oldest shown message without skipping others at the same time.
+func TestMessagesUntilIsInclusive(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	ts := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	for _, id := range []string{"a", "b"} {
+		h.hs.Record(history.MessageRecord{ID: id, Direction: history.DirectionIncoming, Type: history.TypeUserMessage, Phone: "14155550800", Text: id, Timestamp: ts})
+	}
+	count := func(param string) int {
+		w := h.raw("GET", "/api/v1/messages?phone=14155550800&"+param+"="+url.QueryEscape(ts.Format(time.RFC3339Nano)), nil, nil)
+		var list []map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &list)
+		return len(list)
+	}
+	if n := count("before"); n != 0 {
+		t.Fatalf("before stays exclusive, got %d", n)
+	}
+	if n := count("until"); n != 2 {
+		t.Fatalf("until must include messages at that exact time, got %d", n)
+	}
+}
+
+// Settings that delete messages (shorter keep period, lower limit) need the password;
+// keeping messages longer does not.
+func TestStorageSettingsThatDeleteNeedPassword(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	_ = h.cfg.Update(func(c *config.Config) error { c.Storage.RetentionDays, c.Storage.MaxMessages = 180, 50000; return nil })
+	if w, _ := h.api("PATCH", "/settings", map[string]any{"storage": map[string]any{"retention_days": 1}}); w.Code != http.StatusForbidden {
+		t.Fatalf("a shorter keep period without the password must be refused, got %d", w.Code)
+	}
+	if w, _ := h.api("PATCH", "/settings", map[string]any{"storage": map[string]any{"max_messages": 1000}}); w.Code != http.StatusForbidden {
+		t.Fatalf("a lower message limit without the password must be refused, got %d", w.Code)
+	}
+	if h.cfg.Snapshot().Storage.RetentionDays != 180 {
+		t.Fatal("a refused change must not be saved")
+	}
+	if w, _ := h.api("PATCH", "/settings", map[string]any{"storage": map[string]any{"retention_days": 365}}); w.Code != 200 {
+		t.Fatalf("keeping messages longer needs no password, got %d", w.Code)
+	}
+	if w, _ := h.api("PATCH", "/settings", map[string]any{"storage": map[string]any{"retention_days": 30}, "password": adminPass}); w.Code != 200 || h.cfg.Snapshot().Storage.RetentionDays != 30 {
+		t.Fatalf("with the password the change is saved, got %d", w.Code)
+	}
 }
 
 func TestSettingsPartialUpdate(t *testing.T) {
@@ -277,7 +370,10 @@ func TestSettingsPartialUpdate(t *testing.T) {
 	if w, _ := h.api("PATCH", "/settings", map[string]any{"automation": map[string]any{"pace": "fast"}}); w.Code != 200 || h.cfg.Snapshot().Automation.DailyLimit != 800 {
 		t.Fatal("pace preset not applied")
 	}
-	if w, _ := h.api("PATCH", "/settings", map[string]any{"webhook": map[string]any{"url": "http://0.0.0.0:8085/x"}}); w.Code != http.StatusBadRequest {
+	if w, _ := h.api("PATCH", "/settings", map[string]any{"webhook": map[string]any{"url": "https://hooks.example.com/x"}}); w.Code != http.StatusForbidden {
+		t.Fatal("a new event address needs the admin password")
+	}
+	if w, _ := h.api("PATCH", "/settings", map[string]any{"password": adminPass, "webhook": map[string]any{"url": "http://0.0.0.0:8085/x"}}); w.Code != http.StatusBadRequest {
 		t.Fatal("webhook to 0.0.0.0 must be rejected (S22)")
 	}
 	if w, _ := h.api("PATCH", "/settings", map[string]any{"server": map[string]any{"host": "0.0.0.0"}}); w.Code != http.StatusBadRequest {
@@ -394,9 +490,10 @@ func TestInboundWebhookAuth(t *testing.T) {
 	if w := h.raw("POST", "/api/v1/webhook/send", strings.NewReader(payload), signed); w.Code != http.StatusConflict || len(h.wa.sent) != 0 {
 		t.Fatalf("consent declared by the caller must not open the 24-hour window: %d %s", w.Code, w.Body.String())
 	}
-	if c, _ := h.cs.Get("14155550501"); c == nil || c.Consent {
-		t.Fatal("consent declared by the caller must not be recorded")
+	if c, _ := h.cs.Get("14155550501"); c != nil {
+		t.Fatal("a refused request must not add the number to the contacts (nor record its consent claim)")
 	}
+	_ = h.cs.Save(contacts.Contact{Phone: "14155550501"})
 	h.cs.SetConsent("14155550501", true, "Signed up in store")
 	h.cs.RecordInbound("14155550501", time.Now()) // the customer wrote: free text is allowed
 	ts = fmt.Sprint(time.Now().Unix() + 1)
@@ -537,6 +634,20 @@ func TestAPIKeyCannotDoOwnerActions(t *testing.T) {
 		{"POST", "/connection", `{"phone_number_id":"123456"}`},
 		{"POST", "/connection/disconnect", "{}"},
 		{"POST", "/privacy/delete-old-session", "{}"},
+		// S34: reading and sending only; no settings, rules, templates, campaigns,
+		// activity log, connection details, webhook replay or deletes.
+		{"GET", "/settings", ""},
+		{"GET", "/connection", ""},
+		{"GET", "/audit", ""},
+		{"GET", "/analytics/export.csv", ""},
+		{"POST", "/rules", `{"name":"x","pattern":"x","reply":"x"}`},
+		{"DELETE", "/rules/greeting", ""},
+		{"POST", "/templates", `{"name":"x","content":"x"}`},
+		{"DELETE", "/templates/x", ""},
+		{"POST", "/campaigns", "{}"},
+		{"DELETE", "/scheduled/x", ""},
+		{"POST", "/webhook/replay", "{}"},
+		{"POST", "/contacts/import", "{}"},
 	} {
 		if c := call(rq[0], rq[1], rq[2]); c != http.StatusForbidden {
 			t.Errorf("%s %s with the API key: got %d, want 403", rq[0], rq[1], c)
@@ -611,5 +722,264 @@ func TestBackupCopyFolderMustBeLocal(t *testing.T) {
 		if w.Code != http.StatusBadRequest || !strings.Contains(fmt.Sprint(out["error"]), "folder on this computer") {
 			t.Errorf("network folder %q must be refused: %d %v", dir, w.Code, out)
 		}
+	}
+}
+
+// An integration reaches a customer outside the 24-hour window only with an approved
+// template, and only when an opt-in is recorded in Pulse.
+func TestInboundWebhookSendsTemplateOutsideWindow(t *testing.T) {
+	h := newHarness(t)
+	post := func(body string) *httptest.ResponseRecorder {
+		return h.raw("POST", "/api/v1/webhook/send", strings.NewReader(body), map[string]string{"Content-Type": "application/json", "X-Webhook-Secret": "inbound-secret-123456"})
+	}
+	_ = h.cs.Save(contacts.Contact{Phone: "14155550601", Name: "Asha Verma"})
+	body := `{"to":"14155550601","whatsapp_template":{"name":"order_ready","language":"en","params":["{{first_name}}"]}}`
+	if w := post(body); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "opt-in") {
+		t.Fatalf("a template needs a recorded opt-in: %d %s", w.Code, w.Body.String())
+	}
+	h.cs.SetConsent("14155550601", true, "Signed up in store")
+	if w := post(body); w.Code != 200 || len(h.wa.sent) != 1 || h.wa.sent[0] != "14155550601:TEMPLATE order_ready/en: Asha" {
+		t.Fatalf("the template should be sent: %d %s %v", w.Code, w.Body.String(), h.wa.sent)
+	}
+	if w := post(`{"to":"14155550601","message":"Your order is ready"}`); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "whatsapp_template") {
+		t.Fatalf("free text outside the window is refused, pointing to whatsapp_template: %d %s", w.Code, w.Body.String())
+	}
+	if w := post(`{"to":"14155550601","whatsapp_template":{"name":"Bad Name"}}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("an invalid template name must be refused: %d", w.Code)
+	}
+}
+
+// Limits count characters, not bytes: Hindi takes three bytes per letter.
+func TestMessageLengthCountsCharacters(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	_ = h.cs.Save(contacts.Contact{Phone: "14155550701"})
+	h.cs.RecordInbound("14155550701", time.Now()) // the customer wrote: free text is allowed
+	hindi := strings.Repeat("न", 2000)            // 6000 bytes, 2000 characters
+	if w, out := h.api("POST", "/messages/send", map[string]any{"to": "14155550701", "message": hindi}); w.Code != 200 {
+		t.Fatalf("2000 Hindi characters are within WhatsApp's limit: %d %v", w.Code, out)
+	}
+	if w, out := h.api("POST", "/messages/send", map[string]any{"to": "14155550701", "message": strings.Repeat("a", msgtemplate.MaxTextChars+1)}); w.Code != http.StatusBadRequest || !strings.Contains(fmt.Sprint(out["error"]), "too long") {
+		t.Fatalf("over 4096 characters must be refused: %d %v", w.Code, out)
+	}
+}
+
+// Switching off both consent rules is allowed but never silent.
+func TestConsentRulesOffWarns(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	w, out := h.api("PATCH", "/settings", map[string]any{"automation": map[string]any{"require_opt_in": false, "enforce_24h_window": true}})
+	if w.Code != 200 || out["warning"] != nil {
+		t.Fatalf("one rule still on: no warning expected: %d %v", w.Code, out)
+	}
+	w, out = h.api("PATCH", "/settings", map[string]any{"automation": map[string]any{"require_opt_in": false, "enforce_24h_window": false}})
+	if w.Code != 200 || !strings.Contains(fmt.Sprint(out["warning"]), "never opted in") {
+		t.Fatalf("both rules off must warn: %d %v", w.Code, out)
+	}
+	if security.CountAudit("CONSENT_RULES_OFF", time.Now().Add(-time.Minute)) == 0 {
+		t.Fatal("switching both rules off must be in the activity log")
+	}
+	_, hl := h.api("GET", "/health", nil)
+	if hl["level"] != "watch" || !strings.Contains(fmt.Sprint(hl["advice"]), "both off") {
+		t.Fatalf("Home must keep warning while both rules are off: %v", hl)
+	}
+}
+
+// The developer key reads and sends, but deletes nothing; deleting many contacts or the
+// imported chats needs the admin password again.
+func TestDeletingNeedsTheSignedInAdmin(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	_, out := h.api("POST", "/settings/api-key", map[string]any{"password": adminPass, "action": "generate"})
+	key := out["api_key"].(string)
+	for _, p := range []string{"14155552001", "14155552002"} {
+		_ = h.cs.Save(contacts.Contact{Phone: p})
+	}
+	withKey := func(method, path, body string) int {
+		var rd io.Reader
+		if body != "" {
+			rd = strings.NewReader(body)
+		}
+		r := h.raw(method, "/api/v1"+path, rd, map[string]string{"X-API-Key": key, "Content-Type": "application/json"})
+		return r.Code
+	}
+	sess, csrf := h.sess, h.csrf
+	h.sess, h.csrf = "", ""
+	for _, c := range []struct{ method, path, body string }{
+		{"DELETE", "/contacts/14155552001", ""},
+		{"DELETE", "/messages?phone=14155552001", ""},
+		{"POST", "/contacts/bulk", `{"action":"delete","phones":["14155552001"],"password":"` + adminPass + `"}`},
+		{"POST", "/privacy/delete-imported", `{"password":"` + adminPass + `"}`},
+	} {
+		if code := withKey(c.method, c.path, c.body); code != http.StatusForbidden {
+			t.Errorf("the API key must not %s %s: got %d", c.method, c.path, code)
+		}
+	}
+	if h.cs.Count() != 2 {
+		t.Fatal("the API key deleted contacts")
+	}
+	h.sess, h.csrf = sess, csrf
+	if w, _ := h.api("POST", "/contacts/bulk", map[string]any{"action": "delete", "phones": []string{"14155552001", "14155552002"}}); w.Code != http.StatusForbidden {
+		t.Fatalf("bulk delete without the password must be refused: %d", w.Code)
+	}
+	if w, _ := h.api("POST", "/contacts/bulk", map[string]any{"action": "delete", "phones": []string{"14155552001", "14155552002"}, "password": adminPass}); w.Code != 200 || h.cs.Count() != 0 {
+		t.Fatalf("bulk delete with the password: %d, %d left", w.Code, h.cs.Count())
+	}
+}
+
+// A web page firing requests at 127.0.0.1 must not lock the signed-in owner out.
+func TestAnonymousFloodDoesNotBlockTheSession(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	sess := h.sess
+	h.sess = "" // no cookie: a cross-site request cannot send the SameSite=Strict cookie
+	for i := 0; i < 320; i++ {
+		h.raw("GET", "/api/v1/nothing", nil, nil)
+	}
+	if w := h.raw("GET", "/api/v1/nothing", nil, nil); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("anonymous requests are still limited: %d", w.Code)
+	}
+	h.sess = sess
+	if w, _ := h.api("GET", "/me", nil); w.Code != 200 {
+		t.Fatalf("the signed-in session has its own limit: %d", w.Code)
+	}
+}
+
+// Refused webhook calls through the public tunnel must not push the rest out of the log.
+func TestRejectedWebhookCallsDoNotFloodTheLog(t *testing.T) {
+	h := newHarness(t)
+	_ = h.cfg.Update(func(c *config.Config) error {
+		c.CloudAPI.PhoneNumberID, c.CloudAPI.VerifyToken = "111222333", "right-token"
+		return nil
+	})
+	before := security.CountAudit("CLOUD_WEBHOOK_REJECTED", time.Now().Add(-time.Hour))
+	for i := 0; i < 50; i++ {
+		h.raw("GET", config.WebhookPath+"?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=x", nil, nil)
+	}
+	if n := security.CountAudit("CLOUD_WEBHOOK_REJECTED", time.Now().Add(-time.Hour)) - before; n != 1 {
+		t.Fatalf("50 refused calls within a minute must make one log entry, got %d", n)
+	}
+}
+
+// A web page the owner visits can reach 127.0.0.1. Its calls to the integration endpoint
+// must neither fill the activity log nor use up the requests needed to sign in.
+func TestWebPageCannotFloodIntegrationEndpoint(t *testing.T) {
+	h := newHarness(t)
+	before := security.CountAudit("WEBHOOK_REJECTED", time.Now().Add(-time.Hour))
+	for i := 0; i < 400; i++ {
+		w := h.raw("POST", "/api/v1/webhook/send", strings.NewReader("{}"), map[string]string{"Origin": "https://evil.example", "Content-Type": "application/json"})
+		if i == 0 && w.Code != http.StatusForbidden {
+			t.Fatalf("a cross-site call must be refused, got %d", w.Code)
+		}
+	}
+	for i := 0; i < 50; i++ {
+		h.raw("POST", "/api/v1/webhook/send", strings.NewReader("{}"), map[string]string{"Content-Type": "application/json"})
+	}
+	if n := security.CountAudit("WEBHOOK_REJECTED", time.Now().Add(-time.Hour)) - before; n > 1 {
+		t.Fatalf("refused integration calls must make at most one log entry a minute, got %d", n)
+	}
+	if code := h.login(adminPass); code != http.StatusSeeOther {
+		t.Fatalf("the owner must still be able to sign in, got %d", code)
+	}
+}
+
+// Staff cannot remove a contact by giving it another number, and a deleted opted-out
+// number cannot be added back as messageable.
+func TestContactSaveKeepsOptOutsAndAdminRights(t *testing.T) {
+	h := newHarness(t)
+	_ = h.cs.Save(contacts.Contact{Phone: "12025550160", Name: "Asha"})
+	h.cs.SetDND("12025550161", true, "STOP") // not a contact: no effect
+	_ = h.cs.Save(contacts.Contact{Phone: "12025550161"})
+	h.cs.SetDND("12025550161", true, "Replied STOP")
+	h.cs.Delete("12025550161")
+	_ = h.cfg.SetOperatorPassword("staff42Desk")
+	h.login("staff42Desk")
+	if w, _ := h.api("POST", "/contacts", map[string]any{"phone": "12025550199", "name": "Asha", "original_phone": "12025550160"}); w.Code != http.StatusForbidden {
+		t.Fatalf("staff must not change a contact's number, got %d", w.Code)
+	}
+	if w, _ := h.api("POST", "/contacts", map[string]any{"phone": "12025550161", "consent": true, "consent_source": "old list"}); w.Code != http.StatusForbidden {
+		t.Fatalf("staff must not re-add an opted-out number as messageable, got %d", w.Code)
+	}
+	h.login(adminPass)
+	if w, _ := h.api("POST", "/contacts", map[string]any{"phone": "12025550161", "consent": true, "consent_source": "old list"}); w.Code != 200 {
+		t.Fatalf("admin save failed: %d", w.Code)
+	}
+	if c, _ := h.cs.Get("12025550161"); !c.IsDND || c.Consent {
+		t.Fatalf("re-adding must keep the opt-out: %+v", c)
+	}
+}
+
+// "Delete all their data" typed without the country code must still find their messages.
+func TestForgetFindsMessagesOfANumberTypedWithoutCountryCode(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	_ = h.cs.Save(contacts.Contact{Phone: "12025550123"})
+	h.hs.Record(history.MessageRecord{ID: "f1", Direction: history.DirectionIncoming, Type: history.TypeUserMessage, Phone: "12025550123", Text: "hi", Timestamp: time.Now()})
+	w, out := h.api("POST", "/privacy/forget-contact", map[string]any{"phone": "2025550123", "password": adminPass})
+	if w.Code != 200 || !strings.Contains(fmt.Sprint(out["message"]), "1 messages") {
+		t.Fatalf("the stored number's messages must be deleted too: %d %v", w.Code, out)
+	}
+	if len(h.hs.Query(history.Query{Phone: "12025550123"})) != 0 {
+		t.Fatal("messages left behind")
+	}
+}
+
+// S36: a list in X-Forwarded-Host still names the public address; S44: the cookie is
+// Secure when a trusted proxy says the browser used https.
+func TestTrustedProxyHostListAndSecureCookie(t *testing.T) {
+	h := newHarness(t)
+	_ = h.cfg.Update(func(c *config.Config) error {
+		c.CloudAPI.PublicURL = "https://pulse-shop.trycloudflare.com"
+		return nil
+	})
+	if err := security.AddTrustedProxy("127.0.0.1/32"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(security.ResetTrustedProxies)
+	w := h.raw("GET", "/login", nil, map[string]string{"X-Forwarded-Host": "evil.example, pulse-shop.trycloudflare.com", "X-Forwarded-For": "203.0.113.9"})
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("dashboard reached under the public address via a header list: %d", w.Code)
+	}
+	login := func(proto string) *http.Cookie {
+		hdr := map[string]string{"Content-Type": "application/x-www-form-urlencoded", "X-Forwarded-For": "192.168.1.20"}
+		if proto != "" {
+			hdr["X-Forwarded-Proto"] = proto
+		}
+		w := h.raw("POST", "/login", strings.NewReader(url.Values{"password": {adminPass}}.Encode()), hdr)
+		for _, c := range w.Result().Cookies() {
+			if c.Name == sessionCookie {
+				return c
+			}
+		}
+		t.Fatalf("no session cookie (%d)", w.Code)
+		return nil
+	}
+	if c := login("https"); !c.Secure {
+		t.Error("cookie must be Secure behind an https proxy")
+	}
+	if c := login(""); c.Secure {
+		t.Error("cookie must not be Secure over plain http on this computer")
+	}
+}
+
+// S38: forgetting a customer also removes them from the daily backups.
+func TestForgetRemovesCustomerFromBackups(t *testing.T) {
+	h := newHarness(t)
+	h.login(adminPass)
+	_ = h.cs.Save(contacts.Contact{Phone: "14155550901", Name: "Erase Me"})
+	_ = h.cs.Save(contacts.Contact{Phone: "14155550902", Name: "Keep Me"})
+	if err := h.s.AutoBackup(); err != nil {
+		t.Fatal(err)
+	}
+	if w, out := h.api("POST", "/privacy/forget-contact", map[string]any{"phone": "+14155550901", "password": adminPass}); w.Code != 200 {
+		t.Fatalf("forget: %d %v", w.Code, out)
+	}
+	files, _ := filepath.Glob(filepath.Join(h.s.backupDir(), "pulse-backup-*.json"))
+	if len(files) != 1 {
+		t.Fatalf("backups: %v", files)
+	}
+	data, _ := securestore.Default().ReadFile(files[0])
+	if bytes.Contains(data, []byte("14155550901")) || !bytes.Contains(data, []byte("14155550902")) {
+		t.Fatalf("backup still holds the forgotten customer or lost another: %s", data)
 	}
 }

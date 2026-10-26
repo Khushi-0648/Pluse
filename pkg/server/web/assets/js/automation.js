@@ -37,9 +37,12 @@
     P.mount(box, html`<ul class="list">${st.rules.map(ruleRow)}</ul>`);
   }
 
+  // Rules and templates deleted but still inside their Undo window.
+  const pendingRules = new Set(), pendingTemplates = new Set();
   async function loadRules() {
     const r = await P.get('/rules');
-    st.rules = r.rules; st.conflicts = r.conflicts || [];
+    st.allRules = r.rules; // full order, including rules waiting to be deleted
+    st.rules = r.rules.filter((x) => !pendingRules.has(x.name)); st.conflicts = r.conflicts || [];
     drawRules();
   }
 
@@ -72,8 +75,10 @@
   P.act('rule-move', async (el) => {
     const i = Number(el.dataset.index), j = i + Number(el.dataset.dir);
     if (j < 0 || j >= st.rules.length) return;
-    const names = st.rules.map((r) => r.name);
-    [names[i], names[j]] = [names[j], names[i]];
+    // Reorder the full list, so a rule waiting out its Undo window keeps its place.
+    const names = (st.allRules || st.rules).map((r) => r.name);
+    const a = names.indexOf(st.rules[i].name), b = names.indexOf(st.rules[j].name);
+    [names[a], names[b]] = [names[b], names[a]];
     await P.post('/rules/reorder', { names });
     await loadRules();
     const btn = P.$(`[data-action="rule-move"][data-index="${j}"][data-dir="${el.dataset.dir}"]`) || P.$(`[data-action="rule-move"][data-index="${j}"]`);
@@ -81,17 +86,17 @@
   });
   P.act('rule-delete', (el) => {
     const name = el.dataset.name;
-    const before = st.rules;
-    st.rules = before.filter((r) => r.name !== name);
+    pendingRules.add(name);
+    st.rules = st.rules.filter((r) => r.name !== name);
     drawRules();
-    P.undoable('Deleted rule ' + name + '.', () => P.del('/rules/' + encodeURIComponent(name)).then(loadRules), () => { st.rules = before; drawRules(); });
+    P.undoable('Deleted rule ' + name + '.', () => P.del('/rules/' + encodeURIComponent(name)).finally(() => pendingRules.delete(name)).then(loadRules), () => { pendingRules.delete(name); loadRules().catch(P.error); });
   });
   P.act('rule-reset', async () => {
     const ok = await P.confirm({ title: 'Restore the starter rules?', message: 'All your auto-reply rules will be replaced by the starter set (greeting menu, services, prices, hours, talk to a person, thanks, goodbye, help).', confirmLabel: 'Restore', danger: true });
     if (!ok) return;
     await P.post('/rules/reset-defaults');
     P.toast('Starter rules restored.');
-    loadRules();
+    loadRules().catch(P.error);
   });
   P.act('rule-new', () => ruleEditor(null));
   P.act('rule-edit', (el) => ruleEditor(st.rules.find((r) => r.name === el.dataset.name)));
@@ -133,7 +138,7 @@
     const r = await P.post('/rules', { name: data.name, original_name: data.original_name, type: data.type, pattern: data.pattern, reply: data.reply, description: data.description, enabled: !!data.enabled, action: data.action });
     P.$('[data-modal-close]', form.closest('.modal')).click();
     P.toast('Rule saved.' + (r.conflicts && r.conflicts.length ? ' Some keywords overlap with other rules.' : ''));
-    loadRules();
+    loadRules().catch(P.error);
   });
 
   P.form('rule-test', async (form, data) => {
@@ -190,7 +195,7 @@
         ${P.isAdmin() ? html`<a class="btn small" href="#/campaigns?template=${t.id}">Use in campaign</a><button class="btn small" type="button" data-action="tpl-edit" data-id="${t.id}">Edit</button><button class="btn small ghost icon-only" type="button" data-action="tpl-delete" data-id="${t.id}" data-name="${t.name}" aria-label="Delete ${t.name}">${icon('trash', 'icon-sm')}</button>` : html`<a class="btn small" href="#/scheduled?template=${t.id}">Schedule</a>`}
       </div></article>`)}</div>`);
   }
-  async function loadTemplates() { st.templates = await P.get('/templates'); drawTemplates(); }
+  async function loadTemplates() { st.templates = (await P.get('/templates')).filter((t) => !pendingTemplates.has(t.id)); drawTemplates(); }
 
   async function tplEditor(t) {
     await P.loadVars();
@@ -217,10 +222,10 @@
   P.act('tpl-edit', (el) => tplEditor(st.templates.find((t) => t.id === el.dataset.id)));
   P.act('tpl-delete', (el) => {
     const id = el.dataset.id;
-    const before = st.templates;
-    st.templates = before.filter((t) => t.id !== id);
+    pendingTemplates.add(id);
+    st.templates = st.templates.filter((t) => t.id !== id);
     drawTemplates();
-    P.undoable('Deleted template ' + el.dataset.name + '.', () => P.del('/templates/' + encodeURIComponent(id)).then(loadTemplates), () => { st.templates = before; drawTemplates(); });
+    P.undoable('Deleted template ' + el.dataset.name + '.', () => P.del('/templates/' + encodeURIComponent(id)).finally(() => pendingTemplates.delete(id)).then(loadTemplates), () => { pendingTemplates.delete(id); loadTemplates().catch(P.error); });
   });
   P.form('tpl-save', async (form, data) => {
     if (!data.name.trim()) { P.fieldError(form, 'name', 'Give the template a name.'); return; }
@@ -228,7 +233,7 @@
     await P.post('/templates', data);
     P.$('[data-modal-close]', form.closest('.modal')).click();
     P.toast('Template saved.');
-    loadTemplates();
+    loadTemplates().catch(P.error);
   });
 
   P.view('templates', {

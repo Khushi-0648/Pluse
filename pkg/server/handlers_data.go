@@ -1,7 +1,10 @@
 package server
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,9 +13,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"whatsapp-automation/pkg/campaign"
+	"whatsapp-automation/pkg/cloudapi"
 	"whatsapp-automation/pkg/config"
 	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/history"
@@ -29,8 +34,7 @@ func (s *Server) handleAnalytics(w http.ResponseWriter, r *http.Request) {
 	}
 	var since time.Time
 	if days > 0 {
-		y, m, d := time.Now().AddDate(0, 0, -days+1).Date()
-		since = time.Date(y, m, d, 0, 0, 0, 0, time.Local)
+		since = reportSince(days, time.Now())
 	}
 	var st history.Stats
 	imported := 0
@@ -78,14 +82,26 @@ func (s *Server) handleAnalytics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// reportSince is where a report of the last days days starts: local midnight of
+// today - days + 1, so "7 days" is today and the six days before it.
+func reportSince(days int, now time.Time) time.Time {
+	y, m, d := now.AddDate(0, 0, -days+1).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.Local)
+}
+
 func (s *Server) handleAnalyticsCSV(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="messages-%s.csv"`, time.Now().Format("20060102")))
+	// days limits the download to the range shown in Reports; 0 or missing means all.
+	var since time.Time
+	if days, err := strconv.Atoi(r.URL.Query().Get("days")); err == nil && days > 0 && days <= 3660 {
+		since = reportSince(days, time.Now()) // the same days as the Reports screen
+	}
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{"time", "direction", "type", "phone", "name", "status", "rule", "campaign", "text"})
 	if s.History != nil {
 		f := false
-		for _, m := range s.History.Query(history.Query{Imported: &f}) {
+		for _, m := range s.History.Query(history.Query{Imported: &f, Since: since}) {
 			_ = cw.Write([]string{m.Timestamp.Format("2006-01-02 15:04:05"), string(m.Direction), string(m.Type), "+" + m.Phone, csvCell(m.Name), m.Status, m.RuleTriggered, m.CampaignID, csvCell(m.Text)})
 		}
 	}
@@ -112,8 +128,23 @@ func (s *Server) handleAuditCSV(w http.ResponseWriter, r *http.Request) {
 	cw.Flush()
 }
 
+// storedPhone turns a typed number into the one Pulse stores. The contact list also finds
+// a number typed without its country code, but messages, schedules and campaigns are
+// matched exactly, so an erasure or export must use the stored form or miss their data.
+func (s *Server) storedPhone(typed string) string {
+	phone := contacts.CleanPhone(typed)
+	if s.Contacts != nil && phone != "" {
+		// Looked up as typed: a saved contact matches exactly first (the Singapore
+		// 6591234567 is not India's 916591234567).
+		if c, ok := s.Contacts.Get(typed); ok {
+			return c.Phone
+		}
+	}
+	return phone
+}
+
 func (s *Server) handlePrivacyExport(w http.ResponseWriter, r *http.Request) {
-	phone := contacts.CleanPhone(r.URL.Query().Get("phone"))
+	phone := s.storedPhone(r.URL.Query().Get("phone"))
 	bundle := map[string]any{"product": version.Product, "version": version.Version, "exported_at": time.Now().Format(time.RFC3339)}
 	name := "all"
 	if phone != "" {
@@ -153,7 +184,11 @@ func (s *Server) handlePrivacyPurge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.All {
-		s.deleteAllCustomerData()
+		if err := s.deleteAllCustomerData(); err != nil {
+			security.LogAudit("DATA_DELETED_ALL", clientIP(r), actor(r), "Delete all data: not every file could be saved yet ("+err.Error()+"); retrying", "failed")
+			writeError(w, http.StatusInternalServerError, "The data is deleted in Pulse, but not every file could be saved yet ("+err.Error()+"). Pulse keeps trying; close programs that may hold the files (antivirus, backup tools) and check again in a minute.")
+			return
+		}
 		security.LogAudit("DATA_DELETED_ALL", clientIP(r), actor(r), "All messages, contacts and scheduled messages deleted", "warning")
 		writeOK(w, map[string]any{"message": "All customer data was deleted."})
 		return
@@ -171,6 +206,12 @@ func (s *Server) handlePrivacyPurge(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteImported(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if !decodeJSON(w, r, &req) || !s.reauth(w, r, req.Password) {
+		return
+	}
 	msgs, people := 0, 0
 	if s.History != nil {
 		msgs = s.History.DeleteHistorySync()
@@ -196,7 +237,7 @@ func (s *Server) handleForgetContact(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) || !s.reauth(w, r, req.Password) {
 		return
 	}
-	phone := contacts.CleanPhone(req.Phone)
+	phone := s.storedPhone(req.Phone)
 	if phone == "" {
 		writeError(w, http.StatusBadRequest, "Enter the phone number.")
 		return
@@ -206,11 +247,13 @@ func (s *Server) handleForgetContact(w http.ResponseWriter, r *http.Request) {
 		msgs = s.History.ClearPhone(phone)
 	}
 	if s.Contacts != nil {
-		s.Contacts.Delete(phone)
+		s.Contacts.Forget(phone) // also keeps a later "Restore backup" from bringing them back
 	}
 	if s.Scheduler != nil {
 		for _, j := range s.Scheduler.List() {
-			if j.Recipient == phone {
+			// Stored numbers are compared as stored: CleanPhone would read the Singapore
+			// 6591234567 as India's 916591234567 and keep that customer's messages.
+			if contacts.NormalizePhone(j.Recipient) == phone {
 				_ = s.Scheduler.Delete(j.ID)
 			}
 		}
@@ -221,8 +264,23 @@ func (s *Server) handleForgetContact(w http.ResponseWriter, r *http.Request) {
 	if s.Hooks != nil {
 		s.Hooks.Forget("+" + phone)
 	}
-	security.LogAudit("CONTACT_FORGOTTEN", clientIP(r), actor(r), fmt.Sprintf("All data for +%s deleted (%d messages)", phone, msgs), "success")
-	writeOK(w, map[string]any{"message": fmt.Sprintf("Deleted the contact and %d messages.", msgs)})
+	// The activity log keeps the entries (what happened, and that an erasure was done)
+	// but no longer names the customer.
+	security.RedactAudit(phone)
+	s.forgetInBackups(phone)
+	security.LogAudit("CONTACT_FORGOTTEN", clientIP(r), actor(r), fmt.Sprintf("All data for %s deleted (%d messages)", security.MaskPhone(phone), msgs), "success")
+	if s.History != nil {
+		if err := s.History.Flush(); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("The contact and %d messages are deleted in Pulse, but the message file could not be saved yet (%v). Pulse keeps trying; check again in a minute.", msgs, err))
+			return
+		}
+	}
+	msg := fmt.Sprintf("Deleted the contact and %d messages.", msgs)
+	if s.DataDir != "" && s.oldCopies() > 0 {
+		// Those files are not edited here; the owner removes them in one step.
+		msg += " Unencrypted copies from a version before 1.4 still exist: delete them under Settings > Privacy and data > Old copies."
+	}
+	writeOK(w, map[string]any{"message": msg})
 }
 
 type backupBundle struct {
@@ -392,6 +450,12 @@ func (s *Server) handleWebhookClearFailed(w http.ResponseWriter, r *http.Request
 // handleInboundWebhook lets a CRM or shop system send a WhatsApp message. It requires the
 // webhook secret (header) or an HMAC signature, or the API key.
 func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
+	// Other systems call this server to server and send no Origin. A browser always
+	// does, so a web page probing this address is refused before anything is logged.
+	if origin := r.Header.Get("Origin"); origin != "" && !security.IsAllowedOrigin(origin, r.Host) {
+		writeError(w, http.StatusForbidden, "Cross-site request refused.")
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -399,7 +463,7 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := s.cfg.Snapshot()
-	secret := snap.Webhook.Secret
+	secret, _ := s.cfg.InboundSecret() // the sending key; falls back to the older shared one
 	authorized, replayed := false, false
 	if a, ok := s.authenticate(r); ok && a.apiKey {
 		authorized = true
@@ -417,7 +481,7 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !authorized {
-		security.LogAudit("WEBHOOK_REJECTED", clientIP(r), "unknown", "Inbound webhook without a valid secret", "failed")
+		s.logRejected("WEBHOOK_REJECTED", clientIP(r), "Inbound webhook without a valid secret")
 		writeError(w, http.StatusUnauthorized, "Missing or wrong webhook secret.")
 		return
 	}
@@ -441,9 +505,19 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 		Variables     map[string]string `json:"variables"`
 		Consent       bool              `json:"consent"`        // accepted from older integrations, ignored
 		ConsentSource string            `json:"consent_source"` // accepted from older integrations, ignored
+		// WhatsAppTemplate is a Meta-approved template, sent when the customer has not
+		// written in the last 24 hours (or when there is no message).
+		WhatsAppTemplate *campaign.Template `json:"whatsapp_template"`
+		// IdempotencyKey, when given, makes a repeat of the same request within 24 hours
+		// refused instead of sent twice (for example a retry after a timeout).
+		IdempotencyKey string `json:"idempotency_key"`
 	}
 	if err := jsonUnmarshal(body, &p); err != nil {
 		writeError(w, http.StatusBadRequest, "The body is not valid JSON.")
+		return
+	}
+	if p.IdempotencyKey = strings.TrimSpace(p.IdempotencyKey); len(p.IdempotencyKey) > 200 {
+		writeError(w, http.StatusBadRequest, "Field 'idempotency_key' can be at most 200 characters.")
 		return
 	}
 	to := p.To
@@ -455,38 +529,54 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Field 'to' must be a phone number with country code.")
 		return
 	}
+	tpl, err := p.WhatsAppTemplate.Clean()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "whatsapp_template: "+err.Error())
+		return
+	}
 	text := strings.TrimSpace(p.Message)
 	if text == "" && p.TemplateID != "" && s.Templates != nil {
 		if t, ok := s.Templates.Get(p.TemplateID); ok {
 			text = t.Content
 		}
 	}
-	if text == "" {
-		writeError(w, http.StatusBadRequest, "Field 'message' (or a valid 'template_id') is required.")
+	if text == "" && tpl == nil {
+		writeError(w, http.StatusBadRequest, "Field 'message' (or a valid 'template_id', or 'whatsapp_template') is required.")
 		return
 	}
 	extraKeys := []string{"email", "notes"}
 	for k := range p.Variables {
 		extraKeys = append(extraKeys, k)
 	}
-	if err := msgtemplate.Validate(text, extraKeys...); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if s.Contacts != nil {
-		if _, ok := s.Contacts.Get(phone); !ok {
-			_ = s.Contacts.Save(contacts.Contact{Phone: phone, Name: p.Name, Email: p.Email, Tags: p.Tags, Source: "webhook"})
+	if text != "" {
+		if err := msgtemplate.ValidateOutgoing(text, extraKeys...); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
-		// "consent" in the request is only the other system's claim. It is not recorded and
-		// does not open the 24-hour window: only an opt-in recorded in Pulse counts.
 	}
+	// A new number is only saved once a message to it went out (or was recorded in
+	// practice mode): a refused request must not fill the contact list.
 	var ct contacts.Contact
+	known := false
 	if s.Contacts != nil {
-		if c, ok := s.Contacts.Get(phone); ok {
-			ct = *c
+		if c, ok := s.Contacts.Get(to); ok { // as typed: a saved contact matches exactly first
+			ct, phone, known = *c, c.Phone, true
 		}
 	}
+	if !known {
+		ct = contacts.Contact{Phone: phone, Name: p.Name, Email: p.Email, Tags: p.Tags, Source: "webhook"}
+		// Opted out and then deleted: still do-not-message (checked below like any opt-out).
+		ct.IsDND = s.Contacts != nil && s.Contacts.WasOptedOut(phone)
+	}
+	saveNew := func() {
+		if !known && s.Contacts != nil {
+			_ = s.Contacts.Save(ct)
+		}
+	}
+	// "consent" in the request is only the other system's claim. It is not recorded and
+	// does not open the 24-hour window: only an opt-in recorded in Pulse counts.
 	a := snap.Automation
+	useTemplate := text == "" || campaign.NeedsTemplate(&ct, time.Now())
 	switch {
 	case ct.IsDND:
 		writeError(w, http.StatusConflict, "The customer opted out of messages.")
@@ -494,11 +584,15 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	case inPhoneList(a.BlacklistPhones, phone):
 		writeError(w, http.StatusConflict, "This number is on the blocked list.")
 		return
-	case a.AllowListOnly && !inPhoneList(a.AllowList, phone):
+	case a.AllowListOnly && !s.Contacts.AllowListed(a.AllowList, phone):
 		writeError(w, http.StatusConflict, "Test mode is on and this number is not on the allow-list.")
 		return
-	case campaign.NeedsTemplate(&ct, time.Now()):
-		writeError(w, http.StatusConflict, campaign.OutsideWindowMessage)
+	case useTemplate && tpl == nil:
+		writeError(w, http.StatusConflict, campaign.OutsideWindowMessage+" An integration can send one with 'whatsapp_template'.")
+		return
+	case useTemplate && a.RequireOptIn && !ct.Consent:
+		// The same rule as campaigns: WhatsApp requires opt-in before a business starts a chat.
+		writeError(w, http.StatusConflict, "No opt-in is recorded in Pulse for this customer, so no template is sent. Record their consent on the contact first.")
 		return
 	}
 	releaseDaily, ok := campaign.ReserveDaily(snap, s.History, time.Now())
@@ -515,37 +609,188 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = ct.Name
 	}
-	rendered, missing := msgtemplate.Render(text, msgtemplate.Vars{Name: name, Phone: phone, Business: snap.Business, Extra: vars})
+	mv := msgtemplate.Vars{Name: name, Phone: phone, Business: snap.Business, Extra: vars, Now: time.Now(), Location: msgtemplate.Location(snap.BusinessHours.Timezone)}
+	var rendered string
+	var missing []string
+	var parts cloudapi.TemplateParts
+	if useTemplate {
+		parts, missing = tpl.Render(mv)
+		rendered = tpl.Describe(parts)
+	} else {
+		rendered, missing = msgtemplate.Render(text, mv)
+	}
 	if len(missing) > 0 {
 		writeError(w, http.StatusBadRequest, msgtemplate.MissingError(missing).Error())
 		return
 	}
-	rec := history.MessageRecord{Direction: history.DirectionOutgoing, Type: history.TypeWebhook, Phone: phone, Text: rendered, SentBy: "webhook"}
+	if !useTemplate {
+		if err := msgtemplate.LengthError(rendered, false); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	// Labelled, so a send whose answer is lost is corrected when Meta reports it. With an
+	// idempotency_key the label is made from it, so the history remembers the key across
+	// restarts too.
+	rec := history.MessageRecord{Direction: history.DirectionOutgoing, Type: history.TypeWebhook, Phone: phone, Text: rendered, SentBy: "webhook", Label: IntegrationLabel + security.RandomToken(8)}
+	if p.IdempotencyKey != "" {
+		rec.Label = idempotencyLabel(p.IdempotencyKey)
+		switch integrationKeys.claim(p.IdempotencyKey, time.Now()) {
+		case claimBusy:
+			writeError(w, http.StatusConflict, "A request with this idempotency_key is still in progress — retry later.")
+			return
+		case claimUsed:
+			writeError(w, http.StatusConflict, idempotencyUsed)
+			return
+		}
+		defer integrationKeys.finish(p.IdempotencyKey)
+		if s.History != nil && s.History.HasLabel(rec.Label, time.Now().Add(-idempotencyTTL)) {
+			writeError(w, http.StatusConflict, idempotencyUsed) // received before Pulse restarted
+			return
+		}
+	}
 	if a.DryRun {
 		rec.ID, rec.Status = "dry_"+security.RandomToken(6), history.StatusDryRun
 		if s.History != nil {
 			s.History.Record(rec)
 		}
-		writeOK(w, map[string]any{"dry_run": true, "text": rendered})
+		saveNew()
+		writeOK(w, map[string]any{"dry_run": true, "text": rendered, "template": useTemplate})
 		return
 	}
 	if s.Messenger == nil || !s.status().Connected {
+		integrationKeys.release(p.IdempotencyKey) // nothing was sent: the same key may be tried again
 		writeError(w, http.StatusServiceUnavailable, "WhatsApp is not connected.")
 		return
 	}
-	id, err := s.Messenger.SendTextMessage(r.Context(), phone, rendered)
+	// Recorded as "sending" first (see campaign.SendRecorded), and not cut off when the
+	// caller hangs up.
+	id, err := campaign.SendRecorded(r.Context(), s.History, rec, directSendTimeout, func(sctx context.Context) (string, error) {
+		if useTemplate {
+			return campaign.SendTemplate(sctx, s.Messenger, phone, *tpl, parts)
+		}
+		return s.Messenger.SendTextMessage(sctx, phone, rendered)
+	})
+	if err != nil && cloudapi.MaybeSent(err) {
+		// Meta may have the message: recorded as failed with its label (corrected when
+		// Meta reports it) and counted towards the daily limit. The caller must not retry.
+		saveNew()
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "unknown", "message": "may have been sent; do not retry", "to": "+" + phone, "error": err.Error()})
+		return
+	}
 	if err != nil {
+		integrationKeys.release(p.IdempotencyKey) // refused by WhatsApp: nothing was sent
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	rec.ID, rec.Status = id, history.StatusSent
-	if s.History != nil {
-		s.History.Record(rec)
-	}
+	saveNew()
 	if s.Contacts != nil {
 		s.Contacts.UpdateLastContacted(phone)
 	}
-	writeOK(w, map[string]any{"message_id": id, "to": "+" + phone})
+	writeOK(w, map[string]any{"message_id": id, "to": "+" + phone, "template": useTemplate})
+}
+
+// IntegrationLabel prefixes the label of messages sent through the integration endpoint
+// (biz_opaque_callback_data), so a send whose answer was lost is corrected later.
+const IntegrationLabel = "pulse:w:"
+
+// Idempotency keys of integration requests are remembered for 24 hours, at most
+// idempotencyMax of them (the oldest are forgotten first).
+const (
+	idempotencyTTL = 24 * time.Hour
+	idempotencyMax = 10000
+)
+
+// idempotencyUsed answers a request whose idempotency_key was already used.
+const idempotencyUsed = "A request with this idempotency_key was already received in the last 24 hours, so it was not sent again."
+
+// idempotencyBusyFor is the longest a request with a key can still be in progress (the
+// send timeout with room to spare); after that its key simply counts as used.
+const idempotencyBusyFor = 2 * directSendTimeout
+
+// idempotencyLabel is the label of a message sent for an idempotency_key: a hash of the
+// key, so the history remembers it across restarts without storing or sending the key.
+func idempotencyLabel(key string) string {
+	sum := sha256.Sum256([]byte("pulse-idempotency:" + key))
+	return IntegrationLabel + "k:" + hex.EncodeToString(sum[:16])
+}
+
+// idempotencyKeys remembers integration requests by their idempotency_key, in memory;
+// the history keeps them across restarts (idempotencyLabel).
+type idempotencyKeys struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+	busy map[string]bool // the first request with the key is still being handled
+}
+
+var integrationKeys = &idempotencyKeys{}
+
+type claimResult int
+
+const (
+	claimNew  claimResult = iota // not used in the last 24 hours: go ahead
+	claimBusy                    // the first request with this key is still in progress
+	claimUsed                    // already received
+)
+
+// claim records key and reports whether it is new, still in progress or already used.
+func (k *idempotencyKeys) claim(key string, now time.Time) claimResult {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.seen == nil {
+		k.seen, k.busy = map[string]time.Time{}, map[string]bool{}
+	}
+	if at, dup := k.seen[key]; dup && now.Sub(at) < idempotencyTTL {
+		if k.busy[key] && now.Sub(at) < idempotencyBusyFor {
+			return claimBusy
+		}
+		return claimUsed
+	}
+	if len(k.seen) >= idempotencyMax {
+		for x, at := range k.seen {
+			if now.Sub(at) >= idempotencyTTL {
+				delete(k.seen, x)
+			}
+		}
+		for len(k.seen) >= idempotencyMax {
+			oldest, first := "", true
+			for x, at := range k.seen {
+				if first || at.Before(k.seen[oldest]) {
+					oldest, first = x, false
+				}
+			}
+			delete(k.seen, oldest)
+		}
+		for x := range k.busy {
+			if _, ok := k.seen[x]; !ok {
+				delete(k.busy, x)
+			}
+		}
+	}
+	k.seen[key] = now
+	k.busy[key] = true
+	return claimNew
+}
+
+// finish marks the request with key as done; the key stays used for 24 hours.
+func (k *idempotencyKeys) finish(key string) {
+	if key == "" {
+		return
+	}
+	k.mu.Lock()
+	delete(k.busy, key)
+	k.mu.Unlock()
+}
+
+// release forgets key after a request that certainly sent nothing, so it can be retried.
+func (k *idempotencyKeys) release(key string) {
+	if key == "" {
+		return
+	}
+	k.mu.Lock()
+	delete(k.seen, key)
+	delete(k.busy, key)
+	k.mu.Unlock()
 }
 
 // replayWindow is how long a used webhook signature is remembered. Timestamps are

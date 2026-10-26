@@ -4,7 +4,11 @@ package securestore
 
 import "os"
 
-// Without an OS key protector the key relies on 0600 file permissions.
+// osProtects is false: without an OS key protector the data key and the "sealed"
+// settings secrets (access token, app secret) are stored as they are and rely on 0600
+// file permissions only.
+const osProtects = false
+
 func protect(plain []byte) ([]byte, error) { return append([]byte(nil), plain...), nil }
 
 func unprotect(wrapped []byte) ([]byte, error) { return append([]byte(nil), wrapped...), nil }
@@ -21,10 +25,4 @@ func restrictToUser(path string) {
 			_ = os.Chmod(path, 0600)
 		}
 	}
-}
-
-// ProtectDatabaseFile sets strict 0600 permissions on non-Windows platforms.
-func ProtectDatabaseFile(path string) error {
-	restrictToUser(path)
-	return nil
 }

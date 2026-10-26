@@ -13,12 +13,29 @@
   const lines = (list) => (list || []).join('\n');
   const toList = (s) => (s || '').split(/[\n,]+/).map((x) => x.trim()).filter(Boolean);
 
-  async function save(section, body, msg) {
-    await P.patch('/settings', { [section]: body });
+  async function save(section, body, msg, password) {
+    const r = await P.patch('/settings', password ? { [section]: body, password } : { [section]: body });
     P.vars = null; // business details feed the variable picker
     S = await P.get('/settings');
     P.dirty.clear();
     P.toast(msg || 'Saved.');
+    if (r && r.warning) P.toast(r.warning, { type: 'warn', timeout: 12000 });
+  }
+
+  /* Opt-in and the 24-hour rule both off lets campaigns reach people who never agreed to
+     hear from the business: allowed, but only after a clear question. */
+  async function saveSafety(d) {
+    const guarded = S.automation.require_opt_in || S.automation.enforce_24h_window;
+    if (guarded && !d.require_opt_in && !d.enforce_24h_window) {
+      const ok = await P.confirm({
+        title: 'Switch off opt-in and the 24-hour rule?',
+        message: 'Campaigns and scheduled messages could then go to people who never agreed to hear from you. WhatsApp\'s policy requires opt-in: such messages get blocked and reported, which lowers your number\'s quality and limits.',
+        confirmLabel: 'Switch both off', danger: true,
+      });
+      if (!ok) return false;
+    }
+    await save('automation', safetyBody(d), 'Safety settings saved.');
+    return true;
   }
 
   /* ---------- WhatsApp connection ---------- */
@@ -35,16 +52,17 @@
       ${st.last_check ? html`<div class="row-between"><span>Last checked</span><span>${P.fmtDateTime(st.last_check)}</span></div>` : ''}
       ${st.last_webhook ? html`<div class="row-between"><span>Last message from Meta</span><span>${P.fmtDateTime(st.last_webhook)}</span></div>` : ''}
       ${st.problem ? html`<div class="notice bad">${icon('alert')}<p>${st.problem}</p></div>` : ''}
+      ${!st.problem && st.warning ? html`<div class="notice warn">${icon('alert')}<p>${st.warning}</p></div>` : ''}
     </div>`;
   }
   function whatsappTab() {
     const saved = (has) => (has ? 'Saved - leave empty to keep it' : '');
     return html`<div class="stack">
       <form class="card" data-form="set-connection" id="f-connection" novalidate>
-        <div class="card-head"><div><h2>Your WhatsApp Business API</h2><p>Pulse uses Meta's official WhatsApp Business Platform with your own Meta app, number and access token. <strong>Note:</strong> Numbers registered to the Cloud API cannot be used in the WhatsApp mobile app simultaneously. Use a dedicated business number or manage all customer chats through the Pulse inbox. Help &gt; Using the official WhatsApp API explains where to find each value.</p></div></div>
+        <div class="card-head"><div><h2>Your WhatsApp Business API</h2><p>Pulse uses Meta's official WhatsApp Business Platform with your own Meta app, number and access token. Nothing is shared with anyone else. Help &gt; Using the official WhatsApp API explains where to find each value.</p></div></div>
         <div class="card-body form-grid">
           ${field('c-pnid', 'Phone number ID', html`<input type="text" id="c-pnid" name="phone_number_id" value="${C.phone_number_id}" inputmode="numeric" autocomplete="off" required>`, 'In Meta: WhatsApp > API Setup. A long number; it is not your phone number.')}
-          ${field('c-waba', 'WhatsApp Business account ID', html`<input type="text" id="c-waba" name="business_account_id" value="${C.business_account_id}" inputmode="numeric" autocomplete="off">`, 'Shown on the same page.')}
+          ${field('c-waba', 'WhatsApp Business account ID', html`<input type="text" id="c-waba" name="business_account_id" value="${C.business_account_id}" inputmode="numeric" autocomplete="off">`, 'Shown on the same page. Needed so Pulse can make sure Meta sends your customers\' messages here.')}
           <div class="field"><label for="c-token">Access token</label>
             <div class="input-group"><input type="password" id="c-token" name="access_token" autocomplete="off" placeholder="${saved(C.has_access_token)}">
             <button class="btn" type="button" data-action="toggle-secret" data-target="c-token" aria-pressed="false">Show</button></div>
@@ -53,7 +71,9 @@
             <div class="input-group"><input type="password" id="c-secret" name="app_secret" autocomplete="off" placeholder="${saved(C.has_app_secret)}">
             <button class="btn" type="button" data-action="toggle-secret" data-target="c-secret" aria-pressed="false">Show</button></div>
             <span class="hint">In Meta: App settings > Basic. Pulse uses it to check that incoming messages really come from Meta.</span></div>
-          <div class="full">${field('c-public', 'Public address of this computer', html`<input type="url" id="c-public" name="public_url" value="${C.public_url}" placeholder="https://your-name.trycloudflare.com" autocomplete="off">`, 'Meta must reach Pulse over the internet to deliver incoming messages. Start a secure tunnel (for example Cloudflare Tunnel) to this computer and paste its https address here. Only the webhook address below works through it; the dashboard stays private.')}</div>
+          <div class="full">${field('c-public', 'Public address of this computer', html`<input type="url" id="c-public" name="public_url" value="${C.public_url}" placeholder="https://pulse.yourdomain.com" autocomplete="off">`, 'Meta must reach Pulse over the internet to deliver incoming messages. Use a fixed https address that forwards to this computer (for example a named Cloudflare Tunnel on your own domain) and paste it here. Quick tunnels (cloudflared tunnel --url) change address on every start and break Meta\'s webhook: only for a one-off test. ' + (P.session.remoteAccess
+            ? 'Phone access is on (Settings > Account), so the sign-in page of this dashboard is also reachable through this address: keep strong passwords.'
+            : 'Only the webhook address below works through it; the dashboard stays private while phone access (Settings > Account) is off.'))}</div>
           <details class="full"><summary>Advanced</summary>
             ${field('c-ver', 'Graph API version', html`<input type="text" id="c-ver" name="api_version" value="${C.api_version}" placeholder="v23.0" autocomplete="off">`, 'Leave as it is unless Meta asks you to change it.')}
           </details>
@@ -204,7 +224,7 @@
           ${field('s-allow', 'Numbers allowed in test mode', html`<textarea id="s-allow" name="allow_list" rows="2" placeholder="+919876543210">${lines(a.allow_list)}</textarea>`, 'One number per line, with country code.')}
           ${field('s-block', 'Blocked numbers: never message these', html`<textarea id="s-block" name="blacklist_phones" rows="2">${lines(a.blacklist_phones)}</textarea>`, 'One number per line. No replies, campaigns or scheduled messages go to them.')}
           ${P.switchEl('auto_read', a.auto_read, 'Mark messages as read when the bot replies')}
-          ${P.switchEl('typing_simulation', a.typing_simulation, 'Show "typing..." before automatic replies', 'This also marks the message as read.')}
+          ${P.switchEl('typing_simulation', a.typing_simulation, 'Show "typing..." before automatic replies', 'Only works while "Mark messages as read" is on: WhatsApp shows typing together with the read ticks.')}
           <details><summary>Advanced pace settings</summary>
             <div class="form-grid">
               ${field('s-daily_limit', 'Messages per day', num('daily_limit', a.daily_limit, 1, 5000), 'Automatic replies, campaigns, scheduled and integration messages together.')}
@@ -241,19 +261,22 @@
     const body = {
       require_opt_in: !!d.require_opt_in, enforce_24h_window: !!d.enforce_24h_window, dry_run: !!d.dry_run, allow_list_only: !!d.allow_list_only,
       allow_list: toList(d.allow_list), blacklist_phones: toList(d.blacklist_phones), auto_read: !!d.auto_read,
-      typing_simulation: !!d.typing_simulation, handover_pause_hours: d.handover_pause_hours,
+      typing_simulation: !!d.typing_simulation,
     };
+    // An emptied number field (null) keeps the saved value instead of being sent.
+    if (d.handover_pause_hours != null) body.handover_pause_hours = d.handover_pause_hours;
     // Only send pace numbers that changed, so presets stay selected otherwise.
-    pace.forEach((k) => { const v = k === 'warmup_mode' ? !!d[k] : d[k]; if (v !== a[k]) body[k] = v; });
+    pace.forEach((k) => { const v = k === 'warmup_mode' ? !!d[k] : d[k]; if (v != null && v !== a[k]) body[k] = v; });
     return body;
   }
   P.form('set-safety', async (form, d) => {
+    // An emptied number field would be sent as null and silently ignored by the server.
+    const empty = P.$$('input[type="number"]', form).find((x) => !x.disabled && x.value === '');
+    if (empty) { P.fieldError(form, empty.name, 'Enter a number, or press Discard to keep the saved value.'); return; }
     if (d.broadcast_max_delay < d.broadcast_min_delay) { P.fieldError(form, 'broadcast_max_delay', 'The longest gap must be at least the shortest gap.'); return; }
     if (d.allow_list_only && !toList(d.allow_list).length) { P.fieldError(form, 'allow_list', 'Add at least one number that test mode may message.'); return; }
-    await save('automation', safetyBody(d), 'Safety settings saved.');
-    draw();
+    if (await saveSafety(d)) draw();
   });
-  P.form('set-notify', (form, d) => save('notifications', { desktop: !!d.desktop }, 'Alert settings saved.'));
   const keepEdits = () => !P.dirty.active() || window.confirm('You have unsaved changes on this page. Discard them?');
   P.act('set-pace', async (btn) => {
     if (!keepEdits()) return;
@@ -295,8 +318,14 @@
             <div class="full field"><label for="w-secret">Security key</label>
               <div class="input-group"><input type="password" id="w-secret" name="secret" value="${w.secret}" autocomplete="off" placeholder="${S.has_webhook_secret ? 'Saved - type to replace' : 'At least 16 characters'}">
               <button class="btn" type="button" data-action="toggle-secret" data-target="w-secret" aria-pressed="false">Show</button>
-              <button class="btn" type="button" data-action="gen-secret">Generate</button></div>
-              <span class="hint">Press Generate and share the key with your developer. It proves messages really come from Pulse, and lets their system send WhatsApp messages through Pulse.</span></div>
+              <button class="btn" type="button" data-action="gen-secret" data-target="w-secret">Generate</button></div>
+              <span class="hint">Press Generate and share the key with your developer. It proves the updates really come from Pulse.</span></div>
+            <div class="full field"><label for="w-inbound">Key for sending messages through Pulse</label>
+              <div class="input-group"><input type="password" id="w-inbound" name="inbound_secret" value="${w.inbound_secret || ''}" autocomplete="off" placeholder="At least 16 characters, different from the key above">
+              <button class="btn" type="button" data-action="toggle-secret" data-target="w-inbound" aria-pressed="false">Show</button>
+              <button class="btn" type="button" data-action="gen-secret" data-target="w-inbound">Generate</button></div>
+              ${S.legacy_inbound_key ? html`<div class="notice warn" role="status">${icon('alert')}<p>The security key above also lets other systems send messages through Pulse. Generate a separate key here and give it only to the system that sends messages.</p></div>` : ''}
+              <span class="hint">Only for a system that sends WhatsApp messages through Pulse. Keep it separate, so a system that only receives updates cannot send messages. While it is empty, the security key above is accepted for sending too.</span></div>
             ${field('w-timeout', 'Wait for an answer (seconds)', html`<input type="number" id="w-timeout" name="timeout_seconds" value="${w.timeout_seconds}" min="1" max="30">`)}
             ${field('w-retries', 'Tries before giving up', html`<input type="number" id="w-retries" name="max_retries" value="${w.max_retries}" min="1" max="10">`)}
           </div>
@@ -308,7 +337,7 @@
       <section class="card"><div class="card-head"><div><h2>Let other systems send WhatsApp messages</h2><p>For example, an order confirmation from your online shop.</p></div></div>
         <div class="card-body stack-sm">
           <details><summary>Instructions for your developer</summary>
-            <p>POST JSON to <code>${origin}/api/v1/webhook/send</code> with header <code>X-Webhook-Secret</code> set to the security key above, or sign it: send <code>X-Webhook-Timestamp</code> (Unix seconds) and <code>X-Signature-SHA256: sha256=HMAC(key, timestamp + "." + body)</code>. Signed requests older than 5 minutes are refused. Outgoing events carry <code>X-Pulse-Signature: t=timestamp,v1=HMAC(key, timestamp + "." + body)</code>; check it and refuse timestamps older than 5 minutes. The older <code>X-Signature-SHA256</code> (HMAC of the body only) is still sent. See Help for an example.</p>
+            <p>POST JSON to <code>${origin}/api/v1/webhook/send</code> with header <code>X-Webhook-Secret</code> set to the key for sending messages through Pulse (above), or sign it with that key: send <code>X-Webhook-Timestamp</code> (Unix seconds) and <code>X-Signature-SHA256: sha256=HMAC(key, timestamp + "." + body)</code>. Signed requests older than 5 minutes are refused. Outgoing events carry <code>X-Pulse-Signature: t=timestamp,v1=HMAC(key, timestamp + "." + body)</code>; check it and refuse timestamps older than 5 minutes. The older <code>X-Signature-SHA256</code> (HMAC of the body only) is still sent. See Help for an example.</p>
           </details>
           <p class="hint">This only works on this computer unless your developer makes Pulse reachable from the internet securely.</p>
         </div></section>
@@ -326,9 +355,22 @@
       </tbody></table></div>` : html`<div class="card-body hint">Everything was delivered.${r.pending ? ' ' + r.pending + ' updates are waiting to be sent.' : ''}</div>`);
   }
   const EVENT_NAMES = { 'message.received': 'New message', 'handover.requested': 'Customer asked for a person', 'contact.opted_out': 'Customer opted out', 'contact.opted_in': 'Customer opted in', ping: 'Test' };
+  /* A new security key or event address needs the admin password: the key lets other
+     programs send messages and the address receives every customer message. */
+  async function saveWebhook(d) {
+    const body = { enabled: !!d.enabled, url: d.url.trim(), secret: d.secret, inbound_secret: d.inbound_secret || '', timeout_seconds: d.timeout_seconds, max_retries: d.max_retries };
+    let password = '';
+    if (body.url !== (S.webhook.url || '') || body.secret !== S.webhook.secret || body.inbound_secret !== (S.webhook.inbound_secret || '')) {
+      const ok = await P.confirm({ title: 'Confirm the new integration details', message: 'Changing the security key or the address that receives events needs your admin password.', confirmLabel: 'Save', password: true });
+      if (!ok) return false;
+      password = ok.password;
+    }
+    await save('webhook', body, 'Integration settings saved.', password);
+    return true;
+  }
   P.form('set-webhook', async (form, d) => {
     if (d.enabled && !d.url.trim()) { P.fieldError(form, 'url', 'Enter the URL.'); return; }
-    await save('webhook', { enabled: !!d.enabled, url: d.url.trim(), secret: d.secret, timeout_seconds: d.timeout_seconds, max_retries: d.max_retries }, 'Integration settings saved.');
+    await saveWebhook(d);
   });
   P.act('toggle-secret', (btn) => {
     const i = document.getElementById(btn.dataset.target);
@@ -337,10 +379,10 @@
     btn.textContent = show ? 'Hide' : 'Show';
     btn.setAttribute('aria-pressed', String(show));
   });
-  P.act('gen-secret', () => {
+  P.act('gen-secret', (btn) => {
     const a = new Uint8Array(24);
     crypto.getRandomValues(a);
-    const i = P.$('#w-secret');
+    const i = document.getElementById(btn.dataset.target || 'w-secret');
     i.value = Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
     i.type = 'text';
     i.dispatchEvent(new Event('input', { bubbles: true }));
@@ -351,9 +393,9 @@
     if (r.ok) P.toast('The test arrived. The connection works.');
     else P.toast('The test did not arrive: ' + r.error, { type: 'error', timeout: 8000 });
   });
-  P.act('webhook-replay', async (btn) => { await P.busy(btn, () => P.post('/webhook/replay', { id: btn.dataset.id })); P.toast('Pulse will try again.'); loadFailed(); });
-  P.act('webhook-replay-all', async (btn) => { const r = await P.busy(btn, () => P.post('/webhook/replay', { id: '' })); P.toast('Trying ' + r.queued + ' updates again.'); loadFailed(); });
-  P.act('webhook-clear', async () => { await P.del('/webhook/failed'); loadFailed(); });
+  P.act('webhook-replay', async (btn) => { await P.busy(btn, () => P.post('/webhook/replay', { id: btn.dataset.id })); P.toast('Pulse will try again.'); loadFailed().catch(P.error); });
+  P.act('webhook-replay-all', async (btn) => { const r = await P.busy(btn, () => P.post('/webhook/replay', { id: '' })); P.toast('Trying ' + r.queued + ' updates again.'); loadFailed().catch(P.error); });
+  P.act('webhook-clear', async () => { await P.del('/webhook/failed'); loadFailed().catch(P.error); });
   P.act('api-key', async (btn) => {
     const gen = btn.dataset.op === 'generate';
     const ok = await P.confirm({ title: gen ? 'Create a new developer key?' : 'Remove the developer key?', message: gen ? 'Any previous key stops working. The new key is shown only once.' : 'Programs using the key will stop working.', confirmLabel: gen ? 'Create key' : 'Remove', danger: !gen, password: true });
@@ -394,7 +436,7 @@
       </form>
       <section class="card"><div class="card-head"><div><h2>Backup</h2><p>Contacts, rules, templates, business details and opening hours. Messages are not included.</p></div></div>
         <div class="card-body row"><button class="btn" type="button" data-action="backup">${icon('download', 'icon-sm')}Download backup</button>
-          <label class="btn" for="restore-file">${icon('upload', 'icon-sm')}Restore from backup</label><input type="file" id="restore-file" accept=".json,application/json" data-change="restore" hidden></div></section>
+          <button class="btn" type="button" data-action="restore-pick">${icon('upload', 'icon-sm')}Restore from backup</button><input type="file" id="restore-file" accept=".json,application/json" data-change="restore" hidden aria-label="Backup file to restore"></div></section>
       <section class="card"><div class="card-head"><div><h2>Delete data</h2></div></div>
         <div class="card-body stack">
           <form class="input-group" data-form="purge-days"><label class="sr-only" for="p-days">Days</label><input type="number" id="p-days" name="days" min="1" max="3650" placeholder="Days, for example 90"><button class="btn danger" type="submit">Delete older messages</button></form>
@@ -418,28 +460,53 @@
     if (!ok) return;
     const r = await P.post('/privacy/delete-old-session', { password: ok.password });
     P.toast(r.message);
-    loadAutoBackups();
+    loadAutoBackups().catch(P.error);
   });
   P.act('delete-old-copies', async () => {
     const ok = await P.confirm({ title: 'Delete the unencrypted old copies?', message: 'These are the contact and message files from the version before 1.4. Their content is already in Pulse, encrypted. This cannot be undone.', confirmLabel: 'Delete', danger: true, password: true });
     if (!ok) return;
     const r = await P.post('/privacy/delete-old-copies', { password: ok.password });
     P.toast(r.message);
-    loadAutoBackups();
+    loadAutoBackups().catch(P.error);
   });
   P.form('set-autobackup', async (form, d) => {
     await save('storage', { auto_backup: !!d.auto_backup, backup_copy_dir: d.backup_copy_dir.trim() }, 'Backup settings saved.');
     draw();
   });
-  P.act('backup-now', async (btn) => { const r = await P.busy(btn, () => P.post('/backups/now')); P.toast(r.message); loadAutoBackups(); });
+  P.act('backup-now', async (btn) => {
+    const r = await P.busy(btn, () => P.post('/backups/now'));
+    if (!r) return;
+    // warning: the backup was saved but the extra copy folder failed.
+    P.toast(r.message, r.warning ? { type: 'warn', timeout: 9000 } : undefined);
+    loadAutoBackups().catch(P.error);
+  });
   P.act('backup-restore', async (btn) => {
-    const ok = await P.confirm({ title: 'Restore this backup?', message: 'Contacts, rules and templates from this backup are added or updated. Nothing is deleted, and opt-outs are kept.', confirmLabel: 'Restore', password: true });
+    const ok = await P.confirm({ title: 'Restore this backup?', message: 'Contacts, rules and templates from this backup are added or updated, and opt-outs are kept. Your business details and opening hours are replaced by the ones in the backup.', confirmLabel: 'Restore', password: true });
     if (!ok) return;
     const r = await P.post('/backups/restore', { name: btn.dataset.name, password: ok.password });
     P.toast(r.message);
   });
-  P.form('set-storage', (form, d) => save('storage', { retention_days: d.retention_days, max_messages: d.max_messages }, 'Storage settings saved.'));
-  P.form('export-one', (form, d) => { const p = d.phone.replace(/[^0-9]/g, ''); if (p.length < 7) { P.fieldError(form, 'phone', 'Enter the phone number.'); return; } P.download('/privacy/export?phone=' + p); });
+  /* Keeping messages for a shorter time, or fewer of them, deletes the older ones for good:
+     like "Delete messages" it needs the admin password (the server checks it too). */
+  /* Shared by the card's Save button and the unsaved-changes bar, so both ask for the password. */
+  async function saveStorage(d) {
+    const days = Number(d.retention_days);
+    /* An empty field (P.formData gives null) is not "0 messages": Number(null) would be 0
+       and ask to delete older messages although nothing gets smaller. */
+    const maxSet = d.max_messages !== null && d.max_messages !== undefined && String(d.max_messages).trim() !== '';
+    const max = maxSet ? Number(d.max_messages) : NaN;
+    const cur = S.storage;
+    let password = '';
+    if ((days > 0 && (cur.retention_days === 0 || days < cur.retention_days)) || (maxSet && max < cur.max_messages)) {
+      const ok = await P.confirm({ title: 'Delete older messages?', message: 'With these settings Pulse deletes the older messages permanently. Enter your admin password to continue.', confirmLabel: 'Save and delete', danger: true, password: true });
+      if (!ok) return false;
+      password = ok.password;
+    }
+    await save('storage', { retention_days: d.retention_days, max_messages: d.max_messages }, 'Storage settings saved.', password);
+    return true;
+  }
+  P.form('set-storage', async (form, d) => { await saveStorage(d); });
+  P.form('export-one', (form, d) => { const p = d.phone.replace(/[^0-9]/g, ''); if (p.length < 7) { P.fieldError(form, 'phone', 'Enter the phone number.'); return; } return P.download('/privacy/export?phone=' + p); });
   P.form('forget-one', async (form, d) => {
     const p = d.phone.replace(/[^0-9]/g, '');
     if (p.length < 7) { P.fieldError(form, 'phone', 'Enter the phone number.'); return; }
@@ -450,11 +517,13 @@
     P.toast(r.message);
   });
   P.act('delete-imported', async () => {
-    const ok = await P.confirm({ title: 'Delete imported chats?', message: 'Past messages copied from the phone, and contacts that only came from that import, will be deleted from Pulse. Your phone keeps everything.', confirmLabel: 'Delete', danger: true });
+    const ok = await P.confirm({ title: 'Delete imported chats?', message: 'Past messages copied from the phone, and contacts that only came from that import, will be deleted from Pulse. Your phone keeps everything.', confirmLabel: 'Delete', danger: true, password: true });
     if (!ok) return;
-    const r = await P.post('/privacy/delete-imported');
+    const r = await P.post('/privacy/delete-imported', { password: ok.password });
     P.toast(r.message);
   });
+  // A real button (a <label> for a hidden input cannot be reached with the keyboard).
+  P.act('restore-pick', () => P.$('#restore-file').click());
   P.act('backup', () => P.download('/backup'));
   P.act('export-all', () => P.download('/privacy/export'));
   P.change('restore', async (el) => {
@@ -463,7 +532,7 @@
     if (!f) return;
     let bundle;
     try { bundle = JSON.parse(await f.text()); } catch (e) { P.toast('This is not a valid backup file.', { type: 'error' }); return; }
-    const ok = await P.confirm({ title: 'Restore this backup?', message: 'Contacts, rules and templates from the file are added or updated. Nothing is deleted.', confirmLabel: 'Restore', password: true });
+    const ok = await P.confirm({ title: 'Restore this backup?', message: 'Contacts, rules and templates from the file are added or updated; none are deleted. Your business details and opening hours are replaced by the ones in the file.', confirmLabel: 'Restore', password: true });
     if (!ok) return;
     const r = await P.post('/restore', { password: ok.password, bundle });
     P.toast(r.message);
@@ -506,15 +575,45 @@
           <div class="card-foot"><button class="btn primary" type="submit">Save staff password</button></div>
         </form>
       </div>
-      <section class="card"><div class="card-head"><div><h2>This computer</h2></div></div>
+      ${P.session.local ? html`<section class="card"><div class="card-head"><div><h2>This computer</h2></div></div>
         <div class="card-body stack-sm">
           ${S.autostart_supported ? html`<label class="switch"><input type="checkbox" data-change="autostart" ${S.autostart ? P.raw('checked') : ''}><span class="track" aria-hidden="true"></span><span><span class="label">Start Pulse when Windows starts</span><br><span class="hint">Runs in the background so replies keep working after a restart. Also set Windows to never sleep while plugged in.</span></span></label>` : html`<p class="hint">Starting automatically is available on Windows. On other systems use a service manager.</p>`}
           <div class="row"><button class="btn" type="button" data-action="desktop-shortcut">Create a desktop shortcut</button></div>
-        </div></section>
+        </div></section>` : ''}
+      ${phoneCard()}
       <section class="card"><div class="card-head"><div><h2>Activity log</h2><p>Sign-ins, setting changes, hand-overs, opt-outs and deletions.</p></div><button class="btn small" type="button" data-action="audit-csv">${icon('download', 'icon-sm')}Download for Excel</button></div>
         <div id="audit-box"><div class="card-body"><div class="skeleton"></div></div></div></section>
     </div>`;
   }
+  /* Using Pulse on a phone: the engine keeps running on this computer (Meta delivers
+     messages to it), and the phone opens the dashboard through the fixed https address. */
+  function phoneCard() {
+    const on = P.session.remoteAccess;
+    const addr = (S.cloud_api && S.cloud_api.public_url) || '';
+    return html`<section class="card"><div class="card-head"><div><h2>Use Pulse on your phone (Android app)</h2>
+        <p>Reply to customers and manage Pulse from an Android phone or another computer. Pulse keeps running on this computer; the phone connects through your fixed https address.</p></div>
+        ${on ? P.statusPill('ok', 'On') : P.statusPill('', 'Off')}</div>
+      <div class="card-body stack-sm">
+        ${on ? html`<ol class="steps">
+            <li>On the phone, open Chrome and go to <strong>${addr}</strong>.</li>
+            <li>Sign in with your admin or staff password.</li>
+            <li>Chrome menu (⋮) &gt; <strong>Install app</strong> (or <strong>Add to Home screen</strong>). Pulse then opens like an app.</li>
+          </ol>
+          <p class="hint">Anyone who knows the address sees the sign-in page, so keep strong passwords. Wrong passwords lock out the device that typed them for 5 minutes.</p>`
+        : html`<p class="hint">Needs your fixed https address (Settings &gt; WhatsApp connection), the same one Meta uses. ${addr ? html`Current address: <strong>${addr}</strong>.` : 'No address is saved yet.'}</p>`}
+        <div class="row"><button class="btn${on ? '' : ' primary'}" type="button" data-action="remote-access" data-on="${on ? '0' : '1'}">${on ? 'Switch off phone access' : 'Switch on phone access'}</button></div>
+      </div></section>`;
+  }
+  P.act('remote-access', async (btn) => {
+    const enable = btn.dataset.on === '1';
+    const ok = await P.confirm({ title: enable ? 'Use Pulse from phones?' : 'Switch off phone access?', message: enable ? 'The sign-in page becomes reachable through your https address. Enter your admin password to continue.' : 'Phones and other computers can no longer open the dashboard. Enter your admin password to continue.', confirmLabel: enable ? 'Switch on' : 'Switch off', danger: enable, password: true });
+    if (!ok) return;
+    const r = await P.post('/settings/remote-access', { enabled: enable, password: ok.password });
+    P.session.remoteAccess = !!r.remote_access;
+    P.toast(r.remote_access ? 'Phone access is on.' : 'Phone access is off.');
+    if (!r.remote_access && !P.session.local) { window.location.reload(); return; }
+    draw();
+  });
   const ACTIVITY = {
     LOGIN: 'Signed in', LOGIN_FAILED: 'Wrong password entered', LOGIN_LOCKED: 'Sign-in blocked after wrong passwords', LOGOUT: 'Signed out',
     REAUTH_FAILED: 'Wrong password for a protected action', PASSWORD_SET: 'Admin password chosen', PASSWORD_CHANGED: 'Admin password changed', PASSWORD_RESET: 'Admin password reset',
@@ -568,16 +667,20 @@
   function draw() {
     const el = P.$('#settings-body');
     if (!el) return;
-    P.$$('[data-action="settings-tab"]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === tab)));
+    P.$$('[data-action="settings-tab"]').forEach((b) => {
+      const on = b.dataset.tab === tab;
+      b.setAttribute('aria-selected', String(on));
+      b.tabIndex = on ? 0 : -1; // roving tabindex: Tab enters the list at the selected tab
+    });
+    el.setAttribute('aria-labelledby', 'st-tab-' + tab);
     const body = { whatsapp: whatsappTab, business: businessTab, hours: hoursTab, safety: safetyTab, integrations: integrationsTab, privacy: privacyTab, account: accountTab }[tab]();
     P.mount(el, body);
     P.dirty.clear();
-    const forms = { business: ['#f-business', (f, d) => save('business', d, 'Business details saved.')], hours: ['#f-hours', (f, d) => save('business_hours', hoursBody(d), 'Opening hours saved.')], safety: ['#f-safety', (f, d) => save('automation', safetyBody(d), 'Safety settings saved.')], integrations: ['#f-webhook', (f, d) => save('webhook', { enabled: !!d.enabled, url: d.url.trim(), secret: d.secret, timeout_seconds: d.timeout_seconds, max_retries: d.max_retries }, 'Integration settings saved.')], privacy: ['#f-storage', (f, d) => save('storage', { retention_days: d.retention_days, max_messages: d.max_messages }, 'Storage settings saved.')] };
+    const forms = { business: ['#f-business', (f, d) => save('business', d, 'Business details saved.')], hours: ['#f-hours', (f, d) => save('business_hours', hoursBody(d), 'Opening hours saved.')], safety: ['#f-safety', (f, d) => saveSafety(d).then((ok) => { if (!ok) throw new Error('Nothing was saved.'); })], integrations: ['#f-webhook', (f, d) => saveWebhook(d).then((ok) => { if (!ok) throw new Error('Nothing was saved.'); })], privacy: ['#f-storage', (f, d) => saveStorage(d).then((ok) => { if (!ok) throw new Error('Nothing was saved.'); })] };
     if (forms[tab]) P.trackForm(P.$(forms[tab][0]), forms[tab][1]);
     if (tab === 'integrations') loadFailed().catch(P.error);
     if (tab === 'account') loadAudit().catch(P.error);
     if (tab === 'privacy') loadAutoBackups().catch(P.error);
-    if (tab === 'safety') { const s = P.$('#browser-alert-state'); if (s && P.store.get('browserAlerts', false)) s.textContent = 'Browser alerts are on while this page is open.'; }
   }
   P.act('settings-tab', (btn) => {
     if (P.dirty.active() && !window.confirm('You have unsaved changes. Leave this tab without saving?')) return;
@@ -593,7 +696,20 @@
       tab = TABS.some((t) => t[0] === q.get('tab')) ? q.get('tab') : 'whatsapp';
       await P.loadVars();
       [S, C] = await Promise.all([P.get('/settings'), P.get('/connection')]);
-      P.mount(el, html`<div class="tabs" role="tablist" aria-label="Settings sections">${TABS.map(([k, l]) => html`<button type="button" role="tab" data-action="settings-tab" data-tab="${k}" aria-selected="${String(k === tab)}">${l}</button>`)}</div><div id="settings-body"></div>`);
+      P.mount(el, html`<div class="tabs" role="tablist" aria-label="Settings sections">${TABS.map(([k, l]) => html`<button type="button" role="tab" id="st-tab-${k}" aria-controls="settings-body" data-action="settings-tab" data-tab="${k}" aria-selected="${String(k === tab)}" tabindex="${k === tab ? '0' : '-1'}">${l}</button>`)}</div><div id="settings-body" role="tabpanel" tabindex="0" aria-labelledby="st-tab-${tab}"></div>`);
+      // Arrow keys, Home and End move between tabs; Enter or Space opens the focused one
+      // (manual activation, so an unsaved form is not left by just moving the focus).
+      P.$('[role="tablist"]', el).addEventListener('keydown', (e) => {
+        const list = P.$$('[role="tab"]', e.currentTarget);
+        const i = list.indexOf(document.activeElement);
+        if (i < 0) return;
+        const to = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: list.length - 1 }[e.key];
+        if (to === undefined) return;
+        e.preventDefault();
+        const next = list[(to + list.length) % list.length];
+        list.forEach((b) => { b.tabIndex = b === next ? 0 : -1; });
+        next.focus();
+      });
       draw();
     },
   });

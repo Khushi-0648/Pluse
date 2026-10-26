@@ -57,9 +57,18 @@
       </div>`);
   }
 
+  // Deletes still inside their Undo window: hidden from every reload until they commit.
+  const pendingDelete = new Set();
+  let loadSeq = 0;
   async function load() {
+    const seq = ++loadSeq;
     const q = new URLSearchParams({ search: st.search, filter: st.filter, tag: st.tag, page: String(st.page), limit: '100' });
-    st.data = await P.get('/contacts?' + q.toString());
+    const data = await P.get('/contacts?' + q.toString());
+    if (seq !== loadSeq) return; // a newer search or page was asked for meanwhile
+    const shown = data.contacts.filter((c) => !pendingDelete.has(c.phone));
+    data.total -= data.contacts.length - shown.length;
+    data.contacts = shown;
+    st.data = data;
     drawTable();
   }
 
@@ -74,7 +83,9 @@
     let recent = [];
     let inWindow = false;
     if (phone) {
+      const page = P.renderToken;
       const r = await P.get('/contacts/' + encodeURIComponent(phone));
+      if (page !== P.renderToken) return; // the user moved to another page meanwhile
       c = r.contact; recent = r.recent_messages || []; inWindow = r.in_window;
     }
     const isNew = !phone;
@@ -111,9 +122,10 @@
 
   P.form('contact-save', async (form, data) => {
     if (!data.phone || data.phone.replace(/[^0-9]/g, '').length < 7) { P.fieldError(form, 'phone', 'Enter the phone number with country code.'); return; }
-    if (data.consent && !data.consent_source.trim()) {
-      const existing = form.elements.original_phone.value && st.data && st.data.contacts.find((x) => x.phone === form.elements.original_phone.value);
-      if (!existing || !existing.consent) { P.fieldError(form, 'consent_source', 'Say how this person agreed to receive messages.'); return; }
+    // A contact that already had consent when the form opened needs no new source; the form
+    // carries that state, so it also works for a contact opened from the inbox.
+    if (data.consent && !data.consent_source.trim() && data.seen_consent !== 'true') {
+      P.fieldError(form, 'consent_source', 'Say how this person agreed to receive messages.'); return;
     }
     const body = {
       original_phone: data.original_phone, phone: data.phone, name: data.name, email: data.email, notes: data.notes,
@@ -130,12 +142,21 @@
   P.act('contact-edit', (el) => editContact(el.dataset.phone));
   P.act('contact-delete', (el) => {
     const phone = el.dataset.phone;
-    const before = st.data.contacts;
-    st.data.contacts = before.filter((c) => c.phone !== phone);
+    const idx = st.data.contacts.findIndex((c) => c.phone === phone);
+    if (idx < 0) return;
+    const [item] = st.data.contacts.splice(idx, 1);
     st.data.total -= 1;
     st.selected.delete(phone);
+    pendingDelete.add(phone);
     drawTable();
-    P.undoable('Deleted ' + el.dataset.name + '.', () => P.del('/contacts/' + encodeURIComponent(phone)).then(load), () => { st.data.contacts = before; st.data.total += 1; drawTable(); });
+    // Undo puts back only this contact, so other deletes in their Undo window stay hidden.
+    P.undoable('Deleted ' + el.dataset.name + '.',
+      () => P.del('/contacts/' + encodeURIComponent(phone)).finally(() => pendingDelete.delete(phone)).then(load),
+      () => {
+        pendingDelete.delete(phone);
+        if (!st.data.contacts.some((c) => c.phone === phone)) { st.data.contacts.splice(Math.min(idx, st.data.contacts.length), 0, item); st.data.total += 1; }
+        drawTable();
+      });
   });
   P.act('contact-forget', async (el) => {
     const ok = await P.confirm({ title: 'Delete all data for this person?', message: 'The contact, every stored message and any scheduled messages to them will be deleted. Use this when a customer asks you to erase their data.', confirmLabel: 'Delete everything', danger: true, password: true });
@@ -143,7 +164,7 @@
     const r = await P.post('/privacy/forget-contact', { phone: el.dataset.phone, password: ok.password });
     P.$$('.modal [data-modal-close]').forEach((b) => b.click());
     P.toast(r.message);
-    load();
+    load().catch(P.error);
   });
 
   P.change('contact-select', (el) => { if (el.checked) st.selected.add(el.dataset.phone); else st.selected.delete(el.dataset.phone); P.mount(P.$('#bulk-bar'), bulkBar()); });
@@ -154,8 +175,8 @@
     const res = await P.confirm({ title, message: 'Tag name', extra: html`<div class="field"><label for="bulk-tag-name" class="sr-only">Tag</label><input type="text" id="bulk-tag-name" name="tag" list="bulk-tags" maxlength="40" required autofocus><datalist id="bulk-tags">${st.tags.map((t) => html`<option value="${t}">`)}</datalist></div>`, confirmLabel: 'Apply' });
     return res && res.tag && res.tag.trim();
   }
-  async function bulk(action, tag) {
-    const r = await P.post('/contacts/bulk', { action, phones: Array.from(st.selected), tag });
+  async function bulk(action, tag, password) {
+    const r = await P.post('/contacts/bulk', { action, phones: Array.from(st.selected), tag, password });
     P.toast('Updated ' + P.plural(r.updated, 'contact') + '.');
     st.selected.clear();
     await Promise.all([load(), loadTags()]);
@@ -167,15 +188,15 @@
     if (ok) await bulk('opt_out');
   });
   P.act('bulk-delete', async () => {
-    const ok = await P.confirm({ title: 'Delete ' + P.plural(st.selected.size, 'contact') + '?', message: 'Their messages stay in the inbox until you delete them too.', confirmLabel: 'Delete', danger: true });
-    if (ok) await bulk('delete');
+    const ok = await P.confirm({ title: 'Delete ' + P.plural(st.selected.size, 'contact') + '?', message: 'Their messages stay in the inbox until you delete them too.', confirmLabel: 'Delete', danger: true, password: true });
+    if (ok) await bulk('delete', '', ok.password);
   });
 
-  P.act('contacts-page', (el) => { st.page = Number(el.dataset.page) || 1; load(); });
+  P.act('contacts-page', (el) => { st.page = Number(el.dataset.page) || 1; load().catch(P.error); });
   let timer = null;
-  P.change('contact-search', (el) => { clearTimeout(timer); timer = setTimeout(() => { st.search = el.value.trim(); st.page = 1; st.selected.clear(); load(); }, 250); });
-  P.change('contact-filter', (el) => { st.filter = el.value; st.page = 1; st.selected.clear(); load(); });
-  P.change('contact-tag', (el) => { st.tag = el.value; st.page = 1; st.selected.clear(); load(); });
+  P.change('contact-search', (el) => { clearTimeout(timer); timer = setTimeout(() => { st.search = el.value.trim(); st.page = 1; st.selected.clear(); load().catch(P.error); }, 250); });
+  P.change('contact-filter', (el) => { st.filter = el.value; st.page = 1; st.selected.clear(); load().catch(P.error); });
+  P.change('contact-tag', (el) => { st.tag = el.value; st.page = 1; st.selected.clear(); load().catch(P.error); });
   P.act('contact-reveal', (el) => { st.reveal = !st.reveal; P.store.set('revealPhones', st.reveal); el.setAttribute('aria-pressed', String(st.reveal)); el.textContent = st.reveal ? 'Hide numbers' : 'Show numbers'; drawTable(); });
   P.act('contacts-export', () => P.download('/contacts/export.csv'));
 

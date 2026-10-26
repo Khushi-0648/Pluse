@@ -8,11 +8,13 @@ import (
 	"time"
 
 	"whatsapp-automation/pkg/campaign"
+	"whatsapp-automation/pkg/cloudapi"
 	"whatsapp-automation/pkg/config"
 	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/history"
 	"whatsapp-automation/pkg/msgtemplate"
 	"whatsapp-automation/pkg/notify"
+	"whatsapp-automation/pkg/securestore"
 	"whatsapp-automation/pkg/security"
 	"whatsapp-automation/pkg/webhook"
 )
@@ -36,6 +38,10 @@ type Incoming struct {
 	Text     string
 	Media    string // "Photo", "Document"... for messages that are not plain text
 	SentAt   time.Time
+
+	// late marks a message that arrived after Stop: it goes through its chat's queue, so
+	// it is handled after the ones before it, but is only recorded (STOP/START applied).
+	late bool
 }
 
 // Outcome describes what the engine did with a message (used by tests and the rule tester).
@@ -67,19 +73,48 @@ type Engine struct {
 
 	mu         sync.Mutex
 	menus      map[string]time.Time
-	lastAway   map[string]time.Time
-	lastFall   map[string]time.Time
 	capFlagged map[string]time.Time
+	lastPrune  time.Time // when the per-customer maps above were last cleared of old entries
 	limitNoted time.Time
 	queues     map[string]chan Incoming
 	stopping   bool           // Stop was called: new messages are only recorded
-	stopCh     chan struct{}  // closed when Stop is called to wake idle workers
-	inflight   sync.WaitGroup // queued messages not yet processed
+	inflight   sync.WaitGroup // messages queued before Stop and not yet processed
+	jnl        *journal       // received messages not yet processed, on disk (nil: off)
+}
+
+// UseJournal keeps received messages in path until they are processed, so none is lost
+// when Pulse stops unexpectedly. It returns the messages a previous run received but did
+// not process; pass them to Receive once sending is ready.
+func (e *Engine) UseJournal(path string) []Incoming {
+	j, pending := openJournal(path, securestore.Default())
+	if e.hist != nil {
+		// Entries leave the journal once their history is on disk, and the contacts too:
+		// a STOP or START applied to a contact that was not saved yet must be replayed
+		// after a crash, so a contacts save that fails keeps the entries.
+		e.hist.OnSaved(func(snapshotAt time.Time) {
+			if e.contacts != nil {
+				if err := e.contacts.Flush(); err != nil {
+					fmt.Printf("[Bot] The contacts could not be saved (%v); received messages stay listed until they are.\n", err)
+					return
+				}
+			}
+			j.compact(snapshotAt)
+		})
+	} else {
+		j.immediate = true
+	}
+	e.jnl = j
+	return pending
 }
 
 // NewEngine creates the engine. m, hooks and notifier may be nil.
 func NewEngine(m Messenger, cfg *config.Config, cs *contacts.Store, hs *history.Store, hooks *webhook.Dispatcher, n notify.Notifier) *Engine {
-	e := &Engine{msg: m, cfg: cfg, contacts: cs, hist: hs, hooks: hooks, notifier: n, now: time.Now, stopCh: make(chan struct{})}
+	e := &Engine{msg: m, cfg: cfg, contacts: cs, hist: hs, hooks: hooks, notifier: n, now: time.Now}
+	if cs != nil && hs != nil {
+		// A contact Pulse 2.0 saved under a wrong number takes its messages along when it
+		// moves to the number Meta sends (contacts.LegacyWAID).
+		cs.OnRenamed(func(oldPhone, newPhone string) { hs.RenamePhone(oldPhone, newPhone) })
+	}
 	e.Reset()
 	return e
 }
@@ -95,12 +130,7 @@ func (e *Engine) SetClock(now func() time.Time) { e.now = now }
 // and their opt-outs applied, but never answered. Call it before the final save.
 func (e *Engine) Stop(ctx context.Context) bool {
 	e.mu.Lock()
-	if !e.stopping {
-		e.stopping = true
-		if e.stopCh != nil {
-			close(e.stopCh)
-		}
-	}
+	e.stopping = true
 	e.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
@@ -119,7 +149,7 @@ func (e *Engine) Stop(ctx context.Context) bool {
 // Reset clears in-memory conversation state.
 func (e *Engine) Reset() {
 	e.mu.Lock()
-	e.menus, e.lastAway, e.lastFall, e.capFlagged = map[string]time.Time{}, map[string]time.Time{}, map[string]time.Time{}, map[string]time.Time{}
+	e.menus, e.capFlagged = map[string]time.Time{}, map[string]time.Time{}
 	if e.queues == nil {
 		e.queues = map[string]chan Incoming{}
 	}
@@ -129,10 +159,16 @@ func (e *Engine) Reset() {
 // Receive queues a customer's message for the automation pipeline. Messages without a
 // number or without any content are ignored.
 func (e *Engine) Receive(in Incoming) {
-	in.Phone = contacts.CleanPhone(in.Phone)
+	in.Phone = contacts.NormalizePhone(in.Phone) // Meta's number: no country code is guessed
 	in.PushName, in.Text = strings.TrimSpace(in.PushName), strings.TrimSpace(in.Text)
 	if in.Phone == "" || in.ID == "" || (in.Text == "" && in.Media == "") {
 		return
+	}
+	if err := e.jnl.add(in); err != nil {
+		// Meta still gets its answer (refusing would only make it repeat the delivery,
+		// which hits the same disk problem); the message is processed right away and only
+		// a crash before the next history save could lose it.
+		fmt.Printf("[Bot] Message %s could not be saved before processing: %v\n", in.ID, err)
 	}
 	e.enqueue(in)
 }
@@ -143,11 +179,10 @@ func (e *Engine) enqueue(in Incoming) {
 	key := in.Phone
 	// The send happens under the lock so an idle worker cannot remove the queue in between.
 	e.mu.Lock()
-	if e.stopping {
-		e.mu.Unlock()
-		e.process(in, true) // shutting down: record it and apply STOP/START, no reply
-		return
-	}
+	// After Stop a message is still handled through its chat's queue, after the ones
+	// before it (a STOP then START must apply in that order), but only recorded with
+	// STOP/START applied, never answered. Stop does not wait for it.
+	in.late = e.stopping
 	q, ok := e.queues[key]
 	if !ok {
 		q = make(chan Incoming, 64)
@@ -155,12 +190,16 @@ func (e *Engine) enqueue(in Incoming) {
 		go e.worker(key, q)
 	}
 	queued := true
-	e.inflight.Add(1)
+	if !in.late {
+		e.inflight.Add(1)
+	}
 	select {
 	case q <- in:
 	default:
 		queued = false
-		e.inflight.Done()
+		if !in.late {
+			e.inflight.Done()
+		}
 	}
 	e.mu.Unlock()
 	if !queued {
@@ -168,26 +207,36 @@ func (e *Engine) enqueue(in Incoming) {
 		e.record(in, e.cfg.Snapshot())
 		// An opt-out must never be lost, even when the chat is flooding.
 		if IsOptOut(in.Text) && e.contacts != nil {
-			e.contacts.SetDND(in.Phone, true, "Replied "+strings.ToUpper(Normalize(in.Text))+" on "+e.now().Format("2006-01-02"))
+			e.contacts.Upsert(in.Phone, in.PushName, "whatsapp") // the exact number, as Meta sent it
+			e.contacts.SetDND(in.Phone, true, "Replied "+strings.ToUpper(Normalize(in.Text))+" on "+e.now().Format("2006-01-02"), in.SentAt)
 		}
+		e.jnl.done(in.ID)
 	}
 }
 
+// handle processes one queued message and then takes it off the journal.
+func (e *Engine) handle(in Incoming) {
+	if !in.late {
+		defer e.inflight.Done()
+	}
+	defer e.jnl.done(in.ID) // also after a recovered panic, so such a message is not retried at every start
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[Bot] Recovered from error handling message %s: %v\n", in.ID, r)
+		}
+	}()
+	e.process(in, in.late) // after Stop: record it and apply STOP/START, no reply
+}
+
+// worker handles one chat's queue until it has been idle for a while. It keeps running
+// after Stop, so messages that arrive during shutdown keep their order.
 func (e *Engine) worker(key string, q chan Incoming) {
 	idle := time.NewTimer(5 * time.Minute)
 	defer idle.Stop()
 	for {
 		select {
 		case in := <-q:
-			func() {
-				defer e.inflight.Done()
-				defer func() {
-					if r := recover(); r != nil {
-						fmt.Printf("[Bot] Recovered from error handling message %s: %v\n", in.ID, r)
-					}
-				}()
-				e.Process(in)
-			}()
+			e.handle(in)
 			idle.Reset(5 * time.Minute)
 		case <-idle.C:
 			e.mu.Lock()
@@ -198,23 +247,6 @@ func (e *Engine) worker(key string, q chan Incoming) {
 			}
 			e.mu.Unlock()
 			idle.Reset(time.Minute)
-		case <-e.stopCh:
-			for {
-				select {
-				case in := <-q:
-					func() {
-						defer e.inflight.Done()
-						defer func() {
-							if r := recover(); r != nil {
-								fmt.Printf("[Bot] Recovered from error handling message %s: %v\n", in.ID, r)
-							}
-						}()
-						e.Process(in)
-					}()
-				default:
-					return
-				}
-			}
 		}
 	}
 }
@@ -233,9 +265,29 @@ func (e *Engine) Process(in Incoming) Outcome { return e.process(in, false) }
 // process handles one message; when quiet it is only recorded (with STOP/START
 // applied) and never answered.
 func (e *Engine) process(in Incoming, quiet bool) Outcome {
+	in.Text, in.PushName = CleanDisplayText(in.Text, true), CleanDisplayText(in.PushName, false)
 	cfg := e.cfg.Snapshot()
 	a := cfg.Automation
 	now := e.now()
+	e.pruneState(now)
+
+	// Meta can deliver a message more than once, and the client only remembers deliveries
+	// since Pulse last started: a message already in the history was handled before, so
+	// it must not be answered again (a restart, or a replayed delivery).
+	if e.hist != nil {
+		if _, done := e.hist.Get(in.ID); done {
+			return Outcome{Skipped: "message was already handled"}
+		}
+		// The reply's record is saved before the reply is sent (see reply): a message
+		// replayed after a crash that came after the reply went out is not answered again.
+		since := time.Time{}
+		if !in.SentAt.IsZero() {
+			since = in.SentAt.Add(-time.Hour) // a reply is never older than the message (with clock slack)
+		}
+		if e.hist.HasLabel(ReplyLabel+in.ID, since) {
+			return Outcome{Skipped: "message was already answered"}
+		}
+	}
 
 	// The 24-hour window starts when the customer wrote, not when Pulse came back online
 	// and received the message.
@@ -243,7 +295,10 @@ func (e *Engine) process(in Incoming, quiet bool) Outcome {
 	if !in.SentAt.IsZero() && in.SentAt.Before(now) {
 		sentAt = in.SentAt
 	}
-	stale := now.Sub(sentAt) > 24*time.Hour
+	// Free text may only answer within WhatsApp's 24-hour window; like every other sender,
+	// Pulse stops half an hour early (contacts.FreeTextWindow), so a reply that is paced or
+	// retried cannot reach Meta after the window closed.
+	stale := now.Sub(sentAt) >= contacts.FreeTextWindow
 	var contact contacts.Contact
 	if e.contacts != nil {
 		contact = e.contacts.Upsert(in.Phone, in.PushName, "whatsapp")
@@ -260,6 +315,17 @@ func (e *Engine) process(in Incoming, quiet bool) Outcome {
 	})
 
 	if in.Text == "" {
+		// Pulse cannot read a voice note, a photo without a caption or a document, so a
+		// person has to look; otherwise the customer would get silence.
+		if e.needsPersonForMedia(in, contact, cfg, now, stale) {
+			reason := "Sent a " + strings.ToLower(in.Media) + " that Pulse cannot read"
+			e.contacts.FlagAttention(in.Phone, reason)
+			security.LogAudit("MEDIA_NEEDS_PERSON", "+"+in.Phone, contact.Name, reason, "success")
+			if e.notifier != nil {
+				e.notifier.Notify("Chat needs attention", displayName(contact.Name, in.Phone)+": "+reason)
+			}
+			return Outcome{Skipped: "no text; chat flagged for a person"}
+		}
 		return Outcome{Skipped: "no text"}
 	}
 
@@ -272,35 +338,56 @@ func (e *Engine) process(in Incoming, quiet bool) Outcome {
 	}
 
 	blocked := contains(a.BlacklistPhones, in.Phone)
-	outsideTest := a.AllowListOnly && !contains(a.AllowList, in.Phone)
+	outsideTest := a.AllowListOnly && !e.contacts.AllowListed(a.AllowList, in.Phone)
 	mayReply := a.Enabled && !blocked && !outsideTest && !stale && !quiet
 
 	// Opt-out and opt-in are always recorded, even while automation is off or the chat is
 	// paused; the confirmation is only sent when automatic replies may be sent, and only
 	// when the status actually changed (repeating STOP/START must not trigger replies).
+	if IsOptOut(in.Text) && !contact.IsDND && contact.OptInAt != nil && sentAt.Before(*contact.OptInAt) {
+		// Meta does not guarantee the order of deliveries: a STOP written before the
+		// customer's newer START must not opt them out again.
+		security.LogAudit("OPT_OUT_IGNORED", "+"+in.Phone, name, "An older \""+in.Text+"\" arrived after the customer opted in again; the opt-in stays", "warning")
+		return Outcome{Rule: "system:opt_out", Skipped: "older than the customer's opt-in; still opted in"}
+	}
 	if IsOptOut(in.Text) {
 		if e.contacts != nil {
-			e.contacts.SetDND(in.Phone, true, "Replied "+strings.ToUpper(Normalize(in.Text))+" on "+now.Format("2006-01-02"))
+			e.contacts.SetDND(in.Phone, true, "Replied "+strings.ToUpper(Normalize(in.Text))+" on "+now.Format("2006-01-02"), sentAt)
 		}
 		security.LogAudit("OPT_OUT", "+"+in.Phone, name, "Customer opted out with \""+in.Text+"\"", "success")
 		e.hooks.Send("contact.opted_out", map[string]any{"phone": "+" + in.Phone, "name": name})
 		if !mayReply || contact.IsDND {
 			return Outcome{Rule: "system:opt_out", Skipped: "opt-out recorded; no confirmation sent"}
 		}
-		reply, _ := render(a.OptOutReply)
+		if e.optConfirmsCapped(in.Phone, now) {
+			return Outcome{Rule: "system:opt_out", Skipped: "opt-out recorded; confirmation limit reached"}
+		}
+		reply := systemReply(render, a.OptOutReply, defaults.OptOutReply)
 		return e.reply(in, cfg, reply, "system:opt_out", true)
 	}
-	if IsOptIn(in.Text) {
-		already := contact.Consent && !contact.IsDND
+	if IsOptIn(in.Text) && contact.IsDND && contact.ConsentAt != nil && sentAt.Before(*contact.ConsentAt) {
+		// Meta does not guarantee the order of deliveries: a START written before the
+		// customer's STOP (or delivered again later) must not subscribe them again.
+		security.LogAudit("OPT_IN_IGNORED", "+"+in.Phone, name, "An older \""+in.Text+"\" arrived after the customer opted out; the opt-out stays", "warning")
+		return Outcome{Rule: "system:opt_in", Skipped: "older than the customer's opt-out; still opted out"}
+	}
+	// "start", "resume" or "chalu" alone only re-subscribes a customer who opted out;
+	// from anyone else it is an ordinary message ("resume" my order) and records no
+	// consent, which needs a clear opt-in.
+	if IsOptIn(in.Text) && contact.IsDND {
 		if e.contacts != nil {
-			e.contacts.SetConsent(in.Phone, true, "Replied "+strings.ToUpper(Normalize(in.Text))+" on "+now.Format("2006-01-02"))
+			// The time the customer wrote it, so an older STOP arriving later cannot undo it.
+			e.contacts.SetConsent(in.Phone, true, "Replied "+strings.ToUpper(Normalize(in.Text))+" on "+now.Format("2006-01-02"), sentAt)
 		}
 		security.LogAudit("OPT_IN", "+"+in.Phone, name, "Customer opted in with \""+in.Text+"\"", "success")
 		e.hooks.Send("contact.opted_in", map[string]any{"phone": "+" + in.Phone, "name": name})
-		if !mayReply || already {
+		if !mayReply {
 			return Outcome{Rule: "system:opt_in", Skipped: "opt-in recorded; no confirmation sent"}
 		}
-		reply, _ := render(a.OptInReply)
+		if e.optConfirmsCapped(in.Phone, now) {
+			return Outcome{Rule: "system:opt_in", Skipped: "opt-in recorded; confirmation limit reached"}
+		}
+		reply := systemReply(render, a.OptInReply, defaults.OptInReply)
 		return e.reply(in, cfg, reply, "system:opt_in", true)
 	}
 
@@ -310,7 +397,7 @@ func (e *Engine) process(in Incoming, quiet bool) Outcome {
 	case !a.Enabled:
 		return Outcome{Skipped: "automation is switched off"}
 	case stale:
-		return Outcome{Skipped: "message is more than 24 hours old"}
+		return Outcome{Skipped: "message is more than 23 hours 30 minutes old (WhatsApp's 24-hour window)"}
 	case contact.IsDND:
 		return Outcome{Skipped: "customer opted out"}
 	case blocked:
@@ -329,7 +416,7 @@ func (e *Engine) process(in Incoming, quiet bool) Outcome {
 		if limited != "" {
 			return Outcome{Rule: "system:handover", Skipped: limited, Handover: true}
 		}
-		reply, _ := render(a.HandoverReply)
+		reply := systemReply(render, a.HandoverReply, defaults.HandoverReply)
 		out := e.reply(in, cfg, reply, "system:handover", true)
 		out.Handover = true
 		return out
@@ -339,24 +426,14 @@ func (e *Engine) process(in Incoming, quiet bool) Outcome {
 		return Outcome{Skipped: limited}
 	}
 
-	if cfg.BusinessHours.Enabled && !IsOpen(cfg.BusinessHours, now) {
-		e.mu.Lock()
-		last := e.lastAway[in.Phone]
-		e.mu.Unlock()
-		if now.Sub(last) > awayRepeatAfter {
-			reply, missing := render(cfg.BusinessHours.AwayReply)
-			if len(missing) == 0 && reply != "" {
-				e.mu.Lock()
-				e.lastAway[in.Phone] = now
-				e.mu.Unlock()
-				return e.reply(in, cfg, reply, "system:away", false)
-			}
+	if cfg.BusinessHours.Enabled && !IsOpen(cfg.BusinessHours, now) && !e.repliedRecently(in.Phone, now.Add(-awayRepeatAfter), "system:away") {
+		reply, missing := render(cfg.BusinessHours.AwayReply)
+		if len(missing) == 0 && reply != "" {
+			return e.reply(in, cfg, reply, "system:away", false)
 		}
 	}
 
-	e.mu.Lock()
-	menuActive := now.Sub(e.menus[in.Phone]) < menuSessionTTL
-	e.mu.Unlock()
+	menuActive := e.menuActive(in.Phone, now)
 
 	rules := e.cfg.GetRules()
 	var unanswered []string // rules that matched but need a detail that is still empty
@@ -406,21 +483,103 @@ func (e *Engine) process(in Incoming, quiet bool) Outcome {
 	}
 
 	if a.EnableDefaultReply && strings.TrimSpace(a.DefaultReply) != "" {
-		e.mu.Lock()
-		last := e.lastFall[in.Phone]
-		e.mu.Unlock()
-		if now.Sub(last) < fallbackRepeat {
+		if e.repliedRecently(in.Phone, now.Add(-fallbackRepeat), "system:fallback") {
 			return Outcome{Skipped: "fallback reply already sent recently"}
 		}
 		reply, missing := render(a.DefaultReply)
 		if len(missing) == 0 && reply != "" {
-			e.mu.Lock()
-			e.lastFall[in.Phone] = now
-			e.mu.Unlock()
 			return e.reply(in, cfg, reply, "system:fallback", false)
 		}
 	}
 	return Outcome{Skipped: "no rule matched"}
+}
+
+// failedRetryAfter is how long a reply that could not be sent holds back the next try,
+// so failing sends (an expired token, Meta's rate limit) are not repeated for every
+// message, while a short outage does not suppress the reply for the whole window.
+const failedRetryAfter = 15 * time.Minute
+
+// repliedRecently reports whether one of rules answered phone since t. It reads the
+// saved history rather than memory, so a restart does not reset the away and fallback
+// limits. A reply that failed to send counts only for failedRetryAfter.
+func (e *Engine) repliedRecently(phone string, since time.Time, rules ...string) bool {
+	if e.hist == nil {
+		return false
+	}
+	if e.hist.RuleRepliesTo(phone, since, rules...) > 0 {
+		return true
+	}
+	failedSince := e.now().Add(-failedRetryAfter)
+	if failedSince.Before(since) {
+		failedSince = since
+	}
+	return e.hist.RuleFailuresTo(phone, failedSince, rules...) > 0
+}
+
+// menuActive reports whether a menu was shown to phone recently, so number choices
+// ("1", "2") match. After a restart the last automatic reply in the history tells.
+func (e *Engine) menuActive(phone string, now time.Time) bool {
+	e.mu.Lock()
+	at, ok := e.menus[phone]
+	e.mu.Unlock()
+	if ok {
+		return now.Sub(at) < menuSessionTTL
+	}
+	if e.hist != nil {
+		if last, found := e.hist.LastAutoReply(phone, now.Add(-menuSessionTTL)); found && now.Sub(last.Timestamp) < menuSessionTTL && HasMenu(last.Text) {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneState drops per-customer entries that no longer matter (older than the window
+// each one is used for), at most every 10 minutes, so the maps do not grow with every
+// customer who ever wrote while Pulse keeps running for months.
+func (e *Engine) pruneState(now time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if now.Sub(e.lastPrune) < 10*time.Minute {
+		return
+	}
+	e.lastPrune = now
+	for _, m := range []struct {
+		entries map[string]time.Time
+		keep    time.Duration
+	}{{e.menus, menuSessionTTL}, {e.capFlagged, time.Hour}} {
+		for phone, at := range m.entries {
+			if now.Sub(at) > m.keep {
+				delete(m.entries, phone)
+			}
+		}
+	}
+}
+
+// optConfirmPerHour caps STOP/START confirmations per customer. They skip the cooldown
+// and daily limit so an opt-out is always confirmed, but a customer (or another bot)
+// alternating STOP and START must not keep Pulse replying. The opt-out itself is always
+// recorded; only the confirmation is held back.
+const optConfirmPerHour = 3
+
+func (e *Engine) optConfirmsCapped(phone string, now time.Time) bool {
+	return e.hist != nil && e.hist.RuleRepliesTo(phone, now.Add(-time.Hour), "system:opt_out", "system:opt_in") >= optConfirmPerHour
+}
+
+// needsPersonForMedia reports whether a message without text should go on the Needs
+// attention list: only while automatic replies run (otherwise staff read every chat),
+// never for stickers, opted-out, blocked or test-excluded numbers, or a chat a person
+// already handles.
+func (e *Engine) needsPersonForMedia(in Incoming, ct contacts.Contact, cfg config.Config, now time.Time, stale bool) bool {
+	a := cfg.Automation
+	switch {
+	case e.contacts == nil, !a.Enabled, stale, in.Media == "", in.Media == "Sticker":
+		return false
+	case ct.IsDND, contains(a.BlacklistPhones, in.Phone), a.AllowListOnly && !e.contacts.AllowListed(a.AllowList, in.Phone):
+		return false
+	case ct.BotPaused(now), ct.NeedsAttention:
+		return false
+	}
+	return true
 }
 
 func dedupe(list []string) []string {
@@ -447,7 +606,7 @@ func without(rules []config.Rule, name string) []config.Rule {
 
 func contains(list []string, phone string) bool {
 	for _, p := range list {
-		if c := contacts.CleanPhone(p); c != "" && c == phone {
+		if contacts.MatchesTyped(p, phone) {
 			return true
 		}
 	}
@@ -468,15 +627,17 @@ func (e *Engine) overLimits(in Incoming, name string, cfg config.Config, now tim
 	if e.hist == nil {
 		return ""
 	}
-	if last, ok := e.hist.LastAutoReply(in.Phone); ok && a.CooldownSeconds > 0 && now.Sub(last.Timestamp) < time.Duration(a.CooldownSeconds)*time.Second {
+	if last, ok := e.hist.LastAutoReply(in.Phone, now.Add(-time.Duration(a.CooldownSeconds)*time.Second)); ok && a.CooldownSeconds > 0 && now.Sub(last.Timestamp) < time.Duration(a.CooldownSeconds)*time.Second {
 		return "cooldown: replied less than " + fmt.Sprint(a.CooldownSeconds) + " seconds ago"
 	}
 	if n := e.hist.AutoRepliesTo(in.Phone, now.Add(-time.Hour)); a.MaxRepliesPerContactHr > 0 && n >= a.MaxRepliesPerContactHr {
 		e.flagOnce(in.Phone, name, fmt.Sprintf("Reached %d automatic replies in one hour", n), cfg)
 		return "per-contact hourly reply cap reached"
 	}
-	recent := e.hist.RecentIncoming(in.Phone, 4)
-	if len(recent) == 4 && now.Sub(recent[3].Timestamp) < loopWindow {
+	// Three identical messages within the window, after two automatic replies, look like
+	// another bot answering Pulse (D37); a person rarely sends the same text three times.
+	recent := e.hist.RecentIncoming(in.Phone, 3, now.Add(-loopWindow))
+	if len(recent) == 3 && now.Sub(recent[2].Timestamp) < loopWindow {
 		same := true
 		for _, m := range recent[1:] {
 			if Normalize(m.Text) != Normalize(recent[0].Text) {
@@ -484,7 +645,7 @@ func (e *Engine) overLimits(in Incoming, name string, cfg config.Config, now tim
 				break
 			}
 		}
-		if same && e.hist.AutoRepliesTo(in.Phone, now.Add(-loopWindow)) >= 3 {
+		if same && e.hist.AutoRepliesTo(in.Phone, now.Add(-loopWindow)) >= 2 {
 			if e.contacts != nil {
 				e.contacts.PauseBot(in.Phone, time.Hour, "Paused for 1 hour: the same message kept arriving (possible bot loop)")
 			}
@@ -496,8 +657,7 @@ func (e *Engine) overLimits(in Incoming, name string, cfg config.Config, now tim
 	if a.WarmupMode && limit > 50 {
 		limit = 50
 	}
-	y, m, d := now.Date()
-	if limit > 0 && e.hist.SentSince(time.Date(y, m, d, 0, 0, 0, 0, now.Location())) >= limit {
+	if limit > 0 && e.hist.SentSince(campaign.DailyWindowStart(now)) >= limit {
 		e.mu.Lock()
 		note := now.Sub(e.limitNoted) > time.Hour
 		if note {
@@ -505,7 +665,7 @@ func (e *Engine) overLimits(in Incoming, name string, cfg config.Config, now tim
 		}
 		e.mu.Unlock()
 		if note {
-			security.LogAudit("DAILY_LIMIT_REACHED", "local", "system", fmt.Sprintf("Daily sending limit of %d reached; automatic replies paused until midnight", limit), "warning")
+			security.LogAudit("DAILY_LIMIT_REACHED", "local", "system", fmt.Sprintf("Daily sending limit of %d reached in the last 24 hours; automatic replies paused until earlier messages are more than 24 hours old", limit), "warning")
 		}
 		return "daily sending limit reached"
 	}
@@ -514,12 +674,12 @@ func (e *Engine) overLimits(in Incoming, name string, cfg config.Config, now tim
 
 func (e *Engine) flagOnce(phone, name, reason string, cfg config.Config) {
 	e.mu.Lock()
-	last := e.capFlagged[phone]
-	if time.Since(last) < time.Hour {
+	last, now := e.capFlagged[phone], e.now()
+	if now.Sub(last) < time.Hour {
 		e.mu.Unlock()
 		return
 	}
-	e.capFlagged[phone] = time.Now()
+	e.capFlagged[phone] = now
 	e.mu.Unlock()
 	if e.contacts != nil {
 		e.contacts.PauseBot(phone, time.Hour, reason)
@@ -585,34 +745,54 @@ func (e *Engine) reply(in Incoming, cfg config.Config, text, rule string, essent
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	// Read receipts and "typing..." are courtesies: they never hold up or fail a reply.
-	if a.AutoRead && !a.TypingSimulation {
-		_ = e.msg.MarkAsRead(ctx, in.ID)
+	// WhatsApp only shows "typing..." together with a read receipt, so with "mark as
+	// read" off there is no typing indicator either: the customer sees no blue ticks.
+	if a.AutoRead {
+		if a.TypingSimulation && !essential {
+			d := time.Duration(a.TypingDurationMs) * time.Millisecond
+			if d <= 0 {
+				d = 1500 * time.Millisecond
+			}
+			if d > 8*time.Second {
+				d = 8 * time.Second
+			}
+			_ = e.msg.ShowTyping(ctx, in.Phone) // also marks the message as read
+			select {
+			case <-time.After(d):
+			case <-ctx.Done():
+			}
+		} else {
+			_ = e.msg.MarkAsRead(ctx, in.ID)
+		}
 	}
-	if a.TypingSimulation && !essential {
-		d := time.Duration(a.TypingDurationMs) * time.Millisecond
-		if d <= 0 {
-			d = 1500 * time.Millisecond
+	// Labelled like campaign and scheduled messages: a reply whose answer was lost (a
+	// timeout) is recorded as failed and corrected when Meta reports it (ResolveLabel).
+	rec.Label = ReplyLabel + in.ID
+	rec.Timestamp = e.now()
+	placeholder := ""
+	if e.hist != nil {
+		// The reply is recorded ("sending", with its label) before it goes out, and with
+		// the journal on it is saved to disk first: if Pulse stops after the reply left
+		// but before the next save, the replayed message is recognised as answered
+		// (process) instead of being answered twice.
+		placeholder = e.hist.Placeholder(rec)
+		if e.jnl != nil {
+			if ferr := e.hist.Flush(); ferr != nil {
+				fmt.Printf("[Bot] The message history could not be saved before replying: %v\n", ferr)
+			}
 		}
-		if d > 8*time.Second {
-			d = 8 * time.Second
-		}
-		_ = e.msg.ShowTyping(ctx, in.Phone) // also marks the message as read
-		select {
-		case <-time.After(d):
-		case <-ctx.Done():
-		}
-	} else if a.TypingSimulation && a.AutoRead {
-		_ = e.msg.MarkAsRead(ctx, in.ID)
 	}
-	id, err := e.msg.SendReply(ctx, in.Phone, text, in.ID)
-	rec.ID, rec.Timestamp, rec.Status = id, e.now(), history.StatusSent
+	id, err := e.msg.SendReply(cloudapi.WithCallbackData(ctx, rec.Label), in.Phone, text, in.ID)
 	if err != nil {
-		rec.ID = "fail_" + security.RandomToken(6)
-		rec.Status, rec.Error = history.StatusFailed, err.Error()
 		out.SendErr = err.Error()
 	}
 	if e.hist != nil {
-		e.hist.Record(rec)
+		if err != nil {
+			// May have gone out (a timeout): counts towards the limit, corrected by its label.
+			e.hist.Settle(placeholder, "fail_"+security.RandomToken(6), history.StatusFailed, err.Error(), cloudapi.MaybeSent(err))
+		} else {
+			e.hist.Settle(placeholder, id, history.StatusSent, "", false)
+		}
 	}
 	if e.contacts != nil && err == nil {
 		e.contacts.UpdateLastContacted(in.Phone)
@@ -620,21 +800,38 @@ func (e *Engine) reply(in Incoming, cfg config.Config, text, rule string, essent
 	return out
 }
 
+// ReplyLabel prefixes the label every automatic reply is sent with
+// (biz_opaque_callback_data): ReplyLabel + the customer's message ID.
+const ReplyLabel = "pulse:r:"
+
+// defaults holds the built-in confirmation texts; they only use variables that always
+// have a value ({{first_name}} falls back to "there").
+var defaults = config.DefaultConfig().Automation
+
+// systemReply renders an opt-out, opt-in or hand-over confirmation. These are always
+// sent, so when the owner's text needs a detail that is empty, the built-in text goes
+// out instead of a reply with a gap in it.
+func systemReply(render func(string) (string, []string), text, builtIn string) string {
+	if r, missing := render(text); len(missing) == 0 {
+		return r
+	}
+	r, _ := render(builtIn)
+	return r
+}
+
 // Simulate shows which reply a message would get, without sending anything.
 func (e *Engine) Simulate(text, name string, menuActive bool) Outcome {
 	cfg := e.cfg.Snapshot()
 	now := e.now()
 	vars := msgtemplate.Vars{Name: name, Phone: "919800000000", Message: text, Business: cfg.Business, Now: now, Location: Location(cfg.BusinessHours.Timezone)}
+	render := func(t string) (string, []string) { return msgtemplate.Render(t, vars) }
 	switch {
 	case IsOptOut(text):
-		r, _ := msgtemplate.Render(cfg.Automation.OptOutReply, vars)
-		return Outcome{Reply: r, Rule: "system:opt_out"}
+		return Outcome{Reply: systemReply(render, cfg.Automation.OptOutReply, defaults.OptOutReply), Rule: "system:opt_out"}
 	case IsOptIn(text):
-		r, _ := msgtemplate.Render(cfg.Automation.OptInReply, vars)
-		return Outcome{Reply: r, Rule: "system:opt_in"}
+		return Outcome{Reply: systemReply(render, cfg.Automation.OptInReply, defaults.OptInReply), Rule: "system:opt_in"}
 	case IsHandoverRequest(text):
-		r, _ := msgtemplate.Render(cfg.Automation.HandoverReply, vars)
-		return Outcome{Reply: r, Rule: "system:handover", Handover: true}
+		return Outcome{Reply: systemReply(render, cfg.Automation.HandoverReply, defaults.HandoverReply), Rule: "system:handover", Handover: true}
 	}
 	// Like Process, an away reply that needs an empty detail is not sent at all.
 	if cfg.BusinessHours.Enabled && !IsOpen(cfg.BusinessHours, now) {

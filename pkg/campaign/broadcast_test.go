@@ -9,9 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"whatsapp-automation/pkg/cloudapi"
 	"whatsapp-automation/pkg/config"
 	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/history"
+	"whatsapp-automation/pkg/msgtemplate"
 )
 
 type fakeSender struct {
@@ -21,7 +23,8 @@ type fakeSender struct {
 	n    int
 }
 
-func (f *fakeSender) SendTemplate(ctx context.Context, to, name, lang string, params []string) (string, error) {
+func (f *fakeSender) SendTemplate(ctx context.Context, to, name, lang string, parts cloudapi.TemplateParts) (string, error) {
+	params := parts.Body
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.n++
@@ -203,6 +206,38 @@ func TestRestartMarksRunningAsPaused(t *testing.T) {
 	paceOverride = time.Millisecond
 }
 
+// A recipient cut off mid-send is failed without a message ID after a restart; Meta's
+// delivery update with the campaign label corrects it, so Resume does not resend.
+func TestInterruptedRecipientIsCorrectedByItsLabel(t *testing.T) {
+	_, _, _, _, r := setup(t)
+	c := &Campaign{ID: "camp1", Name: "Offer", Status: CPaused, Recipients: []Recipient{
+		{Phone: "14155550401", Status: RFailed, Error: "Interrupted while sending; check whether it arrived before sending again."},
+		{Phone: "14155550402", Status: RFailed, MessageID: "wamid.REAL", Error: "Message undeliverable"},
+	}}
+	r.mu.Lock()
+	r.campaigns = append(r.campaigns, c)
+	r.mu.Unlock()
+	if r.Reconcile("pulse:s:job", "wamid.X", "delivered") {
+		t.Fatal("a scheduler label is not a campaign's")
+	}
+	if !r.Reconcile(Label+"camp1:14155550401", "wamid.NEW", RDelivered) {
+		t.Fatal("the campaign's own label must be recognised")
+	}
+	r.Reconcile(Label+"camp1:14155550402", "wamid.OTHER", RDelivered)
+	got, _, _ := r.Get("camp1")
+	if x := got.Recipients[0]; x.Status != RDelivered || x.MessageID != "wamid.NEW" || x.Error != "" || x.SentAt == nil {
+		t.Fatalf("the interrupted recipient must show as delivered: %+v", x)
+	}
+	if x := got.Recipients[1]; x.Status != RFailed || x.MessageID != "wamid.REAL" {
+		t.Fatalf("a real failure reported by Meta must stay failed: %+v", x)
+	}
+	// Later updates for it now find it by its message ID.
+	r.OnReceipt([]string{"wamid.NEW"}, RRead)
+	if got, _, _ := r.Get("camp1"); got.Recipients[0].Status != RRead {
+		t.Fatal("later receipts must apply to the corrected recipient")
+	}
+}
+
 func TestBatchPauseNeverShorterThanNormalDelay(t *testing.T) {
 	old := paceOverride
 	paceOverride = 0
@@ -311,7 +346,11 @@ func TestTemplateForCustomersOutsideTheWindow(t *testing.T) {
 			t.Errorf("template %+v should be refused", bad)
 		}
 	}
-	tpl, err := (&Template{Name: " order_update ", Language: "en_US", Params: []string{"{{first_name}}", " ", "{{business_name}}"}}).Clean()
+	// An empty {{2}} between filled values would move {{3}}'s value into {{2}}: refused.
+	if _, err := (&Template{Name: "order_update", Params: []string{"{{first_name}}", " ", "{{business_name}}"}}).Clean(); err == nil {
+		t.Fatal("an empty value in the middle must be refused, not shifted")
+	}
+	tpl, err := (&Template{Name: " order_update ", Language: "en_US", Params: []string{"{{first_name}}", "{{business_name}}", " "}}).Clean()
 	if err != nil || tpl.Name != "order_update" || len(tpl.Params) != 2 {
 		t.Fatalf("clean %+v %v", tpl, err)
 	}
@@ -333,5 +372,167 @@ func TestTemplateForCustomersOutsideTheWindow(t *testing.T) {
 	_, rep, _ := r.Get(sum.ID)
 	if rep.Failed != 1 {
 		t.Fatalf("a failed delivery must show in the report: %+v", rep)
+	}
+}
+
+// blockingSender holds the send until released, like a slow Graph API.
+type blockingSender struct {
+	fakeSender
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingSender) SendTextMessage(ctx context.Context, to, text string) (string, error) {
+	b.started <- struct{}{}
+	<-b.release
+	return b.fakeSender.SendTextMessage(ctx, to, text)
+}
+
+// If Pulse dies while a message is on its way, the claim must already be on disk, so the
+// restart marks it interrupted instead of sending it again on Resume.
+func TestClaimIsSavedBeforeSending(t *testing.T) {
+	cfg, cs, hs, _, r := setup(t)
+	bs := &blockingSender{started: make(chan struct{}, 1), release: make(chan struct{})}
+	r.sender = bs
+	_ = cs.Save(contacts.Contact{Phone: "14155550301", Consent: true, ConsentSource: "t"})
+	cs.RecordInbound("14155550301", time.Now())
+	plan, _ := BuildPlan(cfg.Snapshot(), cs, hs, "Hi", Audience{All: true})
+	sum, err := r.Start("Crash", "Hi", "admin", plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-bs.started // the message is now "on its way"; nothing else has been saved
+	after, err := NewRunner(r.path, &fakeSender{}, cfg, cs, hs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, _ := after.Get(sum.ID)
+	if len(c.Recipients) != 1 || c.Recipients[0].Status != RFailed || !strings.Contains(c.Recipients[0].Error, "Interrupted") {
+		t.Fatalf("a crash mid-send must not leave the recipient pending: %+v", c.Recipients)
+	}
+	close(bs.release)
+	waitStatus(t, r, sum.ID, CCompleted)
+}
+
+// C12: while a campaign message is on its way the history already holds a labelled
+// "sending" record, so a crash at that moment still counts towards the daily limit.
+func TestSendingPlaceholderCountsTowardsTheLimit(t *testing.T) {
+	cfg, cs, hs, _, r := setup(t)
+	bs := &blockingSender{started: make(chan struct{}, 1), release: make(chan struct{})}
+	r.sender = bs
+	_ = cs.Save(contacts.Contact{Phone: "14155550311", Consent: true, ConsentSource: "t"})
+	cs.RecordInbound("14155550311", time.Now())
+	plan, _ := BuildPlan(cfg.Snapshot(), cs, hs, "Hi", Audience{All: true})
+	sum, err := r.Start("Placeholder", "Hi", "admin", plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-bs.started
+	h := hs.Query(history.Query{Phone: "14155550311"})
+	if len(h) != 1 || h[0].Status != history.StatusSending || h[0].Label != Label+sum.ID+":14155550311" {
+		t.Fatalf("a labelled placeholder must be recorded before the send: %+v", h)
+	}
+	if hs.SentSince(time.Now().Add(-time.Hour)) != 1 {
+		t.Fatal("the message on its way must count towards the daily limit")
+	}
+	close(bs.release)
+	waitStatus(t, r, sum.ID, CCompleted)
+	if h := hs.Query(history.Query{Phone: "14155550311"}); len(h) != 1 || h[0].Status != history.StatusSent || h[0].ID != "m14155550311" {
+		t.Fatalf("the placeholder must take the real ID: %+v", h)
+	}
+}
+
+// marketingSender refuses every text like Meta does for a customer who stopped marketing
+// messages, and lets the test deliver receipts like the WhatsApp connection.
+type marketingSender struct {
+	fakeSender
+	receipts []func(cloudapi.Receipt)
+}
+
+func (m *marketingSender) SendTextMessage(ctx context.Context, to, text string) (string, error) {
+	return "", &cloudapi.APIError{HTTPStatus: 400, Code: cloudapi.CodeMarketingOptOut, Plain: "stopped marketing"}
+}
+
+func (m *marketingSender) OnReceipt(h func(cloudapi.Receipt)) { m.receipts = append(m.receipts, h) }
+
+// C7: error 131050 marks the customer, whether Meta says it at once or in a receipt, and
+// later campaigns leave them out.
+func TestMarketingOptOutIsLeftOutOfCampaigns(t *testing.T) {
+	cfg, cs, hs, _, _ := setup(t)
+	ms := &marketingSender{}
+	r, err := NewRunner("", ms, cfg, cs, hs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"14155550321", "14155550322"} {
+		_ = cs.Save(contacts.Contact{Phone: p, Consent: true, ConsentSource: "t"})
+		cs.RecordInbound(p, time.Now())
+	}
+	plan, _ := BuildPlan(cfg.Snapshot(), cs, hs, "Hi", Audience{Phones: []string{"14155550321"}})
+	sum, err := r.Start("Marketing", "Hi", "admin", plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, r, sum.ID, CCompleted)
+	if c, _ := cs.Get("14155550321"); !c.MarketingOptOut {
+		t.Fatal("a 131050 refusal must mark the contact")
+	}
+	if len(ms.receipts) != 1 {
+		t.Fatal("the runner must listen for Meta's delivery updates")
+	}
+	ms.receipts[0](cloudapi.Receipt{MessageID: "x", Phone: "14155550322", Status: "failed", Code: cloudapi.CodeMarketingOptOut})
+	if c, _ := cs.Get("14155550322"); !c.MarketingOptOut {
+		t.Fatal("a 131050 delivery update must mark the contact")
+	}
+	plan, _ = BuildPlan(cfg.Snapshot(), cs, hs, "Hi", Audience{All: true})
+	if len(plan.Recipients) != 0 || len(plan.Excluded) != 2 || !strings.Contains(plan.Excluded[0].Reason, "marketing") {
+		t.Fatalf("customers who stopped marketing messages must be left out: %+v", plan)
+	}
+}
+
+// C6: WhatsApp refuses template values with line breaks, tabs or long runs of spaces.
+func TestTemplateValuesAreFlattened(t *testing.T) {
+	tpl := Template{Name: "note", Params: []string{"{{notes}}"}}
+	parts, missing := tpl.Render(msgtemplate.Vars{Extra: map[string]string{"notes": "Line one\r\nLine two\tend      x"}})
+	if len(missing) != 0 || parts.Body[0] != "Line one Line two end x" {
+		t.Fatalf("value not flattened: %q %v", parts.Body, missing)
+	}
+}
+
+// C11, C15, C18: free text stops before the window ends, {{time}} follows the business
+// time zone, and the daily limit counts the last 24 hours.
+func TestWindowTimeZoneAndRollingLimit(t *testing.T) {
+	now := time.Now()
+	late := now.Add(-23*time.Hour - 40*time.Minute)
+	if !NeedsTemplate(&contacts.Contact{LastInboundAt: &late}, now) {
+		t.Fatal("23h40m after the customer wrote, only a template may go")
+	}
+	cfg, cs, hs, fs, r := setup(t)
+	_ = cfg.Update(func(c *config.Config) error {
+		c.BusinessHours.Timezone = "Asia/Kolkata"
+		c.Automation.DailyLimit = 3
+		return nil
+	})
+	// One message 25 hours ago (no longer counted) and one 23 hours ago (still counted,
+	// even though it was "yesterday").
+	hs.Record(history.MessageRecord{ID: "old", Direction: history.DirectionOutgoing, Type: history.TypeDirectSend, Phone: "1", Status: history.StatusSent, Timestamp: now.Add(-25 * time.Hour)})
+	hs.Record(history.MessageRecord{ID: "recent", Direction: history.DirectionOutgoing, Type: history.TypeDirectSend, Phone: "1", Status: history.StatusSent, Timestamp: now.Add(-23 * time.Hour)})
+	_ = cs.Save(contacts.Contact{Phone: "14155550331", Consent: true, ConsentSource: "t"})
+	cs.RecordInbound("14155550331", now)
+	plan, _ := BuildPlan(cfg.Snapshot(), cs, hs, "At {{time}}", Audience{All: true})
+	sum, err := r.Start("Zone", "At {{time}}", "admin", plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, r, sum.ID, CCompleted)
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	fs.mu.Lock()
+	got := fs.sent["14155550331"]
+	fs.mu.Unlock()
+	if want1, want2 := "At "+time.Now().In(ist).Format("15:04"), "At "+now.In(ist).Format("15:04"); got != want1 && got != want2 {
+		t.Fatalf("{{time}} must use the business time zone: %q", got)
+	}
+	if left := DailyRemaining(cfg.Snapshot(), hs, time.Now()); left != 1 {
+		t.Fatalf("the limit counts the last 24 hours: %d left", left)
 	}
 }

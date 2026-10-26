@@ -11,18 +11,23 @@ import (
 	"time"
 
 	"whatsapp-automation/pkg/campaign"
+	"whatsapp-automation/pkg/cloudapi"
 	"whatsapp-automation/pkg/config"
 	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/history"
 )
 
 type sender struct {
-	mu   sync.Mutex
-	sent []string
-	fail bool
+	mu     sync.Mutex
+	sent   []string
+	fail   bool
+	during func() // runs while the send is "on its way" (before it answers)
 }
 
 func (s *sender) SendTextMessage(ctx context.Context, to, text string) (string, error) {
+	if s.during != nil {
+		s.during()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail {
@@ -32,7 +37,8 @@ func (s *sender) SendTextMessage(ctx context.Context, to, text string) (string, 
 	return "id" + to, nil
 }
 
-func (s *sender) SendTemplate(ctx context.Context, to, name, lang string, params []string) (string, error) {
+func (s *sender) SendTemplate(ctx context.Context, to, name, lang string, parts cloudapi.TemplateParts) (string, error) {
+	params := parts.Body
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sent = append(s.sent, to+":TEMPLATE "+name+" "+strings.Join(params, ","))
@@ -64,6 +70,58 @@ func newTestScheduler(t *testing.T, edit func(*config.Config)) (*Scheduler, *sen
 	return s, snd, cs
 }
 
+// A job cut off by a crash comes back as failed (never resent blindly); when Meta's
+// delivery update with the job's label arrives, it is shown as sent after all.
+func TestInterruptedJobIsCorrectedByItsLabel(t *testing.T) {
+	s, snd, _ := newTestScheduler(t, nil)
+	j, _, err := s.Add("14155550331", "Hello", time.Now().Add(time.Hour), "", "admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.jobs[0].Status = StatusSending // the crash happened during the send
+	_ = s.saveLocked()
+	s.mu.Unlock()
+	again, err := NewScheduler(s.filePath, snd, s.cfg, s.contacts, s.hist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.List()[0]; got.Status != StatusFailed {
+		t.Fatalf("an interrupted send must come back as failed, got %s", got.Status)
+	}
+	if again.Reconcile("pulse:c:other", "wamid.X", "delivered") {
+		t.Fatal("a campaign label is not the scheduler's")
+	}
+	if !again.Reconcile(Label+j.ID, "wamid.X", "delivered") {
+		t.Fatal("the scheduler's own label must be recognised")
+	}
+	if got := again.List()[0]; got.Status != StatusSent || got.MessageID != "wamid.X" || got.Error != "" {
+		t.Fatalf("a delivered interrupted job must show as sent: %+v", got)
+	}
+	again.Reconcile(Label+j.ID, "wamid.Y", "read")
+	if got := again.List()[0]; got.MessageID != "wamid.X" {
+		t.Fatal("a job that already has a message ID must not be changed again")
+	}
+}
+
+// Meta usually reports "sent" while Pulse is still waiting for the send's answer. If that
+// answer then fails (a timeout), the job is recorded as sent with Meta's message ID.
+func TestStatusDuringSendWinsOverLostAnswer(t *testing.T) {
+	s, snd, cs := newTestScheduler(t, func(c *config.Config) { c.Automation.Enforce24hWindow = false })
+	_ = cs.Save(contacts.Contact{Phone: "14155550341", Consent: true, ConsentSource: "form"})
+	cs.RecordInbound("14155550341", time.Now()) // inside the 24-hour window
+	j, _, err := s.Add("14155550341", "Hello", time.Now(), "", "admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snd.fail = true // the answer to the send is lost
+	snd.during = func() { s.Reconcile(Label+j.ID, "wamid.MID", "sent") }
+	s.processDue(context.Background())
+	if got := s.List()[0]; got.Status != StatusSent || got.MessageID != "wamid.MID" {
+		t.Fatalf("a status received during the send must count: %+v", got)
+	}
+}
+
 // "Require opt-in" applies to scheduled messages as it does to campaigns (F17).
 func TestScheduledMessagesRequireOptIn(t *testing.T) {
 	s, snd, cs := newTestScheduler(t, func(c *config.Config) {
@@ -81,6 +139,47 @@ func TestScheduledMessagesRequireOptIn(t *testing.T) {
 	}
 	if len(snd.sent) != 0 {
 		t.Fatal("nothing should have been sent")
+	}
+}
+
+// C16: with "Require opt-in" on, a scheduled message needs a recorded opt-in like a
+// campaign, even when the customer wrote recently.
+func TestRequireOptInEvenInsideTheWindow(t *testing.T) {
+	s, snd, cs := newTestScheduler(t, func(c *config.Config) { c.Automation.RequireOptIn = true })
+	_ = cs.Save(contacts.Contact{Phone: "14155550312", Name: "Chatty"})
+	cs.RecordInbound("14155550312", time.Now())
+	_, warn, err := s.Add("14155550312", "Hello", time.Now(), "", "admin", nil)
+	if err != nil || len(warn) == 0 || !strings.Contains(warn[0], "Require opt-in") {
+		t.Fatalf("scheduling must warn that it will be skipped: %v %v", warn, err)
+	}
+	s.processDue(context.Background())
+	if got := s.List()[0]; got.Status != StatusSkipped || !strings.Contains(got.Error, "opt-in") || len(snd.sent) != 0 {
+		t.Fatalf("no opt-in recorded: must be skipped even inside the window: %+v", got)
+	}
+}
+
+// C12, C15, C1: a scheduled message is in the history as "sending" while on its way,
+// {{time}} follows the business time zone, and a saved Singapore contact keeps its number.
+func TestScheduledPlaceholderTimeZoneAndNumber(t *testing.T) {
+	s, snd, cs := newTestScheduler(t, func(c *config.Config) { c.BusinessHours.Timezone = "Asia/Kolkata" })
+	_ = cs.Save(contacts.Contact{Phone: "+65 9123 4567", Name: "Wei", Consent: true, ConsentSource: "form"})
+	cs.RecordInbound("6591234567", time.Now())
+	j, _, err := s.Add("6591234567", "At {{time}}", time.Now(), "", "admin", nil)
+	if err != nil || j.Recipient != "6591234567" {
+		t.Fatalf("the saved Singapore contact must keep its number: %+v %v", j, err)
+	}
+	var during []history.MessageRecord
+	snd.during = func() { during = s.hist.Query(history.Query{Phone: "6591234567"}) }
+	s.processDue(context.Background())
+	if len(during) != 1 || during[0].Status != history.StatusSending || during[0].Label != Label+j.ID {
+		t.Fatalf("a labelled placeholder must be written before the send: %+v", during)
+	}
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	if len(snd.sent) != 1 || !strings.HasPrefix(snd.sent[0], "6591234567:At ") || !strings.Contains(snd.sent[0], time.Now().In(ist).Format("15:")) {
+		t.Fatalf("sent %v", snd.sent)
+	}
+	if h := s.hist.Query(history.Query{Phone: "6591234567"}); len(h) != 1 || h[0].Status != history.StatusSent || h[0].ID != "id6591234567" {
+		t.Fatalf("the placeholder must become the sent message: %+v", h)
 	}
 }
 
@@ -116,7 +215,11 @@ func TestScheduledSendingPausesAfterRepeatedFailures(t *testing.T) {
 func TestScheduledMessagesFollowPolicy(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.DefaultConfig()
-	_ = cfg.Update(func(c *config.Config) error { c.Automation.WarmupMode = false; return nil })
+	_ = cfg.Update(func(c *config.Config) error {
+		c.Automation.WarmupMode = false
+		c.Automation.RequireOptIn = false // the 24-hour window alone (see TestRequireOptInEvenInsideTheWindow)
+		return nil
+	})
 	cs, _ := contacts.NewStore(filepath.Join(dir, "c.json"))
 	hs, _ := history.NewStore(filepath.Join(dir, "h.json"), 100)
 	snd := &sender{}

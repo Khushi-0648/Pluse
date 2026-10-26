@@ -50,7 +50,7 @@ func newGraph(t *testing.T) (*graph, *Client, *config.Config) {
 			_, _ = w.Write([]byte(`{"display_phone_number":"+91 98000 00001","verified_name":"Asha Stores","quality_rating":"GREEN","id":"111"}`))
 		case strings.HasSuffix(r.URL.Path, "/media"):
 			_, _ = w.Write([]byte(`{"id":"media-1"}`))
-		case m["status"] != nil:
+		case strings.HasSuffix(r.URL.Path, "/subscribed_apps"), m["status"] != nil:
 			_, _ = w.Write([]byte(`{"success":true}`))
 		default:
 			_, _ = w.Write([]byte(`{"messaging_product":"whatsapp","messages":[{"id":"wamid.OUT1"}]}`))
@@ -68,6 +68,54 @@ func newGraph(t *testing.T) (*graph, *Client, *config.Config) {
 	c.BaseURL = ts.URL
 	c.retryWait = []time.Duration{time.Millisecond, time.Millisecond}
 	return g, c, cfg
+}
+
+func TestCheckSubscribesAppToAccountOnce(t *testing.T) {
+	g, c, cfg := newGraph(t)
+	ctx := context.Background()
+	if st, _ := c.Check(ctx); !st.Connected || !strings.Contains(st.Warning, "WhatsApp Business account ID") {
+		t.Fatalf("without the account ID the owner must be told why messages may not arrive: %+v", st)
+	}
+	cfg.CloudAPI.BusinessAccountID = "222"
+	for i := 0; i < 2; i++ {
+		if st, _ := c.Check(ctx); !st.Connected || st.Warning != "" {
+			t.Fatalf("check %d: %+v", i, st)
+		}
+	}
+	n := 0
+	for _, p := range g.paths {
+		if p == "POST /v23.0/222/subscribed_apps" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("the app must be subscribed to the account exactly once, got %d in %v", n, g.paths)
+	}
+	g.mu.Lock()
+	g.handle = func(w http.ResponseWriter, r *http.Request, _ []byte) bool {
+		if strings.HasSuffix(r.URL.Path, "/subscribed_apps") {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"code":200,"message":"Permissions error"}}`))
+			return true
+		}
+		return false
+	}
+	g.mu.Unlock()
+	c.Forget()
+	if st, _ := c.Check(ctx); !st.Connected || !strings.Contains(st.Warning, "may not arrive") {
+		t.Fatalf("a failed subscription must warn without blocking sends: %+v", st)
+	}
+}
+
+func TestLargePhotoGoesAsDocument(t *testing.T) {
+	g, c, _ := newGraph(t)
+	big := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, maxPhotoBytes)...)
+	if _, err := c.SendMediaMessage(context.Background(), "919800000002", big, "shop.png", "image/png", "New stock"); err != nil {
+		t.Fatal(err)
+	}
+	if m := g.last(); m["type"] != "document" {
+		t.Fatalf("a photo over 5 MB must go as a document: %v", m)
+	}
 }
 
 func (g *graph) last() map[string]any {
@@ -99,7 +147,7 @@ func TestSendTextReplyTemplateAndRead(t *testing.T) {
 	if ctxm := g.last()["context"].(map[string]any); ctxm["message_id"] != "wamid.IN1" {
 		t.Fatalf("reply context missing: %v", g.last())
 	}
-	if _, err := c.SendTemplate(ctx, "919800000002", "order_ready", "en", []string{"Asha", "42"}); err != nil {
+	if _, err := c.SendTemplate(ctx, "919800000002", "order_ready", "en", TemplateParts{Body: []string{"Asha", "42"}}); err != nil {
 		t.Fatal(err)
 	}
 	tpl := g.last()["template"].(map[string]any)
@@ -303,6 +351,34 @@ func TestWebhookParsingDedupeAndSignature(t *testing.T) {
 	}
 }
 
+// A labelled send carries biz_opaque_callback_data, and Meta's status update for it
+// brings the label back on the receipt; an unlabelled send carries none.
+func TestCallbackDataLabelRoundTrip(t *testing.T) {
+	g, c, _ := newGraph(t)
+	ctx := WithCallbackData(context.Background(), "pulse:s:job42")
+	if _, err := c.SendTextMessage(ctx, "919800000002", "Hello"); err != nil {
+		t.Fatal(err)
+	}
+	if m := g.last(); m["biz_opaque_callback_data"] != "pulse:s:job42" {
+		t.Fatalf("label missing from the send: %v", m)
+	}
+	if _, err := c.SendTextMessage(context.Background(), "919800000002", "Hi"); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := g.last()["biz_opaque_callback_data"]; has {
+		t.Fatal("an unlabelled send must not carry a label")
+	}
+	var recs []Receipt
+	c.OnReceipt(func(r Receipt) { recs = append(recs, r) })
+	body := []byte(`{"object":"whatsapp_business_account","entry":[{"id":"222","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"phone_number_id":"111"},"statuses":[{"id":"wamid.L1","status":"delivered","recipient_id":"919800000002","timestamp":"1700000000","biz_opaque_callback_data":"pulse:s:job42"}]}}]}]}`)
+	if _, err := c.HandleWebhook(body); err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || recs[0].CallbackData != "pulse:s:job42" || recs[0].MessageID != "wamid.L1" {
+		t.Fatalf("label not carried back: %+v", recs)
+	}
+}
+
 func TestSeenMemoryIsBounded(t *testing.T) {
 	_, c, _ := newGraph(t)
 	for i := 0; i < seenMax+50; i++ {
@@ -310,5 +386,133 @@ func TestSeenMemoryIsBounded(t *testing.T) {
 	}
 	if len(c.seen) > seenMax {
 		t.Fatalf("seen grew to %d", len(c.seen))
+	}
+}
+
+func TestProfileNameIsCapped(t *testing.T) {
+	if got := profileName("  Asha  "); got != "Asha" {
+		t.Fatalf("names are trimmed, got %q", got)
+	}
+	long := strings.Repeat("é", 5000)
+	if got := []rune(profileName(long)); len(got) != maxProfileName {
+		t.Fatalf("a long name must be cut to %d characters, got %d", maxProfileName, len(got))
+	}
+}
+
+// Meta may have queued a message before answering 5xx: a send is not repeated, a read is.
+func TestServerErrorRetriesOnlyRepeatableRequests(t *testing.T) {
+	g, c, _ := newGraph(t)
+	var calls atomic.Int32
+	g.handle = func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":131000,"message":"Something went wrong"}}`))
+			return true
+		}
+		return false
+	}
+	_, err := c.SendTextMessage(context.Background(), "919800000002", "hi")
+	if err == nil || calls.Load() != 1 || !strings.Contains(err.Error(), "may or may not have sent") {
+		t.Fatalf("a send answered with 5xx must not be repeated: calls=%d err=%v", calls.Load(), err)
+	}
+	calls.Store(0)
+	if _, err := c.Check(context.Background()); err != nil || calls.Load() != 2 {
+		t.Fatalf("a read answered with 5xx is retried: calls=%d err=%v", calls.Load(), err)
+	}
+}
+
+// Meta's wa_id is the full international number: a Singapore sender is not turned into
+// an Indian number, replies go back to it, and a 131050 failure carries its code.
+func TestSingaporeNumbersAreNotTakenForIndian(t *testing.T) {
+	g, c, _ := newGraph(t)
+	var msgs []Message
+	var recs []Receipt
+	c.OnMessage(func(m Message) { msgs = append(msgs, m) })
+	c.OnReceipt(func(r Receipt) { recs = append(recs, r) })
+	body := []byte(`{"object":"whatsapp_business_account","entry":[{"id":"222","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"phone_number_id":"111"},
+	 "contacts":[{"profile":{"name":"Wei"},"wa_id":"6591234567"}],
+	 "messages":[{"from":"6591234567","id":"wamid.SG1","timestamp":"1700000000","type":"text","text":{"body":"hello"}}],
+	 "statuses":[{"id":"wamid.SG2","status":"failed","recipient_id":"6591234567","errors":[{"code":131050,"title":"User stopped marketing messages"}]}]}}]}]}`)
+	if _, err := c.HandleWebhook(body); err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].From != "6591234567" || msgs[0].Name != "Wei" {
+		t.Fatalf("the Singapore sender must keep its number: %+v", msgs)
+	}
+	if len(recs) != 1 || recs[0].Phone != "6591234567" || recs[0].Code != CodeMarketingOptOut {
+		t.Fatalf("receipt: %+v", recs)
+	}
+	if _, err := c.SendReply(context.Background(), msgs[0].From, "hi", msgs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if m := g.last(); m["to"] != "6591234567" {
+		t.Fatalf("the reply must go to the Singapore number, got %v", m["to"])
+	}
+	if _, err := c.SendTextMessage(context.Background(), "+91 98000 00002", "hi"); err != nil || g.last()["to"] != "919800000002" {
+		t.Fatalf("a typed number still works: %v %v", g.last()["to"], err)
+	}
+}
+
+func TestMaybeSentAndErrorCode(t *testing.T) {
+	g, c, _ := newGraph(t)
+	g.handle = func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":131050,"message":"stopped marketing"}}`))
+		return true
+	}
+	_, err := c.SendTextMessage(context.Background(), "919800000002", "hi")
+	if ErrorCode(err) != CodeMarketingOptOut || MaybeSent(err) {
+		t.Fatalf("a refusal is a definite failure with its code: %v", err)
+	}
+	g.handle = func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		w.WriteHeader(http.StatusInternalServerError)
+		return true
+	}
+	if _, err := c.SendTextMessage(context.Background(), "919800000002", "hi"); !MaybeSent(err) {
+		t.Fatalf("a 5xx answer to a send may have been sent: %v", err)
+	}
+	g.handle = func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		_, _ = w.Write([]byte(`{"messages":[]}`))
+		return true
+	}
+	if _, err := c.SendTextMessage(context.Background(), "919800000002", "hi"); !MaybeSent(err) {
+		t.Fatalf("an answer without an ID may have been sent: %v", err)
+	}
+	if MaybeSent(ErrNotConnected) || MaybeSent(nil) {
+		t.Fatal("nothing was sent when not connected")
+	}
+}
+
+// Templates with a media or text header and link buttons need those values too.
+func TestTemplateHeaderAndButtons(t *testing.T) {
+	g, c, _ := newGraph(t)
+	ctx := context.Background()
+	parts := TemplateParts{HeaderMedia: "https://example.com/offer.jpg?v=2", Body: []string{"Asha"}, URLButtons: []string{"", "order/42"}}
+	if _, err := c.SendTemplate(ctx, "919800000002", "offer", "en", parts); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(g.last()["template"])
+	for _, want := range []string{
+		`{"parameters":[{"image":{"link":"https://example.com/offer.jpg?v=2"},"type":"image"}],"type":"header"}`,
+		`{"parameters":[{"text":"Asha","type":"text"}],"type":"body"}`,
+		`{"index":"1","parameters":[{"text":"order/42","type":"text"}],"sub_type":"url","type":"button"}`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("template payload misses %s:\n%s", want, b)
+		}
+	}
+	if strings.Contains(string(b), `"index":"0"`) {
+		t.Fatalf("a button without a variable must not be sent: %s", b)
+	}
+	if _, err := c.SendTemplate(ctx, "919800000002", "hello", "en", TemplateParts{Header: []string{"Diwali"}}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := json.Marshal(g.last()["template"]); !strings.Contains(string(b), `{"parameters":[{"text":"Diwali","type":"text"}],"type":"header"}`) {
+		t.Fatalf("text header missing: %s", b)
+	}
+	for link, kind := range map[string]string{"https://x.com/a.PNG": "image", "https://x.com/v.mp4": "video", "https://x.com/menu.pdf": "document"} {
+		if got := HeaderMediaKind(link); got != kind {
+			t.Errorf("%s: got %s, want %s", link, got, kind)
+		}
 	}
 }

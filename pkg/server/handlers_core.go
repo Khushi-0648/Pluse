@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -120,6 +122,13 @@ func (s *Server) health() Health {
 	if snap.Automation.WarmupMode {
 		h.Advice = append(h.Advice, "Warm-up is on: at most 50 automated messages per day while the number builds a history.")
 	}
+	// Not "risk": that would block campaigns, and this is the owner's own choice.
+	if !snap.Automation.RequireOptIn && !snap.Automation.Enforce24hWindow {
+		if h.Level == "good" {
+			h.Level = "watch"
+		}
+		h.Advice = append(h.Advice, "Opt-in and the 24-hour rule are both off (Settings > Safety): "+consentRulesWarning)
+	}
 	return h
 }
 
@@ -215,6 +224,16 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			}
 			return att
 		}(),
+		// The list is oldest first and cut at 5; the dashboard alert needs the newest request.
+		"latest_attention": func() *attentionItem {
+			var latest *attentionItem
+			for i := range att {
+				if a := &att[i]; latest == nil || a.Since != nil && (latest.Since == nil || a.Since.After(*latest.Since)) {
+					latest = a
+				}
+			}
+			return latest
+		}(),
 		"risk_acknowledged": snap.Setup.RiskAcknowledgedAt != nil,
 	}
 	if t := snap.Setup.PasswordResetAt; t != nil && time.Since(*t) < 7*24*time.Hour && authOf(r).role == "admin" {
@@ -227,7 +246,9 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	if s.Scheduler != nil {
 		counts["scheduled"] = s.Scheduler.PendingCount()
 	}
-	if s.Campaigns != nil {
+	// Campaigns are admin-only (their message, audience and results), so staff do not get
+	// the running one here either.
+	if s.Campaigns != nil && authOf(r).role == "admin" {
 		if a, ok := s.Campaigns.Active(); ok {
 			resp["campaign"] = a
 		}
@@ -261,15 +282,19 @@ func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) deleteAllCustomerData() {
+// deleteAllCustomerData deletes every customer's data. It reports what could not be
+// saved yet (usually a file held by antivirus; it is retried in the background), so the
+// owner is never told "deleted" when the disk still holds the data.
+func (s *Server) deleteAllCustomerData() error {
+	var errs []error
 	if s.History != nil {
-		_ = s.History.Clear()
+		errs = append(errs, s.History.Clear())
 	}
 	if s.Contacts != nil {
-		_ = s.Contacts.Clear()
+		errs = append(errs, s.Contacts.Clear())
 	}
 	if s.Scheduler != nil {
-		_ = s.Scheduler.Clear(true)
+		errs = append(errs, s.Scheduler.Clear(true))
 	}
 	if s.Campaigns != nil {
 		s.Campaigns.DeleteAll()
@@ -277,6 +302,16 @@ func (s *Server) deleteAllCustomerData() {
 	if s.Hooks != nil {
 		s.Hooks.Forget("")
 	}
+	// The daily backups hold the same contacts, rules and details: "delete all" that
+	// left them would not delete all.
+	s.deleteAutoBackups()
+	// The unencrypted files of versions before 1.4 hold customer data too.
+	if s.DataDir != "" && s.oldCopies() > 0 {
+		errs = append(errs, os.RemoveAll(s.oldCopiesDir()))
+	}
+	// The activity log keeps what happened, but no longer names any customer (S38).
+	security.RedactAllCustomers()
+	return errors.Join(errs...)
 }
 
 func (s *Server) handleAcknowledgeRisk(w http.ResponseWriter, r *http.Request) {
@@ -312,6 +347,56 @@ func (s *Server) testRecipient(w http.ResponseWriter, raw string) (string, bool)
 // testHint is added when Meta refuses a test because that phone has not written first.
 const testHint = " Send any message from that phone to your business number first, then try again within 24 hours."
 
+// sendTest sends a test message with the same checks as a message typed in the inbox:
+// opt-out, blocked numbers, test mode, practice mode and the daily limit. In practice
+// mode it is only recorded (dryRun). ok is false when an error was written.
+func (s *Server) sendTest(w http.ResponseWriter, r *http.Request, phone, text string) (dryRun, ok bool) {
+	snap := s.cfg.Snapshot()
+	a := snap.Automation
+	if s.Contacts != nil {
+		c, found := s.Contacts.Get(phone)
+		if (found && c.IsDND) || (!found && s.Contacts.WasOptedOut(phone)) {
+			writeError(w, http.StatusConflict, "This number opted out of messages, so no test is sent to it. Use another phone, or ask them to reply START first.")
+			return false, false
+		}
+	}
+	if inPhoneList(a.BlacklistPhones, phone) {
+		writeError(w, http.StatusConflict, "This number is on your blocked list (Settings > Safety).")
+		return false, false
+	}
+	if a.AllowListOnly && !s.Contacts.AllowListed(a.AllowList, phone) {
+		writeError(w, http.StatusConflict, "Test mode is on: messages can only go to the test numbers in Settings > Safety.")
+		return false, false
+	}
+	rec := history.MessageRecord{Direction: history.DirectionOutgoing, Type: history.TypeDirectSend, Phone: phone, Text: text, SentBy: actor(r)}
+	if a.DryRun {
+		rec.ID, rec.Status = "dry_"+security.RandomToken(6), history.StatusDryRun
+		if s.History != nil {
+			s.History.Record(rec)
+		}
+		return true, true
+	}
+	releaseDaily, reserved := campaign.ReserveDaily(snap, s.History, time.Now())
+	if !reserved {
+		writeError(w, http.StatusTooManyRequests, "Today's sending limit has been reached, so the test was not sent. Raise the limit in Settings > Safety, or try again later.")
+		return false, false
+	}
+	defer releaseDaily()
+	// Recorded and labelled before it goes (see campaign.SendRecorded).
+	rec.Label = DirectLabel + security.RandomToken(8)
+	_, err := campaign.SendRecorded(r.Context(), s.History, rec, directSendTimeout, func(ctx context.Context) (string, error) {
+		return s.Messenger.SendTextMessage(ctx, phone, text)
+	})
+	if err != nil {
+		writeSendError(w, err, testHint)
+		return false, false
+	}
+	return false, true
+}
+
+// practiceNote answers a test that practice mode only recorded.
+const practiceNote = "Practice mode is on, so the test was not sent; it is shown in the inbox as a practice message. Turn practice mode off in Settings > Safety to send it."
+
 func (s *Server) handleTestMessage(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Phone string `json:"phone"`
@@ -329,15 +414,15 @@ func (s *Server) handleTestMessage(w http.ResponseWriter, r *http.Request) {
 		name = version.Product
 	}
 	text := fmt.Sprintf("Test message from %s. If you can read this, sending works. Sent at %s.", name, time.Now().Format("15:04"))
-	id, err := s.Messenger.SendTextMessage(r.Context(), phone, text)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error()+testHint)
+	dryRun, ok := s.sendTest(w, r, phone, text)
+	if !ok {
+		return
+	}
+	if dryRun {
+		writeOK(w, map[string]any{"dry_run": true, "message": practiceNote})
 		return
 	}
 	now := time.Now()
 	_ = s.cfg.Update(func(c *configT) error { c.Setup.TestMessageSentAt = &now; return nil })
-	if s.History != nil {
-		s.History.Record(history.MessageRecord{ID: id, Direction: history.DirectionOutgoing, Type: history.TypeDirectSend, Phone: phone, Text: text, Status: history.StatusSent, SentBy: actor(r)})
-	}
 	writeOK(w, map[string]any{"message": "Test message sent to +" + phone + ". Check WhatsApp on that phone."})
 }

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/securestore"
 	"whatsapp-automation/pkg/security"
 	"whatsapp-automation/pkg/version"
@@ -29,7 +30,36 @@ var backupName = regexp.MustCompile(`^pulse-backup-\d{4}-\d{2}-\d{2}\.json$`)
 
 func (s *Server) backupDir() string { return filepath.Join(s.DataDir, "backups") }
 
-// AutoBackup writes today's backup now.
+// copyDir is where this profile's extra backup copy goes. A -session profile starts with
+// the main profile's settings, including the copy folder, and both would write the same
+// file names there; each extra profile therefore uses a subfolder named after it.
+func (s *Server) copyDir() string {
+	extra := strings.TrimSpace(s.cfg.Snapshot().Storage.BackupCopyDir)
+	if extra == "" || s.Profile == "" {
+		return extra
+	}
+	return filepath.Join(extra, s.Profile)
+}
+
+// copyError means the backup in the data folder was saved and only the extra copy failed.
+type copyError struct{ err error }
+
+func (e copyError) Error() string { return e.err.Error() }
+func (e copyError) Unwrap() error { return e.err }
+
+// writableDir reports whether a file can be created in dir.
+func writableDir(dir string) bool {
+	f, err := os.CreateTemp(dir, ".pulse-write-test-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	_ = os.Remove(name)
+	return true
+}
+
+// AutoBackup writes today's backup now. A failure of the extra copy alone is a copyError.
 func (s *Server) AutoBackup() error {
 	if s.DataDir == "" {
 		return errors.New("no data folder")
@@ -41,26 +71,118 @@ func (s *Server) AutoBackup() error {
 	name := "pulse-backup-" + time.Now().Format("2006-01-02") + ".json"
 	box := securestore.Default()
 	dirs := []string{s.backupDir()}
-	if extra := strings.TrimSpace(s.cfg.Snapshot().Storage.BackupCopyDir); extra != "" {
+	if extra := s.copyDir(); extra != "" {
 		dirs = append(dirs, extra)
 	}
 	var firstErr error
 	for i, dir := range dirs {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("%s: %w", dir, err)
+		err := os.MkdirAll(dir, 0700)
+		if err == nil {
+			if i == 0 {
+				securestore.RestrictToUser(dir)
 			}
-			continue
+			err = box.WriteFileNoBackup(filepath.Join(dir, name), data)
+			pruneBackups(dir)
 		}
-		if i == 0 {
-			securestore.RestrictToUser(dir)
+		if err != nil {
+			err = fmt.Errorf("%s: %w", dir, err)
+			if i == 0 {
+				return err // without the main backup the copy does not matter
+			}
+			if firstErr == nil {
+				firstErr = copyError{err}
+			}
 		}
-		if err := box.WriteFileNoBackup(filepath.Join(dir, name), data); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("%s: %w", dir, err)
-		}
-		pruneBackups(dir)
 	}
 	return firstErr
+}
+
+// deleteAutoBackups removes Pulse's own daily backup files from the data folder and the
+// extra copy folder (only files named pulse-backup-<date>.json; nothing else there).
+func (s *Server) deleteAutoBackups() int {
+	dirs := []string{}
+	if s.DataDir != "" {
+		dirs = append(dirs, s.backupDir())
+	}
+	if extra := s.copyDir(); extra != "" {
+		dirs = append(dirs, extra)
+	}
+	n := 0
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue // for example a USB drive that is not plugged in
+		}
+		for _, e := range entries {
+			if !e.IsDir() && backupName.MatchString(e.Name()) && os.Remove(filepath.Join(dir, e.Name())) == nil {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// forgetInBackups removes one customer from every daily backup (main folder and extra
+// copy), so an erasure request does not leave them on disk for up to 7 days (S38).
+// It returns how many backup files were rewritten.
+func (s *Server) forgetInBackups(phone string) int {
+	dirs := []string{}
+	if s.DataDir != "" {
+		dirs = append(dirs, s.backupDir())
+	}
+	if extra := s.copyDir(); extra != "" {
+		dirs = append(dirs, extra)
+	}
+	box := securestore.Default()
+	n := 0
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !backupName.MatchString(e.Name()) {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			data, err := box.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			var b backupBundle
+			if json.Unmarshal(data, &b) != nil {
+				continue
+			}
+			// Stored numbers are compared as stored (CleanPhone would read the Singapore
+			// 6591234567 as India's 916591234567). A backup made before 2.1 kept such a
+			// number with 91 in front (contacts.LegacyWAID), so that form goes too.
+			legacy := ""
+			if strings.HasPrefix(b.Version, "1.") || strings.HasPrefix(b.Version, "2.0") {
+				legacy = contacts.LegacyWAID(phone)
+			}
+			kept := b.Contacts[:0]
+			for _, c := range b.Contacts {
+				if p := contacts.NormalizePhone(c.Phone); p != phone && (legacy == "" || p != legacy) {
+					kept = append(kept, c)
+				}
+			}
+			if len(kept) == len(b.Contacts) {
+				continue
+			}
+			b.Contacts = kept
+			out, err := json.Marshal(b)
+			if err != nil {
+				continue
+			}
+			// A backup that cannot be rewritten still holds the customer: delete it.
+			if box.WriteFileNoBackup(path, out) != nil {
+				_ = os.Remove(path)
+			}
+			securestore.RemoveBackup(path)
+			n++
+		}
+	}
+	return n
 }
 
 func pruneBackups(dir string) {
@@ -167,6 +289,12 @@ func (s *Server) handleDeleteOldCopies(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleBackupNow(w http.ResponseWriter, r *http.Request) {
 	if err := s.AutoBackup(); err != nil {
+		var ce copyError
+		if errors.As(err, &ce) {
+			security.LogAudit("AUTO_BACKUP_COPY_FAILED", clientIP(r), actor(r), "Backup saved, extra copy failed: "+err.Error(), "failed")
+			writeOK(w, map[string]any{"message": "Backup saved in the data folder, but the extra copy could not be saved: " + err.Error(), "warning": true})
+			return
+		}
 		security.LogAudit("AUTO_BACKUP_FAILED", clientIP(r), actor(r), "Backup failed: "+err.Error(), "failed")
 		writeError(w, http.StatusInternalServerError, "The backup could not be saved: "+err.Error())
 		return

@@ -11,7 +11,9 @@ if not exist "%NEW%" (
 )
 
 echo Closing Pulse normally so everything is saved...
-"%NEW%" stop -config "%~dp0config.yaml"
+rem No -config: the settings live in %%APPDATA%%\Pulse. Pointing at a config.yaml here
+rem would start Pulse with new, empty settings next to the existing data.
+"%NEW%" stop
 timeout /t 3 /nobreak >nul
 
 tasklist /fi "imagename eq whatsapp-auto.exe" | find /i "whatsapp-auto.exe" >nul
@@ -35,7 +37,7 @@ if errorlevel 1 (
 )
 
 echo Starting Pulse...
-start "Pulse" "%~dp0whatsapp-auto.exe" app -config "%~dp0config.yaml"
+start "Pulse" "%~dp0whatsapp-auto.exe" app
 echo.
 echo Done. In your browser press Ctrl+F5 on the dashboard.
 echo If anything looks wrong, close Pulse and rename whatsapp-auto.old.exe back.

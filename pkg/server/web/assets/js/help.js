@@ -7,16 +7,16 @@
     async render(el) {
       await P.loadVars().catch(() => null);
       const vars = (P.vars && P.vars.variables) || [];
+      const port = window.location.port || '8085'; // the port this dashboard is served on
       P.mount(el, html`<div class="stack">
         <section class="card"><div class="card-head"><h2>Using the official WhatsApp API</h2></div><div class="card-body stack-sm">
           <p>Pulse connects through Meta's official WhatsApp Business Platform (Cloud API). This is the way WhatsApp's terms allow businesses to automate messages. You use your own Meta account and number; you need to set it up once:</p>
-          <div class="notice warn"><p><strong>Phone Number Requirement:</strong> A number connected to Meta's Cloud API cannot be used in the WhatsApp or WhatsApp Business mobile app at the same time. Use a dedicated SIM, virtual number or landline, or manage all chats here in the Pulse inbox.</p></div>
           <ol class="steps">
             <li>At <strong>developers.facebook.com</strong>, create an app of type <strong>Business</strong> and add the <strong>WhatsApp</strong> product.</li>
             <li>In WhatsApp &gt; API Setup, add your business phone number and copy the <strong>Phone number ID</strong> and the <strong>WhatsApp Business account ID</strong>.</li>
             <li>In Meta Business settings &gt; System users, create a system user, give it your app and WhatsApp account, and generate a <strong>permanent token</strong> with the permissions <code>whatsapp_business_messaging</code> and <code>whatsapp_business_management</code>.</li>
             <li>In the app's App settings &gt; Basic, copy the <strong>App secret</strong>.</li>
-            <li>Make Pulse reachable over https, for example with Cloudflare Tunnel: <code>cloudflared tunnel --url http://127.0.0.1:8085</code>. Paste the https address it shows as <strong>Public address</strong>.</li>
+            <li>Make Pulse reachable at a <strong>fixed</strong> https address, for example a named Cloudflare Tunnel on your own domain (such as <code>https://pulse.yourdomain.com</code>) that forwards to <code>http://127.0.0.1:${port}</code>, a static ngrok domain or your own reverse proxy. Paste that address as <strong>Public address</strong>. A quick tunnel (<code>cloudflared tunnel --url ...</code>) gets a new address on every start, which breaks Meta's webhook: use it only for a one-off test. See SETUP-GUIDE.md and docs\\meta-whatsapp-setup.md.</li>
             <li>Paste everything in <strong>Settings &gt; WhatsApp connection</strong>, press Test connection, then Save.</li>
             <li>In Meta's WhatsApp &gt; Configuration, set the <strong>Callback URL</strong> to the webhook address and the <strong>Verify token</strong> shown in Pulse, then subscribe to the <strong>messages</strong> field.</li>
             <li>To message customers who have not written in the last 24 hours, create <strong>message templates</strong> in WhatsApp Manager and wait for Meta to approve them. Use them in Campaigns and Scheduled messages.</li>

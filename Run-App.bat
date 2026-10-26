@@ -6,15 +6,22 @@ echo     Starting Pulse...
 echo ===================================================
 cd /d "%~dp0"
 
-rem Strip Mark-of-the-Web if extracted from an internet-downloaded zip
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%~dp0' -Recurse | Unblock-File -ErrorAction SilentlyContinue" 2>nul
-
 if not exist "whatsapp-auto.exe" (
     echo [ERROR] whatsapp-auto.exe was not found in:
     echo "%~dp0"
+    echo If you opened this file inside the zip, unzip the whole Pulse folder first
+    echo ^(right-click the zip, Extract All^), then run it from the unzipped folder.
     echo.
     pause
     exit /b 1
+)
+if exist "%~dp0scripts\Check-SmartAppControl.bat" (
+    call "%~dp0scripts\Check-SmartAppControl.bat"
+    if errorlevel 1 (
+        echo.
+        pause
+        exit /b 1
+    )
 )
 "%~dp0whatsapp-auto.exe" app
 set RC=%errorlevel%

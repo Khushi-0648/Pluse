@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"whatsapp-automation/pkg/version"
@@ -100,26 +101,47 @@ func EnsureDesktopShortcut(exe string) error {
 	return nil
 }
 
-const startupLink = version.Product + " (background).lnk"
+// Profile is how this copy of Pulse was started (-session, -config, -port), so "start
+// with Windows" starts the same profile instead of always the main one.
+var Profile struct {
+	Name string   // the -session name; empty for the main profile
+	Args []string // the flags to repeat, for example -session sales
+}
+
+// startupLink is the Startup-folder shortcut of this profile; each profile has its own.
+func startupLink() string {
+	if Profile.Name != "" {
+		return version.Product + " " + Profile.Name + " (background).lnk"
+	}
+	return version.Product + " (background).lnk"
+}
+
+// quoteArg quotes a shortcut argument that contains spaces (Windows paths cannot contain ").
+func quoteArg(a string) string {
+	if a == "" || strings.ContainsAny(a, " \t") {
+		return `"` + a + `"`
+	}
+	return a
+}
 
 // AutostartSupported reports whether "start with Windows" can be offered.
 func AutostartSupported() bool { return runtime.GOOS == "windows" }
 
-// AutostartEnabled reports whether the app starts with Windows.
+// AutostartEnabled reports whether this profile starts with Windows.
 func AutostartEnabled() bool {
 	if runtime.GOOS != "windows" {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(os.Getenv("APPDATA"), `Microsoft\Windows\Start Menu\Programs\Startup`, startupLink))
+	_, err := os.Stat(filepath.Join(os.Getenv("APPDATA"), `Microsoft\Windows\Start Menu\Programs\Startup`, startupLink()))
 	return err == nil
 }
 
-// SetAutostart adds or removes a Startup-folder shortcut that runs the server minimised.
+// SetAutostart adds or removes a Startup-folder shortcut that runs this profile's server minimised.
 func SetAutostart(enabled bool) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("Starting automatically is only available on Windows.")
 	}
-	path := filepath.Join(os.Getenv("APPDATA"), `Microsoft\Windows\Start Menu\Programs\Startup`, startupLink)
+	path := filepath.Join(os.Getenv("APPDATA"), `Microsoft\Windows\Start Menu\Programs\Startup`, startupLink())
 	if !enabled {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -130,7 +152,11 @@ func SetAutostart(enabled bool) error {
 	if err != nil {
 		return err
 	}
-	return createShortcut("Startup", startupLink, exe, "serve", 7)
+	args := []string{"serve", "-keep-running"}
+	for _, a := range Profile.Args {
+		args = append(args, quoteArg(a))
+	}
+	return createShortcut("Startup", startupLink(), exe, strings.Join(args, " "), 7)
 }
 
 // createShortcut writes a .lnk in a special folder. Paths are passed through the

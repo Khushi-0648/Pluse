@@ -133,11 +133,14 @@
   P.act('cmp-csv', (btn) => P.download('/campaigns/' + encodeURIComponent(btn.dataset.id) + '/report.csv'));
   P.act('cmp-delete', (btn) => {
     const id = btn.dataset.id;
-    const before = st.list;
     hiddenIds.add(id); // keeps the 4-second refresh from showing it again during Undo
-    st.list = before.filter((c) => c.id !== id);
-    P.mount(P.$('#cmp-history'), historyTable());
-    P.undoable('Deleted the campaign report.', () => P.del('/campaigns/' + encodeURIComponent(id)).finally(() => hiddenIds.delete(id)), () => { hiddenIds.delete(id); st.list = before; P.mount(P.$('#cmp-history'), historyTable()); });
+    st.list = st.list.filter((c) => c.id !== id);
+    P.redraw(P.$('#cmp-history'), historyTable());
+    // Undo reloads instead of restoring a snapshot, so other deletes still waiting stay hidden.
+    P.undoable('Deleted the campaign report.', () => P.del('/campaigns/' + encodeURIComponent(id)).finally(() => hiddenIds.delete(id)), () => {
+      hiddenIds.delete(id);
+      P.get('/campaigns').then((l) => { st.list = l.filter((c) => !hiddenIds.has(c.id)); P.redraw(P.$('#cmp-history'), historyTable()); }).catch(P.error);
+    });
   });
 
   let detailSig = '';
@@ -173,7 +176,12 @@
       if (q.get('id')) {
         detailSig = '';
         const status = await renderDetail(el, q.get('id'));
-        if (status === 'running' || status === 'paused') P.every(5000, () => renderDetail(el, q.get('id')).catch(() => {}));
+        if (status === 'running' || status === 'paused') {
+          const poll = P.every(5000, async () => {
+            const s = await renderDetail(el, q.get('id'));
+            if (s !== 'running' && s !== 'paused') clearInterval(poll); // finished: nothing changes any more
+          });
+        }
         return;
       }
       await P.loadVars();
@@ -190,8 +198,9 @@
         st.list = (await P.get('/campaigns')).filter((c) => !hiddenIds.has(c.id));
         const a = st.list.find((c) => c.status === 'running' || c.status === 'paused');
         if (!!a !== !!active) { P.route(); return; }
-        P.mount(P.$('#cmp-active'), activeCard(a));
-        P.mount(P.$('#cmp-history'), historyTable());
+        // Redrawn only when something changed, keeping the focus and open sections.
+        P.redraw(P.$('#cmp-active'), activeCard(a));
+        P.redraw(P.$('#cmp-history'), historyTable());
       });
     },
   });
@@ -212,7 +221,7 @@
   function drawJobs() {
     const box = P.$('#jobs-box');
     if (!box) return;
-    P.mount(box, st.jobs.length
+    P.redraw(box, st.jobs.length
       ? html`<div class="table-wrap"><table class="table cards"><thead><tr><th>To</th><th>When</th><th>Message</th><th>Status</th><th class="right">Actions</th></tr></thead><tbody>${st.jobs.map(jobRow)}</tbody></table></div>`
       : P.empty('Nothing scheduled', 'Schedule a reminder or follow-up to send later.'));
   }
@@ -239,7 +248,7 @@
     form.reset();
     P.$('#job-when').value = localInputValue(new Date(Date.now() + 3600e3));
     P.$('#job-msg').dispatchEvent(new Event('input', { bubbles: true }));
-    loadJobs();
+    loadJobs().catch(P.error);
   });
   P.change('job-template', (el) => {
     const t = st.templates.find((x) => x.id === el.value);
@@ -248,15 +257,14 @@
     ta.value = t.content;
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   });
-  P.act('job-cancel', async (btn) => { await P.busy(btn, () => P.post('/scheduled/' + encodeURIComponent(btn.dataset.id) + '/cancel')); P.toast('Cancelled.'); loadJobs(); });
-  P.act('job-retry', async (btn) => { await P.busy(btn, () => P.post('/scheduled/' + encodeURIComponent(btn.dataset.id) + '/retry')); P.toast('It will be sent within a few seconds.'); loadJobs(); });
+  P.act('job-cancel', async (btn) => { await P.busy(btn, () => P.post('/scheduled/' + encodeURIComponent(btn.dataset.id) + '/cancel')); P.toast('Cancelled.'); loadJobs().catch(P.error); });
+  P.act('job-retry', async (btn) => { await P.busy(btn, () => P.post('/scheduled/' + encodeURIComponent(btn.dataset.id) + '/retry')); P.toast('It will be sent within a few seconds.'); loadJobs().catch(P.error); });
   P.act('job-delete', (btn) => {
     const id = btn.dataset.id;
-    const before = st.jobs;
-    st.jobs = before.filter((j) => j.id !== id);
+    st.jobs = st.jobs.filter((j) => j.id !== id);
     drawJobs();
     hiddenIds.add(id);
-    P.undoable('Deleted the scheduled message.', () => P.del('/scheduled/' + encodeURIComponent(id)).finally(() => hiddenIds.delete(id)).then(loadJobs), () => { hiddenIds.delete(id); st.jobs = before; drawJobs(); });
+    P.undoable('Deleted the scheduled message.', () => P.del('/scheduled/' + encodeURIComponent(id)).finally(() => hiddenIds.delete(id)).then(loadJobs), () => { hiddenIds.delete(id); loadJobs().catch(P.error); });
   });
 
   P.view('scheduled', {

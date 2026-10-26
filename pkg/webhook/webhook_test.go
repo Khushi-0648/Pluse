@@ -159,12 +159,84 @@ func TestPendingEventsSurviveRestart(t *testing.T) {
 	if !strings.Contains(string(d2.pending[0].Payload), "opted_out") {
 		t.Fatal("saved events must keep their order")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "webhook-pending.json")); !os.IsNotExist(err) {
-		t.Fatal("the saved queue must be removed once loaded")
+	if _, err := os.Stat(filepath.Join(dir, "webhook-pending.json")); err != nil {
+		t.Fatal("the saved queue must stay on disk until the events are delivered (a crash must not lose them)")
 	}
 	d2.Forget("14155550100")
 	d2.Stop()
 	if New(cfg, filepath.Join(dir, "webhook-failed.json")).PendingCount() != 0 {
 		t.Fatal("erased events must not come back after a restart")
+	}
+}
+
+// B9: Forget matches the phone field exactly, never a longer number or a message text.
+func TestForgetMatchesExactPhoneOnly(t *testing.T) {
+	d := New(enabledConfig("https://example.invalid/hook"), "")
+	d.Send("message.received", map[string]string{"phone": "+14155550100", "text": "hi"})
+	d.Send("message.received", map[string]string{"phone": "+141555501001", "text": "call +14155550100"})
+	d.Send("message.received", map[string]string{"phone": "+15550000000"})
+	d.mu.Lock()
+	d.failed = append(d.failed, Delivery{ID: "f1", Payload: d.pending[0].Payload}, Delivery{ID: "f2", Payload: d.pending[1].Payload})
+	d.mu.Unlock()
+	d.Forget("+14155550100")
+	if d.PendingCount() != 2 {
+		t.Fatalf("only the exact number's event may go, %d left", d.PendingCount())
+	}
+	for _, p := range d.pending {
+		if eventForPhone(p.Payload, "14155550100") {
+			t.Fatal("the customer's event is still queued")
+		}
+	}
+	if f := d.Failed(); len(f) != 1 || f[0].ID != "f2" {
+		t.Fatalf("failed list = %+v", f)
+	}
+	d.Forget("")
+	if d.PendingCount() != 0 || len(d.Failed()) != 0 {
+		t.Fatal("an empty Forget drops everything")
+	}
+}
+
+// B10: events lost to a full queue are logged, at most once a minute with a count.
+func TestDroppedEventsAreLoggedThrottled(t *testing.T) {
+	var logged []int
+	old := logDropped
+	logDropped = func(n int) { logged = append(logged, n) }
+	defer func() { logDropped = old }()
+	d := New(enabledConfig("https://example.invalid/hook"), "")
+	for i := 0; i < maxPending+5; i++ {
+		d.Send("message.received", nil)
+	}
+	if d.PendingCount() != maxPending {
+		t.Fatalf("queue = %d", d.PendingCount())
+	}
+	if len(logged) != 1 || logged[0] != 1 {
+		t.Fatalf("first drop logged at once, the rest held back: %v", logged)
+	}
+	d.mu.Lock()
+	d.dropLoggedAt = time.Now().Add(-2 * time.Minute)
+	d.mu.Unlock()
+	d.Send("message.received", nil)
+	if len(logged) != 2 || logged[1] != 5 {
+		t.Fatalf("after a minute the count is logged: %v", logged)
+	}
+	d.Send("message.received", nil)
+	d.Stop()
+	if len(logged) != 3 || logged[2] != 1 {
+		t.Fatalf("Stop logs what is left: %v", logged)
+	}
+}
+
+// A crash (no Stop) must not lose queued events: the queue is written soon after each change.
+func TestPendingEventsSurviveCrash(t *testing.T) {
+	dir := t.TempDir()
+	cfg := enabledConfig("https://example.invalid/hook")
+	d := New(cfg, filepath.Join(dir, "webhook-failed.json"))
+	d.Send("contact.opted_out", map[string]string{"phone": "+14155550101"})
+	if err := d.pendSaver.Flush(); err != nil { // what the 1-second timer does
+		t.Fatal(err)
+	}
+	// No Stop: Pulse was killed.
+	if n := New(cfg, filepath.Join(dir, "webhook-failed.json")).PendingCount(); n != 1 {
+		t.Fatalf("a queued event must survive a crash, got %d", n)
 	}
 }

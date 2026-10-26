@@ -12,7 +12,7 @@
     P.mount(el, html`<div class="stack">
       <div class="row-between">
         <div class="segmented" role="group" aria-label="Date range">${[[7, '7 days'], [30, '30 days'], [90, '90 days'], [0, 'All time']].map(([v, l]) => html`<button type="button" data-action="report-range" data-days="${v}" aria-pressed="${String(days === v)}">${l}</button>`)}</div>
-        <button class="btn" type="button" data-action="report-csv">${icon('download', 'icon-sm')}Download messages for Excel</button>
+        <button class="btn" type="button" data-action="report-csv">${icon('download', 'icon-sm')}${days ? 'Download these messages for Excel' : 'Download all messages for Excel'}</button>
       </div>
       <p class="hint">${range}. Only messages Pulse handled are counted.${d.imported_excluded ? ' ' + P.fmtNum(d.imported_excluded) + ' imported past messages are not included.' : ''}</p>
       <div class="grid-4">
@@ -45,7 +45,7 @@
   }
 
   P.act('report-range', (el) => { days = Number(el.dataset.days); P.store.set('reportDays', days); P.route(); });
-  P.act('report-csv', () => P.download('/analytics/export.csv'));
+  P.act('report-csv', () => P.download('/analytics/export.csv' + (days ? '?days=' + days : '')));
 
   P.view('reports', { title: 'Reports', admin: true, render: draw });
 })();

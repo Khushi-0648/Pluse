@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"whatsapp-automation/pkg/campaign"
+	"whatsapp-automation/pkg/cloudapi"
 	"whatsapp-automation/pkg/config"
 	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/history"
@@ -168,7 +170,7 @@ func (s *Server) handleMarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.Contacts != nil {
-		phone := contacts.CleanPhone(req.Phone)
+		phone := s.resolvePhone(req.Phone)
 		if _, ok := s.Contacts.Get(phone); !ok {
 			s.Contacts.Upsert(phone, "", "whatsapp")
 		}
@@ -192,11 +194,18 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			q.Before = t
 		}
 	}
+	// until is inclusive: paging by the oldest shown message must not skip others that
+	// share its timestamp. The caller drops the ones it already has by id.
+	if u := r.URL.Query().Get("until"); u != "" {
+		if t, err := time.Parse(time.RFC3339Nano, u); err == nil {
+			q.Before = t.Add(time.Nanosecond)
+		}
+	}
 	writeJSON(w, http.StatusOK, s.History.Query(q))
 }
 
 func (s *Server) handleDeleteMessages(w http.ResponseWriter, r *http.Request) {
-	phone := contacts.CleanPhone(r.URL.Query().Get("phone"))
+	phone := s.resolvePhone(r.URL.Query().Get("phone"))
 	if phone == "" {
 		writeError(w, http.StatusBadRequest, "Choose a conversation to clear. To delete everything use Settings > Privacy.")
 		return
@@ -262,7 +271,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	phone := contacts.CleanPhone(req.To)
+	phone := s.resolvePhone(req.To)
 	if len(phone) < 7 || len(phone) > 15 {
 		writeError(w, http.StatusBadRequest, "Enter a valid phone number with country code, for example +919876543210.")
 		return
@@ -272,8 +281,8 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Write a message or attach a file.")
 		return
 	}
-	if len(text) > 4000 {
-		writeError(w, http.StatusBadRequest, "The message is too long (4000 characters at most).")
+	if err := msgtemplate.LengthError(text, len(data) > 0); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var att security.AttachmentValidationResult
@@ -300,7 +309,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "This number is on your blocked list (Settings > Safety).")
 		return
 	}
-	if snap.Automation.AllowListOnly && !inPhoneList(snap.Automation.AllowList, phone) {
+	if snap.Automation.AllowListOnly && !s.Contacts.AllowListed(snap.Automation.AllowList, phone) {
 		writeError(w, http.StatusConflict, "Test mode is on: messages can only go to the test numbers in Settings > Safety.")
 		return
 	}
@@ -310,9 +319,13 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, campaign.OutsideWindowMessage)
 		return
 	}
-	rendered, missing := msgtemplate.Render(text, msgtemplate.Vars{Name: ct.Name, Phone: phone, Business: snap.Business, Extra: map[string]string{"email": ct.Email, "notes": ct.Notes}})
+	rendered, missing := msgtemplate.Render(text, msgtemplate.Vars{Name: ct.Name, Phone: phone, Business: snap.Business, Extra: map[string]string{"email": ct.Email, "notes": ct.Notes}, Now: time.Now(), Location: msgtemplate.Location(snap.BusinessHours.Timezone)})
 	if len(missing) > 0 {
 		writeError(w, http.StatusBadRequest, msgtemplate.MissingError(missing).Error())
+		return
+	}
+	if err := msgtemplate.LengthError(rendered, len(data) > 0); err != nil { // variables can make it longer
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	releaseDaily, ok := campaign.ReserveDaily(snap, s.History, time.Now())
@@ -343,20 +356,19 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "WhatsApp is not connected. Check Settings > WhatsApp connection.")
 		return
 	}
-	var id string
-	var err error
-	if len(data) > 0 {
-		id, err = s.Messenger.SendMediaMessage(r.Context(), phone, data, att.CleanName, att.DetectedMIME, rendered)
-	} else {
-		id, err = s.Messenger.SendTextMessage(r.Context(), phone, rendered)
-	}
+	// Recorded and labelled before it goes, like campaigns: a send whose answer is lost
+	// counts towards the daily limit and shows as "may have been sent"; closing the tab
+	// does not cut the send off halfway.
+	rec.Label = DirectLabel + security.RandomToken(8)
+	id, err := campaign.SendRecorded(r.Context(), s.History, rec, directSendTimeout, func(ctx context.Context) (string, error) {
+		if len(data) > 0 {
+			return s.Messenger.SendMediaMessage(ctx, phone, data, att.CleanName, att.DetectedMIME, rendered)
+		}
+		return s.Messenger.SendTextMessage(ctx, phone, rendered)
+	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeSendError(w, err, "")
 		return
-	}
-	rec.ID, rec.Status = id, history.StatusSent
-	if s.History != nil {
-		s.History.Record(rec)
 	}
 	if s.Contacts != nil {
 		s.Contacts.Upsert(phone, "", "manual")
@@ -366,9 +378,45 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"message_id": id, "to": phone, "text": rendered})
 }
 
+// resolvePhone turns a number from the dashboard or an integration into the stored form.
+// A saved contact is found as written first, so a number that came from WhatsApp (for
+// example Singapore's 6591234567) keeps its country; only a number that matches no
+// contact is read as typed by hand, where a 10-digit Indian mobile gets its 91.
+func (s *Server) resolvePhone(raw string) string {
+	if s.Contacts != nil && strings.TrimSpace(raw) != "" {
+		if c, ok := s.Contacts.Get(raw); ok {
+			return c.Phone
+		}
+	}
+	return contacts.CleanPhone(raw)
+}
+
+// DirectLabel prefixes the label of messages typed in the inbox, test messages and the
+// send command (biz_opaque_callback_data), so a send whose answer was lost is corrected
+// when Meta reports it.
+const DirectLabel = "pulse:d:"
+
+// directSendTimeout bounds a send from the dashboard; it runs on even if the browser
+// tab is closed, so a message is never cut off halfway.
+const directSendTimeout = 60 * time.Second
+
+// writeSendError answers a send that did not succeed. One that may still have reached
+// the customer (a timeout, a lost answer) says so, so the person checks the chat
+// instead of sending it twice.
+func writeSendError(w http.ResponseWriter, err error, hint string) {
+	switch {
+	case cloudapi.MaybeSent(err):
+		writeError(w, http.StatusGatewayTimeout, campaign.MaybeSentMessage+" ("+err.Error()+")")
+	case cloudapi.IsNotConnected(err):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	default:
+		writeError(w, http.StatusBadGateway, err.Error()+hint)
+	}
+}
+
 func inPhoneList(list []string, phone string) bool {
 	for _, p := range list {
-		if contacts.CleanPhone(p) == phone {
+		if contacts.MatchesTyped(p, phone) {
 			return true
 		}
 	}

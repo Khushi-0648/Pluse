@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,8 @@ func VerifySignature(appSecret string, body []byte, header string) bool {
 const (
 	seenTTL = 48 * time.Hour
 	seenMax = 20000
+
+	lastInboundMax = 5000 // customers whose newest message is kept for "typing..."
 )
 
 type webhookBody struct {
@@ -52,10 +55,11 @@ type webhookBody struct {
 				} `json:"contacts"`
 				Messages []inboundMessage `json:"messages"`
 				Statuses []struct {
-					ID          string `json:"id"`
-					Status      string `json:"status"`
-					RecipientID string `json:"recipient_id"`
-					Errors      []struct {
+					ID           string `json:"id"`
+					Status       string `json:"status"`
+					RecipientID  string `json:"recipient_id"`
+					CallbackData string `json:"biz_opaque_callback_data"`
+					Errors       []struct {
 						Code    int    `json:"code"`
 						Title   string `json:"title"`
 						Message string `json:"message"`
@@ -98,6 +102,18 @@ type inboundMessage struct {
 	} `json:"context"`
 }
 
+// maxProfileName caps the customer's WhatsApp profile name (WhatsApp allows 25
+// characters), so a forged or odd delivery cannot store a huge name.
+const maxProfileName = 100
+
+func profileName(s string) string {
+	s = strings.TrimSpace(s)
+	if r := []rune(s); len(r) > maxProfileName {
+		s = strings.TrimSpace(string(r[:maxProfileName]))
+	}
+	return s
+}
+
 // mediaLabels name the kinds of messages that are not plain text, as the inbox shows them.
 var mediaLabels = map[string]string{
 	"image": "Photo", "video": "Video", "audio": "Voice message", "voice": "Voice message", "document": "Document",
@@ -107,7 +123,8 @@ var mediaLabels = map[string]string{
 // convert reduces a webhook message to what Pulse needs; ok is false for messages
 // Pulse does not handle (reactions, system notices, unsupported types).
 func (m inboundMessage) convert() (Message, bool) {
-	out := Message{ID: m.ID, From: contacts.CleanPhone(m.From), ContextID: m.Context.ID}
+	// Meta's numbers are full international digits: no country code is guessed.
+	out := Message{ID: m.ID, From: contacts.CleanWAID(m.From), ContextID: m.Context.ID}
 	if sec, err := strconv.ParseInt(m.Timestamp, 10, 64); err == nil && sec > 0 {
 		out.Timestamp = time.Unix(sec, 0)
 	}
@@ -163,7 +180,7 @@ func (c *Client) HandleWebhook(body []byte) (int, error) {
 			}
 			names := map[string]string{}
 			for _, ct := range v.Contacts {
-				names[contacts.CleanPhone(ct.WaID)] = strings.TrimSpace(ct.Profile.Name)
+				names[contacts.CleanWAID(ct.WaID)] = profileName(ct.Profile.Name)
 			}
 			for _, raw := range v.Messages {
 				m, ok := raw.convert()
@@ -172,6 +189,11 @@ func (c *Client) HandleWebhook(body []byte) (int, error) {
 				}
 				m.Name = names[m.From]
 				c.mu.Lock()
+				if len(c.lastInbound) >= lastInboundMax {
+					// Only needed for "typing..." in the next seconds; starting over at worst
+					// skips that indicator once instead of growing with every customer.
+					c.lastInbound = map[string]string{}
+				}
 				c.lastInbound[m.From] = m.ID
 				c.mu.Unlock()
 				for _, h := range msgH {
@@ -183,7 +205,7 @@ func (c *Client) HandleWebhook(body []byte) (int, error) {
 				if s.ID == "" || !c.firstTime("s:"+s.ID+":"+s.Status) {
 					continue
 				}
-				r := Receipt{MessageID: s.ID, Phone: contacts.CleanPhone(s.RecipientID), Status: s.Status}
+				r := Receipt{MessageID: s.ID, Phone: contacts.CleanWAID(s.RecipientID), Status: s.Status, CallbackData: s.CallbackData}
 				switch s.Status {
 				case "sent", "delivered", "read":
 				case "failed":
@@ -194,7 +216,7 @@ func (c *Client) HandleWebhook(body []byte) (int, error) {
 							text = s.Errors[0].Title
 						}
 					}
-					r.Error = plainError(code, text)
+					r.Error, r.Code = plainError(code, text), code
 				default:
 					continue
 				}
@@ -209,7 +231,8 @@ func (c *Client) HandleWebhook(body []byte) (int, error) {
 }
 
 // firstTime records key and reports whether it is new. The memory is bounded: old
-// entries expire, and when it is still full the oldest half is dropped.
+// entries expire, and when it is still full the oldest quarter is dropped (by age, not
+// in map order, which would forget fresh entries Meta may still repeat).
 func (c *Client) firstTime(key string) bool {
 	now := time.Now()
 	c.mu.Lock()
@@ -224,12 +247,13 @@ func (c *Client) firstTime(key string) bool {
 			}
 		}
 		if len(c.seen) >= seenMax {
-			target := (seenMax * 3) / 4
+			keys := make([]string, 0, len(c.seen))
 			for k := range c.seen {
+				keys = append(keys, k)
+			}
+			sort.Slice(keys, func(i, j int) bool { return c.seen[keys[i]].Before(c.seen[keys[j]]) })
+			for _, k := range keys[:len(keys)-(seenMax*3)/4] {
 				delete(c.seen, k)
-				if len(c.seen) <= target {
-					break
-				}
 			}
 		}
 	}

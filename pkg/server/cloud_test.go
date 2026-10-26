@@ -183,6 +183,23 @@ func TestCloudWebhook(t *testing.T) {
 	if w := serve(h, httpReq("GET", "/login", "", "evil.example.com", nil)); w.Code != http.StatusForbidden {
 		t.Fatalf("other host names are still refused: %d", w.Code)
 	}
+	// A tunnel that rewrites the Host header to 127.0.0.1 is recognised by its headers.
+	for _, hdr := range []string{"Cf-Ray", "X-Forwarded-For", "Forwarded"} {
+		if w := serve(h, httpReq("GET", "/login", "", "127.0.0.1:8085", map[string]string{hdr: "1"})); w.Code != http.StatusNotFound {
+			t.Errorf("/login with %s and a rewritten host: %d", hdr, w.Code)
+		}
+	}
+	if w := serve(h, httpReq("GET", "/login", "", "127.0.0.1:8085", nil)); w.Code != http.StatusOK {
+		t.Fatalf("local sign-in page: %d", w.Code)
+	}
+	// Forged calls through the shared tunnel address must not lock out Meta's deliveries.
+	for i := 0; i < 400; i++ {
+		serve(h, httpReq("POST", config.WebhookPath, body, "pulse-shop.trycloudflare.com", map[string]string{"X-Hub-Signature-256": "sha256=00"}))
+	}
+	w = serve(h, httpReq("POST", config.WebhookPath, body, "pulse-shop.trycloudflare.com", map[string]string{"X-Hub-Signature-256": metaSign("app-secret", body)}))
+	if w.Code != 200 {
+		t.Fatalf("signed delivery after a flood of forged ones: %d", w.Code)
+	}
 }
 
 // Files of the old linked-device connection are listed and deleted only on request.

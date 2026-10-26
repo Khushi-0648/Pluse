@@ -151,6 +151,11 @@ func (s *Server) handleSaveContact(w http.ResponseWriter, r *http.Request) {
 	}
 	renamed := false
 	if req.OriginalPhone != "" && contacts.CleanPhone(req.OriginalPhone) != contacts.CleanPhone(c.Phone) {
+		if authOf(r).role != "admin" {
+			// A new number replaces the old entry, which is a delete: admin only, like deleting.
+			writeError(w, http.StatusForbidden, "Only the admin can change a contact's number.")
+			return
+		}
 		if _, exists := s.Contacts.Get(c.Phone); exists {
 			writeError(w, http.StatusConflict, "Another contact already has that number.")
 			return
@@ -199,9 +204,10 @@ func (s *Server) handleBulkContacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Action string   `json:"action"`
-		Phones []string `json:"phones"`
-		Tag    string   `json:"tag"`
+		Action   string   `json:"action"`
+		Phones   []string `json:"phones"`
+		Tag      string   `json:"tag"`
+		Password string   `json:"password"` // deleting needs the admin password again
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -215,9 +221,16 @@ func (s *Server) handleBulkContacts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Enter a tag of up to 40 characters.")
 		return
 	}
-	if req.Action == "delete" && authOf(r).role != "admin" {
-		writeError(w, http.StatusForbidden, "Only the admin can delete contacts.")
-		return
+	if req.Action == "delete" {
+		if authOf(r).role != "admin" {
+			writeError(w, http.StatusForbidden, "Only the admin can delete contacts.")
+			return
+		}
+		// Deleting many contacts at once (and the opt-outs they hold) needs the admin
+		// signed in with the password; reauth also refuses the developer API key.
+		if !s.reauth(w, r, req.Password) {
+			return
+		}
 	}
 	n := 0
 	for _, p := range req.Phones {
@@ -443,6 +456,9 @@ func (s *Server) isOptedOut(phones ...string) bool {
 		}
 		if c, ok := s.Contacts.Get(p); ok && c.IsDND {
 			return true
+		}
+		if s.Contacts.WasOptedOut(p) {
+			return true // opted out, then deleted
 		}
 	}
 	return false

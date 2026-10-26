@@ -10,9 +10,13 @@ import (
 
 func TestNameFallback(t *testing.T) {
 	for _, name := range []string{"", "+91∙∙∙∙∙∙∙∙37", "+919876543210", "919876543210", "123456789012345@lid", "-"} {
+		// No usable name: the name is left out before punctuation, never a number (C22).
 		out, _ := Render("Hello {{first_name}}!", Vars{Name: name, Phone: "919876543210"})
-		if out != "Hello there!" {
+		if out != "Hello!" {
 			t.Errorf("name %q rendered as %q (C22)", name, out)
+		}
+		if out, _ = Render("Hello {{first_name}} and welcome", Vars{Name: name}); out != "Hello there and welcome" {
+			t.Errorf("name %q mid-sentence rendered as %q (C22)", name, out)
 		}
 	}
 	out, _ := Render("Hi {{first_name}} / {{name}}", Vars{Name: "Asha Verma"})
@@ -53,5 +57,39 @@ func TestGreetingUsesTimezone(t *testing.T) {
 	out, _ := Render("{{greeting}}", Vars{Now: now, Location: loc})
 	if out != "Good morning" {
 		t.Errorf("got %q", out)
+	}
+}
+
+// {{message}} only exists in automatic replies: elsewhere it would be sent as a gap.
+func TestMessageVariableOnlyInReplies(t *testing.T) {
+	if err := ValidateOutgoing("You said: {{message}}"); err == nil {
+		t.Fatal("campaigns and scheduled messages must refuse {{message}}")
+	}
+	if err := ValidateOutgoing("Hi {{first_name}}"); err != nil {
+		t.Fatal(err)
+	}
+	if _, missing := Render("You said: {{message}}", Vars{Name: "Asha"}); len(missing) != 1 || missing[0] != "message" {
+		t.Fatalf("an empty {{message}} must be reported, got %v", missing)
+	}
+	if out, missing := Render("You said: {{message}}", Vars{Message: "hello"}); len(missing) != 0 || out != "You said: hello" {
+		t.Fatalf("in a reply it is filled: %q %v", out, missing)
+	}
+}
+
+// C22: with no name a reply must not read "Thank you, there."
+func TestNoNameReadsNaturally(t *testing.T) {
+	for in, want := range map[string]string{
+		"Thank you, {{first_name}}. A member of our team will reply.": "Thank you. A member of our team will reply.",
+		"Goodbye {{first_name}}, have a good day.":                    "Goodbye, have a good day.",
+		"You are welcome, {{first_name}}.":                            "You are welcome.",
+		"Hello {{first_name}}!":                                       "Hello!",
+		"Hello {{first_name}} and welcome":                            "Hello there and welcome",
+	} {
+		if got, _ := Render(in, Vars{}); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+	if got, _ := Render("Thank you, {{first_name}}.", Vars{Name: "Asha Verma"}); got != "Thank you, Asha." {
+		t.Errorf("with a name: %q", got)
 	}
 }

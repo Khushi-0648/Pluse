@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -209,7 +210,8 @@ func TestIncomingStoredBeforeReply(t *testing.T) {
 func TestMaskedNameGreetsThere(t *testing.T) {
 	r := newRig(t)
 	out := r.say("919811112237", "+91∙∙∙∙∙∙∙∙37", "hi")
-	if !strings.Contains(out.Reply, "there") || strings.Contains(out.Reply, "∙") {
+	// No masked digits, and no stiff "Good morning there,": the name is simply left out.
+	if !strings.HasPrefix(out.Reply, "Good morning, thank you") || strings.Contains(out.Reply, "∙") {
 		t.Fatalf("masked number used as a name (C22): %q", out.Reply)
 	}
 }
@@ -277,6 +279,54 @@ func TestAwayReplyOncePerVisit(t *testing.T) {
 	}
 	if out := r.say(asha, "Asha", "hi"); out.Rule != "greeting_menu" {
 		t.Fatalf("after the away reply, rules should still answer: %+v", out)
+	}
+	// A restart (a new engine on the same saved history) must not send it again, and the
+	// menu shown just before the restart still accepts a number choice.
+	r.e = NewEngine(nil, r.cfg, r.cs, r.hs, nil, r.n)
+	r.e.SetMessenger(r.m)
+	r.e.SetClock(func() time.Time { r.now = r.now.Add(time.Second); return r.now })
+	if out := r.say(asha, "Asha", "1"); out.Rule == "system:away" || out.Rule == "" {
+		t.Fatalf("after a restart the away reply must not repeat and the menu must still work: %+v", out)
+	}
+}
+
+// While sending fails, the fallback reply is not retried for every message, only after
+// a pause.
+func TestFailedFallbackIsNotRetriedEveryMessage(t *testing.T) {
+	r := newRig(t)
+	_ = r.cfg.Update(func(c *config.Config) error {
+		c.Automation.EnableDefaultReply, c.Automation.DefaultReply = true, "Sorry, I did not understand. Reply MENU."
+		return nil
+	})
+	r.m.fail = true
+	if out := r.say(asha, "Asha", "qwerty zxcv"); out.Rule != "system:fallback" || out.SendErr == "" {
+		t.Fatalf("the first try must be made and fail: %+v", out)
+	}
+	if out := r.say(asha, "Asha", "asdf ghjk"); out.Rule == "system:fallback" {
+		t.Fatalf("a failing fallback must not be retried at once: %+v", out)
+	}
+	r.now = r.now.Add(failedRetryAfter + time.Minute)
+	r.m.fail = false
+	if out := r.say(asha, "Asha", "zzzz yyyy"); out.Rule != "system:fallback" || out.SendErr != "" {
+		t.Fatalf("after the pause it is tried again: %+v", out)
+	}
+}
+
+// The fallback limit (once per 30 minutes) survives a restart too.
+func TestFallbackLimitSurvivesRestart(t *testing.T) {
+	r := newRig(t)
+	_ = r.cfg.Update(func(c *config.Config) error {
+		c.Automation.EnableDefaultReply, c.Automation.DefaultReply = true, "Sorry, I did not understand. Reply MENU."
+		return nil
+	})
+	if out := r.say(asha, "Asha", "qwerty zxcv"); out.Rule != "system:fallback" {
+		t.Fatalf("fallback expected: %+v", out)
+	}
+	r.e = NewEngine(nil, r.cfg, r.cs, r.hs, nil, r.n)
+	r.e.SetMessenger(r.m)
+	r.e.SetClock(func() time.Time { r.now = r.now.Add(time.Second); return r.now })
+	if out := r.say(asha, "Asha", "asdf ghjk"); out.Rule == "system:fallback" {
+		t.Fatalf("a restart must not reset the fallback limit: %+v", out)
 	}
 }
 
@@ -393,9 +443,21 @@ func TestStopDrainsQueuedMessages(t *testing.T) {
 		t.Fatalf("all queued messages must be stored before shutdown, got %d", incoming)
 	}
 	sent := r.m.count()
+	// Handled through the chat's queue (C17), after that chat's earlier messages.
+	r.e.enqueue(in(asha, "STOP"))
+	r.e.enqueue(in(asha, "START"))
 	r.e.enqueue(in("14155550102", "STOP"))
-	if c, ok := r.cs.Get("14155550102"); !ok || !c.IsDND {
-		t.Fatal("an opt-out arriving during shutdown must still be applied")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, ok := r.cs.Get("14155550102")
+		a, _ := r.cs.Get(asha)
+		if ok && c.IsDND && a != nil && a.Consent && !a.IsDND {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("opt-outs arriving during shutdown must still be applied, in order")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if r.m.count() != sent {
 		t.Fatal("no replies may be sent after Stop")
@@ -456,5 +518,291 @@ func TestReplyQuotesReadsAndTyping(t *testing.T) {
 	r.e.Stop(ctx)
 	if len(r.hs.ExportAll()) != before {
 		t.Fatal("messages without a number or content must be ignored")
+	}
+}
+
+// Meta can deliver a message twice; after a restart the client no longer remembers it.
+func TestRedeliveredMessageIsNotAnsweredTwice(t *testing.T) {
+	r := newRig(t)
+	in := Incoming{ID: "wamid.SAME", Phone: asha, PushName: "Asha", Text: "hi"}
+	r.e.Process(in)
+	if out := r.e.Process(in); out.Skipped == "" || r.m.count() != 1 {
+		t.Fatalf("a message already in the history must not be answered again: %d replies, %+v", r.m.count(), out)
+	}
+}
+
+// STOP/START skip the reply limits, so their confirmations have their own cap.
+func TestOptOutOptInConfirmationsAreCapped(t *testing.T) {
+	r := newRig(t)
+	for i := 0; i < 20; i++ {
+		text := "STOP"
+		if i%2 == 1 {
+			text = "START"
+		}
+		r.say(asha, "Asha", text)
+	}
+	if n := r.m.count(); n != optConfirmPerHour {
+		t.Fatalf("want %d confirmations per hour, got %d", optConfirmPerHour, n)
+	}
+	if c, _ := r.cs.Get(asha); !c.Consent || c.IsDND {
+		t.Fatal("every STOP and START must still be recorded; the last one was START")
+	}
+	r.say(asha, "Asha", "STOP")
+	if c, _ := r.cs.Get(asha); !c.IsDND {
+		t.Fatal("an opt-out past the confirmation cap must still be recorded")
+	}
+}
+
+// An opt-out confirmation the owner edited to use an empty detail must not go out with a
+// gap: the built-in text is sent instead.
+func TestOptOutConfirmationNeverHasGaps(t *testing.T) {
+	r := newRig(t)
+	_ = r.cfg.Update(func(c *config.Config) error {
+		c.Business.Name = ""
+		c.Automation.OptOutReply = "You will hear nothing more from {{business_name}}."
+		return nil
+	})
+	r.say(asha, "Asha", "STOP")
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	if len(r.m.sent) != 1 || r.m.sent[0] != config.DefaultConfig().Automation.OptOutReply {
+		t.Fatalf("want the built-in opt-out text, got %q", r.m.sent)
+	}
+}
+
+// Meta may deliver STOP and START out of order: a START written before the STOP must not
+// subscribe the customer again, but a START written after it does.
+func TestOlderStartDoesNotUndoStop(t *testing.T) {
+	r := newRig(t)
+	now := r.e.now()
+	r.e.Process(Incoming{ID: "wamid.stop", Phone: asha, PushName: "Asha", Text: "STOP", SentAt: now.Add(-10 * time.Minute)})
+	r.e.Process(Incoming{ID: "wamid.oldstart", Phone: asha, PushName: "Asha", Text: "START", SentAt: now.Add(-20 * time.Minute)})
+	if c, _ := r.cs.Get(asha); !c.IsDND || c.Consent {
+		t.Fatalf("a START older than the STOP must not subscribe again: %+v", c)
+	}
+	r.e.Process(Incoming{ID: "wamid.newstart", Phone: asha, PushName: "Asha", Text: "START", SentAt: now.Add(-time.Minute)})
+	if c, _ := r.cs.Get(asha); c.IsDND || !c.Consent {
+		t.Fatalf("a START written after the STOP must subscribe again: %+v", c)
+	}
+}
+
+// C2: "start" or "resume" from a customer who never opted out is an ordinary message:
+// no consent is recorded and the normal rules answer it.
+func TestStartWithoutOptOutIsNotConsent(t *testing.T) {
+	r := newRig(t)
+	out := r.say(asha, "Asha", "resume")
+	if out.Rule == "system:opt_in" {
+		t.Fatalf("resume from a subscribed customer is not an opt-in: %+v", out)
+	}
+	if c, _ := r.cs.Get(asha); c.Consent || c.ConsentAt != nil {
+		t.Fatalf("no consent may be recorded: %+v", c)
+	}
+}
+
+// C9: a STOP written before the customer's newer START, delivered after it, is ignored;
+// the START keeps the time the customer sent it.
+func TestOlderStopDoesNotUndoNewerStart(t *testing.T) {
+	r := newRig(t)
+	now := r.e.now()
+	r.e.Process(Incoming{ID: "wamid.s1", Phone: asha, PushName: "Asha", Text: "STOP", SentAt: now.Add(-30 * time.Minute)})
+	r.e.Process(Incoming{ID: "wamid.go", Phone: asha, PushName: "Asha", Text: "START", SentAt: now.Add(-5 * time.Minute)})
+	if c, _ := r.cs.Get(asha); c.IsDND || c.OptInAt == nil || !c.OptInAt.Equal(now.Add(-5*time.Minute)) {
+		t.Fatalf("the START must be recorded with the time it was sent: %+v", c)
+	}
+	out := r.e.Process(Incoming{ID: "wamid.s0", Phone: asha, PushName: "Asha", Text: "STOP", SentAt: now.Add(-10 * time.Minute)})
+	if c, _ := r.cs.Get(asha); c.IsDND || !c.Consent || out.Reply != "" {
+		t.Fatalf("an older STOP arriving late must not opt them out again: %+v %+v", c, out)
+	}
+}
+
+// C8: Indian customers say DND or "stop na".
+func TestDNDAndStopNaAreOptOuts(t *testing.T) {
+	for _, s := range []string{"DND", "dnd please", "do not disturb", "Please do not disturb me", "stop na", "Stop na!"} {
+		if !IsOptOut(s) {
+			t.Errorf("%q must opt out", s)
+		}
+	}
+	if IsOptOut("don't stop") {
+		t.Error("a negated stop is not an opt-out")
+	}
+}
+
+// C5: automatic replies carry a label, so a reply recorded as failed (its answer was
+// lost) is corrected when Meta reports it delivered.
+func TestFailedReplyIsCorrectedByItsLabel(t *testing.T) {
+	r := newRig(t)
+	r.m.fail = true
+	r.e.Process(Incoming{ID: "wamid.L", Phone: asha, PushName: "Asha", Text: "hello"})
+	var rec history.MessageRecord
+	for _, m := range r.hs.ExportAll() {
+		if m.Direction == history.DirectionOutgoing {
+			rec = m
+		}
+	}
+	if rec.Status != history.StatusFailed || rec.Label != ReplyLabel+"wamid.L" {
+		t.Fatalf("the failed reply must carry its label: %+v", rec)
+	}
+	if !r.hs.ResolveLabel(rec.Label, "wamid.OUT", history.StatusDelivered) {
+		t.Fatal("Meta's report must correct the reply")
+	}
+}
+
+// C1: a sender from Singapore (wa_id 6591234567) is their own contact, not India's
+// 916591234567.
+func TestSingaporeSenderKeepsTheirNumber(t *testing.T) {
+	r := newRig(t)
+	_ = r.cs.Save(contacts.Contact{Phone: "+65 9123 4567", Name: "Wei"})
+	r.e.Process(Incoming{ID: "wamid.SG", Phone: "6591234567", PushName: "Wei L", Text: "hello"})
+	if _, ok := r.cs.Get("916591234567"); ok || r.cs.Count() != 1 {
+		t.Fatal("the Singapore sender was taken for an Indian number")
+	}
+	if c, _ := r.cs.Get("6591234567"); c.LastInboundAt == nil {
+		t.Fatalf("the message must be recorded on the Singapore contact: %+v", c)
+	}
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	if len(r.m.quoted) != 1 || !strings.HasPrefix(r.m.quoted[0], "6591234567>") {
+		t.Fatalf("the reply must go to the Singapore number: %v", r.m.quoted)
+	}
+}
+
+// C14: a received message leaves the journal only once the contacts (its STOP) are on
+// disk as well as the history.
+func TestJournalWaitsForContactsSave(t *testing.T) {
+	r := newRig(t)
+	dir := t.TempDir()
+	cs, err := contacts.NewStore(filepath.Join(dir, "c.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.cs = cs
+	r.e = NewEngine(r.m, r.cfg, cs, r.hs, nil, r.n)
+	path := filepath.Join(dir, "inbound-pending.json")
+	r.e.UseJournal(path)
+	// A folder where the contacts file belongs: saving the contacts fails.
+	if err := os.Mkdir(filepath.Join(dir, "c.json"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	in := Incoming{ID: "wamid.j", Phone: asha, PushName: "Asha", Text: "STOP", SentAt: time.Now()}
+	if err := r.e.jnl.add(in); err != nil {
+		t.Fatal(err)
+	}
+	r.e.Process(in)
+	r.e.jnl.done(in.ID)
+	if err := r.hs.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, saved := openJournal(path, nil); len(saved) != 1 {
+		t.Fatalf("the contacts are not saved: the entry must stay to be replayed: %+v", saved)
+	}
+	if err := os.Remove(filepath.Join(dir, "c.json")); err != nil {
+		t.Fatal(err)
+	}
+	r.hs.Record(history.MessageRecord{ID: "next", Direction: history.DirectionIncoming, Phone: "1", Text: "x"})
+	if err := r.hs.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, saved := openJournal(path, nil); len(saved) != 0 {
+		t.Fatalf("history and contacts saved: the entry must be gone: %+v", saved)
+	}
+	again, _ := contacts.NewStore(filepath.Join(dir, "c.json"))
+	if c, ok := again.Get(asha); !ok || !c.IsDND {
+		t.Fatal("the STOP must be on disk before the journal entry is removed")
+	}
+}
+
+// A voice note or a photo without a caption cannot be answered: a person must look.
+func TestMediaWithoutTextNeedsAPerson(t *testing.T) {
+	r := newRig(t)
+	r.e.Process(Incoming{ID: "wamid.V", Phone: asha, PushName: "Asha", Media: "Voice message"})
+	c, _ := r.cs.Get(asha)
+	if r.m.count() != 0 || !c.NeedsAttention || !strings.Contains(c.AttentionReason, "voice message") || r.n.n != 1 {
+		t.Fatalf("a voice note must be flagged for a person: replies=%d attention=%v %q notified=%d", r.m.count(), c.NeedsAttention, c.AttentionReason, r.n.n)
+	}
+	r.e.Process(Incoming{ID: "wamid.S", Phone: "919800000002", PushName: "Ravi", Media: "Sticker"})
+	if c, _ := r.cs.Get("919800000002"); c.NeedsAttention {
+		t.Fatal("a sticker needs no person")
+	}
+}
+
+// "typing..." is sent with a read receipt, so it must not appear with "mark as read" off.
+func TestNoReadReceiptWhenAutoReadIsOff(t *testing.T) {
+	r := newRig(t)
+	_ = r.cfg.Update(func(c *config.Config) error {
+		c.Automation.AutoRead, c.Automation.TypingSimulation, c.Automation.TypingDurationMs = false, true, 1
+		return nil
+	})
+	r.say(asha, "Asha", "hi")
+	if len(r.m.typing) != 0 || len(r.m.reads) != 0 || r.m.count() != 1 {
+		t.Fatalf("with auto read off: typing=%d reads=%d replies=%d", len(r.m.typing), len(r.m.reads), r.m.count())
+	}
+	_ = r.cfg.Update(func(c *config.Config) error { c.Automation.AutoRead = true; return nil })
+	r.say(asha, "Asha", "thanks")
+	if len(r.m.typing) != 1 {
+		t.Fatal("with auto read on, typing is shown")
+	}
+}
+
+// The opt-out button on Meta's marketing templates arrives as "Stop promotions".
+func TestOptOutButtonAndLookalikes(t *testing.T) {
+	for _, s := range []string{"Stop promotions", "Unsubscribe me", "ＳＴＯＰ", "STOP\u200b", "please stop"} {
+		if !IsOptOut(s) {
+			t.Errorf("%q must opt out", s)
+		}
+	}
+	if IsOptOut("stop by the shop tomorrow") {
+		t.Error("a sentence that merely contains stop is not an opt-out")
+	}
+}
+
+// P4 and P5: customers ask in their own words, and look-alike letters do not hide STOP.
+func TestOptOutAndHandoverInOwnWords(t *testing.T) {
+	for _, s := range []string{"cancel", "QUIT", "STOP please", "stop it", "please stop messaging me",
+		"dont message me again", "Stop sending me these", "ЅТОР", "Ѕтор", "remove me from your list", "how do I unsubscribe?"} {
+		if !IsOptOut(s) {
+			t.Errorf("%q must opt out", s)
+		}
+	}
+	for _, s := range []string{"don't stop", "cancel my order please", "when does the bus stop", "stop by the shop tomorrow", "hi", "price"} {
+		if IsOptOut(s) {
+			t.Errorf("%q is not an opt-out", s)
+		}
+	}
+	for _, s := range []string{"AGENT please", "I want a human being", "can I talk to a real person", "аgent"} {
+		if !IsHandoverRequest(s) {
+			t.Errorf("%q must hand over", s)
+		}
+	}
+	for _, s := range []string{"thank you", "what are your hours", "привет"} {
+		if IsHandoverRequest(s) {
+			t.Errorf("%q is not a hand-over", s)
+		}
+	}
+}
+
+// D37: another bot repeating the same text must not keep Pulse replying.
+func TestRepeatedIdenticalMessagesStopReplies(t *testing.T) {
+	r := newRig(t)
+	for i := 0; i < 8; i++ {
+		r.say(asha, "Asha", "hi")
+	}
+	if n := r.m.count(); n == 0 || n > 2 {
+		t.Fatalf("8 identical messages got %d replies, want 1 or 2", n)
+	}
+	if c, _ := r.cs.Get(asha); c.BotPausedUntil == nil {
+		t.Fatal("the chat must be paused as a possible bot loop")
+	}
+}
+
+// S43: hidden control and direction characters are removed before storing.
+func TestCleanDisplayText(t *testing.T) {
+	if got := CleanDisplayText("Inv\u202efdp.exe\x00 line1\r\nline2", true); got != "Invfdp.exe line1\nline2" {
+		t.Errorf("message: %q", got)
+	}
+	if got := CleanDisplayText("Asha\nVerma\u2066", false); got != "Asha Verma" {
+		t.Errorf("name: %q", got)
+	}
+	if got := CleanDisplayText("👨\u200d👩\u200d👧", false); got != "👨\u200d👩\u200d👧" {
+		t.Errorf("emoji joiners must stay: %q", got)
 	}
 }

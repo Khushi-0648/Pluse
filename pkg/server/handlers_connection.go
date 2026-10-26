@@ -151,8 +151,10 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	}
 	detail := "WhatsApp Business API details removed; local data kept"
 	if req.DeleteData {
-		s.deleteAllCustomerData()
 		detail = "WhatsApp Business API details removed and all local messages, contacts and scheduled messages deleted"
+		if err := s.deleteAllCustomerData(); err != nil {
+			detail += " (not every file saved yet: " + err.Error() + "; retrying)"
+		}
 	}
 	if s.Engine != nil {
 		s.Engine.Reset()
@@ -178,7 +180,11 @@ func (s *Server) handleCloudWebhook(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		q := r.URL.Query()
 		if q.Get("hub.mode") != "subscribe" || !security.ConstantTimeEqual(q.Get("hub.verify_token"), snap.VerifyToken) {
-			security.LogAudit("CLOUD_WEBHOOK_REJECTED", clientIP(r), "unknown", "Webhook subscription check with a wrong verify token", "failed")
+			if !s.hookLimiter.AllowAPIRequest(clientIP(r)) {
+				writeError(w, http.StatusTooManyRequests, "Too many requests.")
+				return
+			}
+			s.logWebhookRejected(clientIP(r), "Webhook subscription check with a wrong verify token")
 			writeError(w, http.StatusForbidden, "Wrong verify token.")
 			return
 		}
@@ -194,11 +200,16 @@ func (s *Server) handleCloudWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		secret, _ := s.cfg.CloudAppSecret()
 		if !cloudapi.VerifySignature(secret, body, r.Header.Get("X-Hub-Signature-256")) {
+			// Only rejected calls count, so a flood of forged ones never delays Meta's.
+			if !s.hookLimiter.AllowAPIRequest(clientIP(r)) {
+				writeError(w, http.StatusTooManyRequests, "Too many requests.")
+				return
+			}
 			reason := "Webhook delivery with a missing or wrong signature"
 			if secret == "" {
 				reason = "Webhook delivery refused because the app secret is not saved in Settings > WhatsApp connection"
 			}
-			security.LogAudit("CLOUD_WEBHOOK_REJECTED", clientIP(r), "unknown", reason, "failed")
+			s.logWebhookRejected(clientIP(r), reason)
 			writeError(w, http.StatusUnauthorized, "Missing or wrong signature.")
 			return
 		}
@@ -214,6 +225,35 @@ func (s *Server) handleCloudWebhook(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST")
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed.")
 	}
+}
+
+// logWebhookRejected writes a refused webhook call to the activity log at most once a
+// minute, with how many more were refused since. Anyone who knows the tunnel address can
+// send such calls, and one entry each would push every older entry (sign-ins, password
+// changes, opt-outs) out of the size-limited log.
+func (s *Server) logWebhookRejected(ip, reason string) {
+	s.logRejected("CLOUD_WEBHOOK_REJECTED", ip, reason)
+}
+
+// logRejected writes a refused call of one kind (action) at most once a minute.
+func (s *Server) logRejected(action, ip, reason string) {
+	s.rejectMu.Lock()
+	if s.rejectLogged == nil {
+		s.rejectLogged, s.rejectSkipped = map[string]time.Time{}, map[string]int{}
+	}
+	now := time.Now()
+	if now.Sub(s.rejectLogged[action]) < time.Minute {
+		s.rejectSkipped[action]++
+		s.rejectMu.Unlock()
+		return
+	}
+	skipped := s.rejectSkipped[action]
+	s.rejectLogged[action], s.rejectSkipped[action] = now, 0
+	s.rejectMu.Unlock()
+	if skipped > 0 {
+		reason += fmt.Sprintf(" (and %d more refused calls in the minute before)", skipped)
+	}
+	security.LogAudit(action, ip, "unknown", reason, "failed")
 }
 
 // markWebhookSeen records, once, that Meta reached the webhook (a setup step).

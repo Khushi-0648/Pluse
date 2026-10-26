@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"whatsapp-automation/pkg/campaign"
-	"whatsapp-automation/pkg/history"
 	"whatsapp-automation/pkg/msgtemplate"
 	"whatsapp-automation/pkg/security"
 )
@@ -98,7 +97,7 @@ func (s *Server) handleTestCampaign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg := s.campaignMessage(req)
-	if err := msgtemplate.Validate(msg, "email", "notes"); err != nil || msg == "" {
+	if err := msgtemplate.ValidateOutgoing(msg, "email", "notes"); err != nil || msg == "" {
 		if err == nil {
 			err = errors.New("Write the message first.")
 		}
@@ -110,19 +109,21 @@ func (s *Server) handleTestCampaign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := s.cfg.Snapshot()
-	text, missing := msgtemplate.Render(msg, msgtemplate.Vars{Name: "Asha Verma", Phone: phone, Business: snap.Business, Extra: map[string]string{"email": "asha@example.com", "notes": "sample note"}})
+	text, missing := msgtemplate.Render(msg, msgtemplate.Vars{Name: "Asha Verma", Phone: phone, Business: snap.Business, Extra: map[string]string{"email": "asha@example.com", "notes": "sample note"}, Now: time.Now(), Location: msgtemplate.Location(snap.BusinessHours.Timezone)})
 	if len(missing) > 0 {
 		writeError(w, http.StatusBadRequest, msgtemplate.MissingError(missing).Error())
 		return
 	}
 	text = "[Test] " + text
-	id, err := s.Messenger.SendTextMessage(r.Context(), phone, text)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error()+testHint)
+	// The same checks as a message typed in the inbox (opt-out, blocked, test mode,
+	// practice mode, daily limit).
+	dryRun, ok := s.sendTest(w, r, phone, text)
+	if !ok {
 		return
 	}
-	if s.History != nil {
-		s.History.Record(history.MessageRecord{ID: id, Direction: history.DirectionOutgoing, Type: history.TypeDirectSend, Phone: phone, Text: text, Status: history.StatusSent, SentBy: actor(r)})
+	if dryRun {
+		writeOK(w, map[string]any{"dry_run": true, "message": practiceNote})
+		return
 	}
 	writeOK(w, map[string]any{"message": "Test sent to +" + phone + "."})
 }

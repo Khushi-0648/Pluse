@@ -11,6 +11,7 @@
     const wa = o.whatsapp || {};
     if (o.password_reset_at) out.push(html`<div class="notice warn">${icon('shield')}<div><p><strong>The admin password was reset with the reset tool on ${P.fmtDateTime(o.password_reset_at)}.</strong> If that was not you, change the password now (Settings &gt; Account) and check the activity log.</p></div></div>`);
     if (wa.problem) out.push(html`<div class="notice bad">${icon('alert')}<div><p><strong>${wa.problem}</strong></p></div></div>`);
+    else if (wa.warning && P.isAdmin()) out.push(html`<div class="notice warn">${icon('alert')}<div><p>${wa.warning} <a href="#/settings?tab=whatsapp">Open WhatsApp connection</a></p></div></div>`);
     if (o.automation.dry_run) out.push(html`<div class="notice info">${icon('info')}<div><p><strong>Practice mode is on.</strong> Automatic replies, campaigns and scheduled messages are shown in the inbox but not actually sent. Turn it off in Settings &gt; Safety.</p></div></div>`);
     if (o.automation.allow_list_only) out.push(html`<div class="notice warn">${icon('shield')}<div><p><strong>Test mode is on.</strong> Pulse only replies to and sends to the test numbers listed in Settings &gt; Safety.</p></div></div>`);
     return out;

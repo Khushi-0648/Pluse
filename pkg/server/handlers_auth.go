@@ -1,9 +1,12 @@
 package server
 
 import (
+	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"whatsapp-automation/pkg/security"
 	"whatsapp-automation/pkg/version"
@@ -24,8 +27,11 @@ func (s *Server) page(w http.ResponseWriter, name string, code int, errMsg strin
 	_ = pageTmpl.ExecuteTemplate(w, name, pageData{Product: version.Product, Version: version.Version, Error: errMsg})
 }
 
-func (s *Server) setSession(w http.ResponseWriter, token string, maxAge int) {
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: maxAge})
+// setSession sets the session cookie. It is marked Secure when the browser reached
+// Pulse over https: directly, or through a configured trusted proxy that says so (S44).
+func (s *Server) setSession(w http.ResponseWriter, r *http.Request, token string, maxAge int) {
+	secure := r.TLS != nil || security.FromTrustedProxy(r) && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode, MaxAge: maxAge})
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -55,15 +61,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.page(w, "login.html", http.StatusForbidden, "This sign-in request came from another website and was blocked.")
 		return
 	}
-	if !s.limiter.BeginLoginAttempt(ip) {
-		security.LogAudit("LOGIN_LOCKED", ip, "unknown", "Too many failed sign-ins", "failed")
+	if !s.beginPasswordCheck(r, ip) {
+		if !security.IsLocalRequest(r) && s.limiter.LoginPausedForAll() {
+			s.logThrottled("LOGIN_LOCKED", ip, "Sign-in paused: too many wrong passwords from all callers")
+			s.page(w, "login.html", http.StatusTooManyRequests, "Too many wrong passwords were tried. Sign-in from other devices is paused for a while; on the computer running Pulse you can still sign in.")
+			return
+		}
+		s.logThrottled("LOGIN_LOCKED", ip, "Too many failed sign-ins")
 		s.page(w, "login.html", http.StatusTooManyRequests, "Too many wrong passwords. Wait 5 minutes and try again.")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	role, ok := s.cfg.Authenticate(r.FormValue("password"))
 	if !ok {
-		security.LogAudit("LOGIN_FAILED", ip, "unknown", "Wrong password", "failed")
+		s.logThrottled("LOGIN_FAILED", ip, "Wrong password")
 		s.page(w, "login.html", http.StatusUnauthorized, "That password is not correct.")
 		return
 	}
@@ -72,14 +83,48 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.limiter.ResetLoginFails(ip)
-	token, _ := s.sessions.CreateSessionWithRole(string(role))
-	s.setSession(w, token, 7*24*3600)
+	// A session from outside this computer (a phone through the tunnel) also ends after
+	// 12 hours without use (S9).
+	var idle time.Duration
+	if !security.IsLocalRequest(r) {
+		idle = remoteSessionIdle
+	}
+	token, _ := s.sessions.CreateSessionWithIdle(string(role), idle)
+	s.setSession(w, r, token, 7*24*3600)
 	security.LogAudit("LOGIN", ip, string(role), "Signed in", "success")
 	if s.cfg.MustChange() && role == "admin" {
 		http.Redirect(w, r, "/setup-password", http.StatusSeeOther)
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// remoteSessionIdle ends a session created from outside this computer after this long
+// without use.
+const remoteSessionIdle = 12 * time.Hour
+
+// logThrottled writes a failed sign-in of one kind (action) to the activity log at most
+// once a minute, with the number left out since then, so guessing through the public
+// tunnel cannot push older entries out of the log (S3).
+func (s *Server) logThrottled(action, ip, reason string) {
+	key := "auth:" + action
+	s.rejectMu.Lock()
+	if s.rejectLogged == nil {
+		s.rejectLogged, s.rejectSkipped = map[string]time.Time{}, map[string]int{}
+	}
+	now := time.Now()
+	if now.Sub(s.rejectLogged[key]) < time.Minute {
+		s.rejectSkipped[key]++
+		s.rejectMu.Unlock()
+		return
+	}
+	skipped := s.rejectSkipped[key]
+	s.rejectLogged[key], s.rejectSkipped[key] = now, 0
+	s.rejectMu.Unlock()
+	if skipped > 0 {
+		reason += fmt.Sprintf(" (and %d more in the minute before)", skipped)
+	}
+	security.LogAudit(action, ip, "unknown", reason, "failed")
 }
 
 func (s *Server) handleSetupPage(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +178,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if a.session != "" {
 		s.sessions.DestroySession(a.session)
 	}
-	s.setSession(w, "", -1)
+	s.setSession(w, r, "", -1)
 	security.LogAudit("LOGOUT", clientIP(r), actor(r), "Signed out of the dashboard", "success")
 	writeOK(w, map[string]any{"message": "Signed out"})
 }
@@ -143,5 +188,38 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"role": a.role, "csrf": s.sessions.GetCSRFToken(a.session), "product": version.Product, "version": version.Version,
 		"must_change_password": s.cfg.MustChange(),
+		// local: opened on the computer running Pulse (shortcuts, start with Windows and
+		// closing Pulse only work there, not from a phone).
+		"local": security.IsLocalRequest(r), "remote_access": s.cfg.Snapshot().Server.RemoteAccess,
 	})
+}
+
+// handleRemoteAccess switches using the dashboard from phones (through the public https
+// address) on or off. It needs the admin password, and a fixed https address to switch on.
+func (s *Server) handleRemoteAccess(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled  bool   `json:"enabled"`
+		Password string `json:"password"`
+	}
+	if !decodeJSON(w, r, &req) || !s.reauth(w, r, req.Password) {
+		return
+	}
+	if req.Enabled {
+		u, err := url.Parse(s.cfg.Snapshot().CloudAPI.PublicURL)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+			writeError(w, http.StatusBadRequest, "Enter your fixed https address first (Settings > WhatsApp connection > Public address, for example https://pulse.yourshop.com). Phones reach Pulse through it.")
+			return
+		}
+	}
+	if err := s.cfg.Update(func(c *configT) error { c.Server.RemoteAccess = req.Enabled; return nil }); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.applyTrustedProxies()
+	state := "off"
+	if req.Enabled {
+		state = "on"
+	}
+	security.LogAudit("REMOTE_ACCESS", clientIP(r), actor(r), "Using the dashboard from phones and other devices switched "+state, "warning")
+	writeOK(w, map[string]any{"remote_access": req.Enabled, "address": s.cfg.Snapshot().CloudAPI.PublicURL})
 }

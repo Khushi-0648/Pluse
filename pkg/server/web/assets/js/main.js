@@ -1,10 +1,20 @@
 'use strict';
 (function () {
   const { html } = P;
-  let lastAttention = null;
+  let latestSince = null; // time of the newest hand-over request this tab has seen
   let lastHandoverAlertId = null;
 
+  let updateShown = false;
   P.applyOverview = (o) => {
+    // Pulse was updated while this tab stayed open: the old page code may not match the
+    // new server, so offer a reload (kept on screen until used).
+    if (o.version && P.session.version && o.version !== P.session.version && !updateShown) {
+      updateShown = true;
+      P.toast('Pulse was updated to version ' + o.version + '. Reload to use the new version.', {
+        timeout: 86400000,
+        action: { label: 'Reload', fn: () => window.location.reload() },
+      });
+    }
     const wa = o.whatsapp || {};
     const pill = P.$('#conn-pill');
     let cls = 'bad', text = 'Not connected';
@@ -41,17 +51,22 @@
       };
     }
 
-    const att = o.counts.needs_attention || 0;
-    if (lastAttention !== null && att > lastAttention) {
-      const who = (o.attention && o.attention[o.attention.length - 1]) || {};
-      const alertId = (who.phone || 'customer') + ':' + att;
+    // Alert on a request newer than any seen before, not on a higher count: the same
+    // customer asking again, or one request resolved while another arrives, still alerts.
+    const who = o.latest_attention || {};
+    const since = who.since ? Date.parse(who.since) || 0 : 0;
+    const isNew = latestSince !== null && since > latestSince;
+    if (latestSince === null || since > latestSince) latestSince = since;
+    if (isNew) {
+      const alertId = (who.phone || 'customer') + ':' + who.since;
       if (lastHandoverAlertId !== alertId) {
         lastHandoverAlertId = alertId;
         if (P.handoverChannel) P.handoverChannel.postMessage({ type: 'ALERT_SHOWN', id: alertId });
 
         P.playInAppChime();
 
-        const label = who.name ? who.name + ' asked for a person' : 'A customer asked for a person';
+        // Not every hand-over is a request: a voice note Pulse cannot read lands here too.
+        const label = (who.name || 'A customer') + ' needs a person' + (who.reason ? ': ' + who.reason : '');
         P.toast(label, {
           type: 'warn',
           timeout: 8000,
@@ -62,10 +77,12 @@
         });
       }
     }
-    lastAttention = att;
   };
 
   async function pollOverview() {
+    // A hidden tab does not poll: background requests would keep a phone session alive
+    // past its idle limit. The next visible poll catches up.
+    if (document.hidden) return;
     try { P.applyOverview(await P.get('/overview')); } catch (e) { /* shown by the page itself */ }
   }
 
@@ -99,10 +116,7 @@
     });
     if (!ok) return;
     try { await P.post('/logout'); } catch (e) { /* already signed out */ }
-    try {
-      localStorage.clear();
-      sessionStorage.clear();
-    } catch (e) { /* storage unavailable */ }
+    P.clearLocal();
     P.mount(P.$('#view'), '');
     window.location.replace('/login');
   });
@@ -116,7 +130,7 @@
   document.addEventListener('DOMContentLoaded', async () => {
     try {
       const me = await P.get('/me');
-      P.session = { csrf: me.csrf, role: me.role, product: me.product, version: me.version };
+      P.session = { csrf: me.csrf, role: me.role, product: me.product, version: me.version, local: me.local !== false, remoteAccess: !!me.remote_access };
     } catch (e) {
       P.mount(P.$('#view'), html`<div class="notice bad"><p>${e.message}</p></div>`);
       return;

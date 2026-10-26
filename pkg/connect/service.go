@@ -140,11 +140,11 @@ func (s *Service) middleware(next http.Handler) http.Handler {
 			h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 			h.Set("X-Frame-Options", "DENY")
 		}
-		lim := s.limiter
-		if r.URL.Path == "/webhook" {
-			lim = s.hooks // Meta's deliveries are counted apart
-		}
-		if !lim.AllowAPIRequest(security.GetClientIP(r)) {
+		// Meta's deliveries are not limited here: they all come from a few Meta addresses
+		// (or one, behind a local proxy), so counting them would let forged calls, or a
+		// busy hour, block real deliveries for every install. handleWebhook limits only
+		// the calls it rejects.
+		if r.URL.Path != "/webhook" && !s.limiter.AllowAPIRequest(security.GetClientIP(r)) {
 			writeError(w, http.StatusTooManyRequests, "Too many requests. Wait a minute and try again.")
 			return
 		}
@@ -434,7 +434,12 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !validSignature(s.cfg.AppSecret, body, r.Header.Get("X-Hub-Signature-256")) {
-		log.Printf("event=webhook_rejected ip=%s", security.GetClientIP(r))
+		ip := security.GetClientIP(r)
+		if !s.hooks.AllowAPIRequest(ip) { // only rejected calls count
+			writeError(w, http.StatusTooManyRequests, "Too many requests.")
+			return
+		}
+		log.Printf("event=webhook_rejected ip=%s", ip)
 		writeError(w, http.StatusUnauthorized, "Missing or wrong signature.")
 		return
 	}

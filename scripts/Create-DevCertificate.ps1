@@ -1,16 +1,22 @@
 # scripts/Create-DevCertificate.ps1
 # Creates a self-signed code-signing certificate for local testing,
 # exports .cer / .pfx, adds to TrustedPublisher, and signs whatsapp-auto.exe.
+# For your own test machine only: never ship the .pfx or ask customers to trust the .cer.
 
 param(
     [string]$SubjectName = "PulseAutomation",
     [string]$ExportDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "certs"),
-    [string]$PfxPassword = "PulseDev123!",
+    [securestring]$PfxPassword,
     [switch]$SignBinary = $true,
     [string]$BinaryPath = (Join-Path (Split-Path -Parent $PSScriptRoot) "whatsapp-auto-exe\whatsapp-auto.exe")
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not (Test-Path $BinaryPath)) {
+    # Customer package layout: the program sits next to the scripts folder.
+    $BinaryPath = Join-Path (Split-Path -Parent $PSScriptRoot) "whatsapp-auto.exe"
+}
 
 Write-Host "=== Creating Code Signing Certificate: CN=$SubjectName ===" -ForegroundColor Cyan
 
@@ -48,23 +54,25 @@ if ($ExportDir) {
     [System.IO.File]::WriteAllBytes($cerPath, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
     Write-Host "  Public cert (.cer): $cerPath" -ForegroundColor Gray
 
-    # Export PFX with private key
+    # Export PFX with private key, protected by a password you choose
+    if (-not $PfxPassword) { $PfxPassword = Read-Host "Choose a password for the .pfx file" -AsSecureString }
     $pfxPath = Join-Path $ExportDir "$SubjectName.pfx"
     $pfxBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $PfxPassword)
     [System.IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
-    Write-Host "  Private key (.pfx): $pfxPath (Password: $PfxPassword)" -ForegroundColor Gray
+    Write-Host "  Private key (.pfx): $pfxPath (keep it private; never commit or ship it)" -ForegroundColor Gray
 }
 
 # 3. Add to TrustedPublisher store
-try {
-    $cerPath = Join-Path $ExportDir "$SubjectName.cer"
-    & certutil -addstore -user TrustedPublisher $cerPath | Out-Null
+$cerPath = Join-Path $ExportDir "$SubjectName.cer"
+& certutil -addstore -user TrustedPublisher $cerPath | Out-Null
+if ($LASTEXITCODE -eq 0) {
     Write-Host "  Added to TrustedPublisher store." -ForegroundColor Green
-} catch {
-    Write-Warning "Could not register to TrustedPublisher: $($_.Exception.Message)"
+} else {
+    Write-Warning "Could not register to TrustedPublisher (certutil exit code $LASTEXITCODE)."
 }
 
 # 4. Sign binary if requested
+$signed = $false
 if ($SignBinary -and (Test-Path $BinaryPath)) {
     Write-Host "`nSigning executable: $BinaryPath" -ForegroundColor Cyan
     $tsUrl = "http://timestamp.digicert.com"
@@ -75,6 +83,7 @@ if ($SignBinary -and (Test-Path $BinaryPath)) {
         $sig = Set-AuthenticodeSignature -FilePath $BinaryPath -Certificate $cert -HashAlgorithm SHA256
     }
     
+    $signed = $sig.Status -in "Valid", "UnknownError"   # UnknownError: self-signed root not trusted yet
     Write-Host "  Signature Status:  $($sig.Status)" -ForegroundColor Green
     Write-Host "  Status Message:    $($sig.StatusMessage)" -ForegroundColor Gray
     
@@ -86,6 +95,10 @@ if ($SignBinary -and (Test-Path $BinaryPath)) {
     Write-Host "  Binary SHA-256:    $hash" -ForegroundColor Gray
 }
 
-Write-Host "`nLocal certificate created and executable signed successfully." -ForegroundColor Green
-Write-Host "To trust this self-signed certificate on your Windows machine:" -ForegroundColor Cyan
-Write-Host "  Right-click 'certs\$SubjectName.cer' > 'Install Certificate' > 'Local Machine' > 'Place in: Trusted Root Certification Authorities'" -ForegroundColor Gray
+if ($signed) {
+    Write-Host "`nLocal certificate created and executable signed." -ForegroundColor Green
+} else {
+    Write-Warning "Certificate created, but $BinaryPath was NOT signed."
+}
+Write-Host "This certificate is for testing on this machine only. Anyone holding the .pfx can sign programs" -ForegroundColor Yellow
+Write-Host "that every machine trusting the .cer will accept. Use a public CA certificate for releases." -ForegroundColor Yellow

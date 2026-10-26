@@ -4,6 +4,8 @@
   const st = { filter: 'all', search: '', list: [], phone: '', messages: [], sig: '', file: null, templates: [], older: false, contact: null };
 
   const statusLabel = { sent: 'Sent', delivered: 'Delivered', read: 'Read', failed: 'Failed', dry_run: 'Test only (not sent)' };
+  // A phone or tablet: its on-screen keyboard has no Shift key for a new line.
+  const touchKeyboard = () => window.matchMedia('(pointer: coarse)').matches && !window.matchMedia('(pointer: fine)').matches;
 
   function chatItem(c) {
     const unread = c.unread > 0;
@@ -19,28 +21,43 @@
     </button></li>`;
   }
 
+  /* The list is polled every few seconds: it is only redrawn when what it shows changed,
+     and a chat button that had the focus gets it back, so keyboard users are not thrown out. */
+  let listSig = '';
   function drawList() {
     const ul = P.$('#chat-list');
     if (!ul) return;
     const items = st.list;
+    let tpl;
     if (!items.length) {
       const msg = st.search ? 'No chats match your search.' : st.filter === 'unread' ? 'You have read everything.' : st.filter === 'attention' ? 'Nobody is waiting for a person.' : st.filter === 'unassigned' ? 'Every chat has someone handling it.' : 'New WhatsApp messages will appear here.';
-      P.mount(ul, html`<li>${P.empty('No conversations', msg)}</li>`);
-      return;
-    }
-    P.mount(ul, items.map(chatItem));
+      tpl = html`<li>${P.empty('No conversations', msg)}</li>`;
+    } else tpl = html`${items.map(chatItem)}`;
+    const sig = String(tpl);
+    if (sig === listSig && ul.childElementCount) return;
+    listSig = sig;
+    const had = document.activeElement && ul.contains(document.activeElement) ? document.activeElement.dataset.phone : null;
+    P.mount(ul, tpl);
+    if (had) { const b = P.$$('.chat-item', ul).find((x) => x.dataset.phone === had); if (b) b.focus(); }
   }
 
-  function conv() { return st.list.find((c) => c.phone === st.phone) || st.contact || { phone: st.phone }; }
+  function conv() {
+    const own = st.contact && st.contact.phone === st.phone ? st.contact : null;
+    return st.list.find((c) => c.phone === st.phone) || own || { phone: st.phone };
+  }
 
+  /* Only the chat that is still open may set st.contact: a slow answer for a chat the user
+     already left must not show (or let staff save) that customer's note on another chat. */
   async function loadContactInfo(phone) {
-    st.contact = null;
+    if (phone === st.phone) st.contact = null;
+    let info = null;
     try {
       const r = await P.get('/contacts/' + encodeURIComponent(phone));
       const c = r.contact;
       const paused = c.bot_paused_until && new Date(c.bot_paused_until) > new Date();
-      st.contact = { phone: c.phone, name: c.name, consent: c.consent, opted_out: c.is_dnd, in_window: r.in_window, bot_paused: !!paused, needs_attention: c.needs_attention, attention_reason: c.attention_reason, assigned_to: c.assigned_to || '', notes: c.notes || '' };
+      info = { phone: c.phone, name: c.name, consent: c.consent, opted_out: c.is_dnd, in_window: r.in_window, bot_paused: !!paused, needs_attention: c.needs_attention, attention_reason: c.attention_reason, assigned_to: c.assigned_to || '', notes: c.notes || '' };
     } catch (e) { /* not a saved contact yet */ }
+    if (phone === st.phone) st.contact = info;
   }
 
   function threadHead(c) {
@@ -112,7 +129,7 @@
       <div id="composer-notices">${composerNotices(c)}</div>
       <div id="attach-preview"></div>
       <label class="sr-only" for="chat-text">Message</label>
-      <textarea id="chat-text" name="message" rows="2" placeholder="Type a message. Enter sends, Shift+Enter adds a new line." ${c.opted_out ? P.raw('disabled') : ''}>${P.store.get('draft.' + c.phone, '')}</textarea>
+      <textarea id="chat-text" name="message" rows="2" placeholder="${touchKeyboard() ? 'Type a message, then press Send.' : 'Type a message. Enter sends, Shift+Enter adds a new line.'}" ${c.opted_out ? P.raw('disabled') : ''}>${P.store.get('draft.' + c.phone, '')}</textarea>
       <div class="row">
         <input type="file" id="chat-file" accept="image/png,image/jpeg,image/webp,application/pdf" data-change="chat-file" hidden>
         <button class="btn small" type="button" data-action="chat-attach">${icon('clip', 'icon-sm')}Attach</button>
@@ -144,7 +161,8 @@
       const nb = P.$('#thread-body');
       nb.scrollTop = nb.scrollHeight;
       const ta = P.$('#chat-text');
-      ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); ta.form.requestSubmit(); } });
+      // Phone keyboards have no Shift+Enter: there Enter adds a new line and Send sends.
+      ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !touchKeyboard()) { e.preventDefault(); ta.form.requestSubmit(); } });
       ta.addEventListener('input', () => P.store.set('draft.' + st.phone, ta.value));
       if (window.matchMedia('(min-width: 861px)').matches) ta.focus();
       drawAttachment();
@@ -153,7 +171,14 @@
     if (!st.sig || typeof st.sig !== 'object') st.sig = { state: '', msgs: '' };
     if (st.sig.state !== stateSig) {
       st.sig.state = stateSig;
-      P.mount(P.$('#thread-head'), threadHead(c));
+      const head = P.$('#thread-head');
+      const f = document.activeElement && head.contains(document.activeElement) ? document.activeElement : null;
+      const key = f ? (f.getAttribute('data-action') || f.getAttribute('href') || '') : '';
+      P.mount(head, threadHead(c));
+      if (f) {
+        const again = P.$$('button, a', head).find((x) => (x.getAttribute('data-action') || x.getAttribute('href') || '') === key) || P.$('button, a', head);
+        if (again) again.focus();
+      }
       P.mount(P.$('#composer-notices'), composerNotices(c));
       const ta = P.$('#chat-text');
       const sendBtn = P.$('.composer button[type="submit"]');
@@ -190,20 +215,30 @@
     }
   }
 
+  // Only the newest list request may draw: an older search or filter answer (or a poll)
+  // that arrives late must not replace it.
+  let listSeq = 0;
   async function loadList() {
+    const seq = ++listSeq;
     const q = new URLSearchParams({ filter: st.filter, search: st.search });
-    st.list = await P.get('/conversations?' + q.toString());
+    const list = await P.get('/conversations?' + q.toString());
+    if (seq !== listSeq) return;
+    st.list = list;
     drawList();
   }
 
+  const PAGE = 100;
   async function loadThread(force) {
     if (!st.phone) { drawThread(force); return; }
     const phone = st.phone;
-    const latest = await P.get('/messages?limit=100&phone=' + encodeURIComponent(phone));
+    // One extra message tells whether older ones exist, so exactly 100 shows no dead button.
+    let latest = await P.get('/messages?limit=' + (PAGE + 1) + '&phone=' + encodeURIComponent(phone));
     if (phone !== st.phone) return; // the user opened another chat meanwhile
+    const more = latest.length > PAGE;
+    latest = latest.slice(0, PAGE);
     if (force) {
       st.messages = latest;
-      st.older = latest.length === 100;
+      st.older = more;
     } else {
       // Keep older pages the user already loaded below the refreshed newest page.
       const cutoff = latest.length ? new Date(latest[latest.length - 1].timestamp) : null;
@@ -219,44 +254,57 @@
   }
 
   async function openChat(phone) {
+    const page = P.renderToken; // the inbox page this chat was opened on
     st.phone = phone;
     st.file = null;
     st.sig = '';
     await loadContactInfo(phone);
+    // Another chat was opened meanwhile, or the user left the inbox: then the address bar
+    // belongs to the other page and this chat was never seen, so it is not marked read.
+    if (phone !== st.phone || page !== P.renderToken) return;
     history.replaceState(null, '', '#/inbox?phone=' + encodeURIComponent(phone) + (st.filter !== 'all' ? '&filter=' + st.filter : ''));
     P.$$('.chat-item').forEach((b) => b.setAttribute('aria-current', b.dataset.phone === phone ? 'true' : 'false'));
     await loadThread(true);
+    if (phone !== st.phone || page !== P.renderToken) return;
     P.post('/conversations/read', { phone }).then(loadList).catch(() => {});
   }
 
+  /* The chat, text and file are taken when Send is pressed. If the user switches chats
+     while it sends, only the sent chat's draft is cleared; the open chat is left alone. */
   async function send() {
     const ta = P.$('#chat-text');
     const text = ta.value.trim();
-    if (!text && !st.file) { ta.focus(); return; }
+    const phone = st.phone, file = st.file;
+    if (!text && !file) { ta.focus(); return; }
     let body;
-    if (st.file) {
+    if (file) {
       body = new FormData();
-      body.append('to', st.phone);
+      body.append('to', phone);
       body.append('message', text);
-      body.append('file', st.file);
-    } else body = { to: st.phone, message: text };
+      body.append('file', file);
+    } else body = { to: phone, message: text };
     const r = await P.post('/messages/send', body);
     if (r && r.dry_run) P.toast(r.message);
-    ta.value = '';
-    P.store.del('draft.' + st.phone);
+    P.store.del('draft.' + phone);
+    if (phone !== st.phone) { loadList().catch(P.error); return; }
+    const box = P.$('#chat-text');
+    if (box) box.value = '';
     st.file = null;
     drawAttachment();
     await loadThread(true);
-    loadList();
+    loadList().catch(P.error);
   }
 
   P.form('chat-send', () => send());
   P.form('chat-meta', async (form, d) => {
-    const r = await P.post('/conversations/meta', { phone: st.phone, assigned_to: d.assigned_to, notes: d.notes });
-    if (st.contact) { st.contact.assigned_to = r.assigned_to; st.contact.notes = r.notes; }
+    const phone = st.phone;
+    await P.post('/conversations/meta', { phone, assigned_to: d.assigned_to, notes: d.notes });
     P.toast('Saved.');
-    P.mount(P.$('#thread-meta'), threadMeta());
-    loadList();
+    // Saving creates the contact when the chat had none, so read it back: otherwise the
+    // form would redraw empty and the next save would erase the note just saved.
+    await loadContactInfo(phone);
+    if (phone === st.phone) P.mount(P.$('#thread-meta'), threadMeta());
+    return loadList();
   });
   P.act('chat-assign-me', async () => {
     let me = P.store.get('myName', '');
@@ -296,9 +344,14 @@
   P.act('chat-older', async (btn) => {
     const oldest = st.messages[st.messages.length - 1];
     if (!oldest) return;
-    const more = await P.busy(btn, () => P.get('/messages?limit=100&phone=' + encodeURIComponent(st.phone) + '&before=' + encodeURIComponent(oldest.timestamp)));
-    st.messages = st.messages.concat(more);
-    st.older = more.length === 100;
+    const phone = st.phone;
+    // until= includes messages that share the oldest one's timestamp; known ones are dropped.
+    const raw = await P.busy(btn, () => P.get('/messages?limit=' + (PAGE + 2) + '&phone=' + encodeURIComponent(phone) + '&until=' + encodeURIComponent(oldest.timestamp)));
+    if (!raw || phone !== st.phone) return;
+    const have = new Set(st.messages.map((m) => m.id));
+    const fresh = raw.filter((m) => !have.has(m.id));
+    st.messages = st.messages.concat(fresh.slice(0, PAGE));
+    st.older = raw.length === PAGE + 2 && fresh.length > 0; // a full answer means more may exist
     st.sig = '';
     drawThread(false);
   });
@@ -316,10 +369,10 @@
   P.act('inbox-filter', (el) => {
     st.filter = el.dataset.filter;
     P.$$('[data-action="inbox-filter"]').forEach((b) => b.setAttribute('aria-pressed', String(b === el)));
-    loadList();
+    loadList().catch(P.error);
   });
   let searchTimer = null;
-  P.change('inbox-search', (el) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { st.search = el.value.trim(); loadList(); }, 250); });
+  P.change('inbox-search', (el) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { st.search = el.value.trim(); loadList().catch(P.error); }, 250); });
 
   P.act('new-message', async () => {
     let contacts = [];
@@ -335,7 +388,8 @@
     });
   });
   P.form('new-message', async (form, data) => {
-    const phone = data.to.replace(/[^0-9]/g, '');
+    let phone = data.to.replace(/[^0-9]/g, '');
+    if (phone.startsWith('00') && phone.length > 10) phone = phone.slice(2); // 0091... is +91..., as the server stores it
     if (phone.length < 7) { P.fieldError(form, 'to', 'Enter a phone number with country code.'); return; }
     P.store.set('draft.' + phone, data.message);
     P.$('[data-modal-close]', form.closest('.modal')).click();

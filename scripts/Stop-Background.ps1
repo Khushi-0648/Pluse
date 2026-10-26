@@ -1,11 +1,12 @@
 # scripts/Stop-Background.ps1
-# Closes a running Pulse normally, so messages are saved and the WhatsApp session file
-# is encrypted. Only if it does not close within 20 seconds is it stopped by force.
+# Closes the Pulse started from this folder normally, so messages are saved. Only if it
+# does not close within 20 seconds is it stopped by force. Other copies are left alone.
 
 $program = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $program "whatsapp-auto.exe"
+function Get-Pulse { Get-Process -Name "whatsapp-auto" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } }
 
-if (-not (Get-Process -Name "whatsapp-auto" -ErrorAction SilentlyContinue)) {
+if (-not (Get-Pulse)) {
     Write-Host "Pulse is not running." -ForegroundColor Gray
     exit 0
 }
@@ -17,11 +18,11 @@ if (Test-Path $exe) {
     Pop-Location
 }
 
-for ($i = 0; $i -lt 20 -and (Get-Process -Name "whatsapp-auto" -ErrorAction SilentlyContinue); $i++) {
+for ($i = 0; $i -lt 20 -and (Get-Pulse); $i++) {
     Start-Sleep -Seconds 1
 }
 
-$left = Get-Process -Name "whatsapp-auto" -ErrorAction SilentlyContinue
+$left = Get-Pulse
 if ($left) {
     Write-Host "Pulse did not close by itself; stopping it now. Changes from the last second may be lost." -ForegroundColor Yellow
     $left | Stop-Process -Force

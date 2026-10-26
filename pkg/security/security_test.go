@@ -29,6 +29,8 @@ func TestValidateWebhookURLBlocksLocalTargets(t *testing.T) {
 		"http://127.0.0.1/x", "http://localhost:8085/", "http://169.254.169.254/latest", "http://10.0.0.5/",
 		"http://192.168.1.10/", "http://0.0.0.0:8085/", "http://[::]:8085/", "http://[::1]/", "http://[::ffff:127.0.0.1]/",
 		"http://100.64.1.1/", "ftp://example.com/", "http://user:pass@example.com/", "http://printer.local/",
+		// IPv6 wrappers around 127.0.0.1 / 10.0.0.1 (IPv4-compatible, 6to4, Teredo) and site-local.
+		"http://[::7f00:1]/", "http://[2002:a00:1::]/", "http://[2001:0:a00:1::]/", "http://[fec0::1]/",
 	}
 	for _, u := range blocked {
 		if ValidateWebhookURL(u) == nil {
@@ -46,6 +48,23 @@ func TestSafeHTTPClientRefusesLoopbackAtConnectTime(t *testing.T) {
 	_, err := SafeHTTPClient(2 * time.Second).Get(ts.URL)
 	if err == nil || !strings.Contains(err.Error(), "blocked") {
 		t.Fatalf("expected the dialer to block loopback, got %v", err)
+	}
+}
+
+// A redirect carries the signature headers (and 307/308 the body), so it may not leave
+// the configured host or drop from https to http.
+func TestSafeHTTPClientRedirectRules(t *testing.T) {
+	check := SafeHTTPClient(time.Second).CheckRedirect
+	req := func(u string) *http.Request { r, _ := http.NewRequest(http.MethodPost, u, nil); return r }
+	first := []*http.Request{req("https://hooks.example.com/a")}
+	if err := check(req("https://hooks.example.com/b"), first); err != nil {
+		t.Fatalf("a redirect on the same host must be followed: %v", err)
+	}
+	if check(req("https://other.example.net/b"), first) == nil {
+		t.Fatal("a redirect to another host must be refused")
+	}
+	if check(req("http://hooks.example.com/b"), first) == nil {
+		t.Fatal("a redirect from https to http must be refused")
 	}
 }
 
@@ -98,6 +117,14 @@ func TestHostAndOriginChecks(t *testing.T) {
 	}
 	if !IsAllowedOrigin("http://127.0.0.1:8085", "127.0.0.1:8085") || IsAllowedOrigin("https://evil.com", "127.0.0.1:8085") {
 		t.Error("origin check is wrong")
+	}
+	// Another local program on https (port 443) is a different site from Pulse on 8085;
+	// a reverse proxy (Host without a port) still accepts https.
+	if IsAllowedOrigin("https://localhost", "127.0.0.1:8085") || IsAllowedOrigin("http://localhost:443", "localhost:8085") {
+		t.Error("a page on port 443 must not pass for Pulse on another port")
+	}
+	if !IsAllowedOrigin("https://pulse.example.com", "pulse.example.com") {
+		t.Error("an https page behind a reverse proxy must still pass")
 	}
 }
 
@@ -152,12 +179,50 @@ func TestIsLocalRequestRefusesProxiedRequests(t *testing.T) {
 	if !IsLocalRequest(r) {
 		t.Fatal("a direct loopback request is local")
 	}
-	for _, h := range []string{"X-Forwarded-For", "Forwarded", "X-Real-IP"} {
+	for _, h := range []string{"X-Forwarded-For", "Forwarded", "X-Real-IP", "Via", "X-Original-Host", "True-Client-IP"} {
 		r := httptest.NewRequest("GET", "/", nil)
 		r.RemoteAddr = "127.0.0.1:5000"
 		r.Header.Set(h, "203.0.113.9")
 		if IsLocalRequest(r) {
 			t.Errorf("a request with %s came through a proxy and is not local", h)
+		}
+		if !ViaUntrustedProxy(r) {
+			t.Errorf("a request with %s must count as coming through an untrusted proxy", h)
+		}
+	}
+}
+
+// Behind a trusted proxy only X-Forwarded-For counts, read from the right: X-Real-IP and
+// CF-Connecting-IP are often passed through from the caller unchanged.
+func TestClientIPCannotBeSpoofedBehindATrustedProxy(t *testing.T) {
+	if err := AddTrustedProxy("127.0.0.1/32"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ResetTrustedProxies)
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "127.0.0.1:5000"
+	r.Header.Set("X-Real-IP", "1.1.1.1")
+	r.Header.Set("CF-Connecting-IP", "2.2.2.2")
+	r.Header.Set("X-Forwarded-For", "9.9.9.9, 203.0.113.7") // the caller wrote 9.9.9.9; the proxy added 203.0.113.7
+	if got := GetClientIP(r); got != "203.0.113.7" {
+		t.Fatalf("got %s, want the address the trusted proxy saw", got)
+	}
+	r.Header.Set("X-Forwarded-For", "203.0.113.7, 127.0.0.1") // a chain of two local proxies
+	if got := GetClientIP(r); got != "203.0.113.7" {
+		t.Fatalf("trusted proxies in the chain are skipped: got %s", got)
+	}
+}
+
+// S24: one extra letter or a keyboard walk does not make a weak password strong.
+func TestPasswordVariantsRejected(t *testing.T) {
+	for _, p := range []string{"Hello2024x", "hello2024x", "1q2w3e4r5t", "1qaz2wsx3edc", "xSummer2026"} {
+		if ValidatePassword(p) == nil {
+			t.Errorf("%q must be rejected", p)
+		}
+	}
+	for _, p := range []string{"Gulmohar7Tiffin", "tea4Marigold9", "Kx7mPq2vLw"} {
+		if err := ValidatePassword(p); err != nil {
+			t.Errorf("%q should be accepted: %v", p, err)
 		}
 	}
 }

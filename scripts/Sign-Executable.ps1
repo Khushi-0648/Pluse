@@ -13,9 +13,11 @@
 #       .\scripts\Sign-Executable.ps1 -Thumbprint B76B717440F111E5CFE3D54E743EAA54C573AFD7
 #   - Self-signed / local test certificate:
 #       .\scripts\Sign-Executable.ps1 -Thumbprint <THUMBPRINT> -AllowSelfSigned
+#   - Several programs with one password prompt (Build.bat signs x64, ARM64 and x86 so):
+#       .\scripts\Sign-Executable.ps1 -PfxPath C:\certs\pulse.pfx -BinaryPath a\whatsapp-auto.exe,b\whatsapp-auto.exe
 
 param(
-    [string]$BinaryPath = (Join-Path (Split-Path -Parent $PSScriptRoot) "whatsapp-auto-exe\whatsapp-auto.exe"),
+    [string[]]$BinaryPath = @(Join-Path (Split-Path -Parent $PSScriptRoot) "whatsapp-auto-exe\whatsapp-auto.exe"),
     [string]$PfxPath,
     [string]$Thumbprint,
     [string]$TimestampServer = "http://timestamp.digicert.com",
@@ -25,21 +27,55 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not (Test-Path $BinaryPath)) {
-    Write-Error "Program not found: $BinaryPath. Run Build.bat first."
-    exit 1
+# "powershell -File" passes "a,b,c" as one string, so a comma-separated list is split here.
+$BinaryPath = @($BinaryPath | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($BinaryPath.Count -eq 1 -and -not (Test-Path $BinaryPath[0])) {
+    # Customer package layout: the program sits next to the scripts folder.
+    $BinaryPath = @(Join-Path (Split-Path -Parent $PSScriptRoot) "whatsapp-auto.exe")
 }
-$BinaryPath = (Resolve-Path $BinaryPath).Path
+$resolved = @()
+foreach ($b in $BinaryPath) {
+    if (-not (Test-Path $b)) {
+        Write-Error "Program not found: $b. Run Build.bat first."
+        exit 1
+    }
+    $resolved += (Resolve-Path $b).Path
+}
+$BinaryPath = $resolved
 
+# Loads the .pfx. EphemeralKeySet keeps the private key in memory only, so no copy of it
+# is left in the user's key store; older .NET versions do not have it, and then the
+# default flags are used.
+function Open-Pfx([string]$path, [System.Security.SecureString]$password, [bool]$ephemeral) {
+    $type = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]
+    if ($ephemeral) {
+        if (-not [Enum]::IsDefined($type, 'EphemeralKeySet')) { return $null }
+        $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+    } else {
+        $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet
+    }
+    return New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($path, $password, $flags)
+}
+
+$pw = $null
+$ephemeralCert = $false
 if ($PfxPath) {
+    # Asked once, however many programs are signed.
     $pw = Read-Host "Password for $PfxPath" -AsSecureString
     $PfxPath = (Resolve-Path $PfxPath).Path
-    $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]'UserKeySet,PersistKeySet'
     try {
-        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($PfxPath, $pw, $flags)
+        $cert = Open-Pfx $PfxPath $pw $true
+        $ephemeralCert = [bool]$cert
     } catch {
-        Write-Error "Could not open $PfxPath. Check the password. ($($_.Exception.InnerException.Message))"
-        exit 1
+        $cert = $null # retried below with the default flags; a wrong password fails there too
+    }
+    if (-not $cert) {
+        try {
+            $cert = Open-Pfx $PfxPath $pw $false
+        } catch {
+            Write-Error "Could not open $PfxPath. Check the password. ($($_.Exception.InnerException.Message))"
+            exit 1
+        }
     }
 } elseif ($Thumbprint) {
     $cert = Get-ChildItem Cert:\CurrentUser\My, Cert:\LocalMachine\My -CodeSigningCert |
@@ -62,30 +98,59 @@ if ($cert.Subject -eq $cert.Issuer) {
     $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
     if (-not $chain.Build($cert) -and -not $AllowSelfSigned) {
         $why = ($chain.ChainStatus | ForEach-Object { $_.StatusInformation.Trim() }) -join "; "
-        Write-Warning "Certificate chain not trusted by default root store: $why"
+        Write-Error "Certificate chain is not trusted: $why. Use a public CA certificate, or -AllowSelfSigned for local tests."
+        exit 1
     }
 }
 
 if ($cert.NotAfter -lt (Get-Date)) { Write-Error "The certificate expired on $($cert.NotAfter)."; exit 1 }
 
-Write-Host "Signing $BinaryPath" -ForegroundColor Cyan
-Write-Host "  with: $($cert.Subject)" -ForegroundColor Gray
+Write-Host "Signing with: $($cert.Subject)" -ForegroundColor Gray
 
-if (-not $NoTimestamp) {
-    try {
-        $sig = Set-AuthenticodeSignature -FilePath $BinaryPath -Certificate $cert -HashAlgorithm SHA256 -TimestampServer $TimestampServer -IncludeChain All -ErrorAction Stop
-    } catch {
-        Write-Warning "Timestamp server unreachable. Signing without timestamp..."
-        $sig = Set-AuthenticodeSignature -FilePath $BinaryPath -Certificate $cert -HashAlgorithm SHA256
+function Sign-One([string]$file, $withCert) {
+    if ($NoTimestamp) {
+        return Set-AuthenticodeSignature -FilePath $file -Certificate $withCert -HashAlgorithm SHA256 -ErrorAction Stop
     }
-} else {
-    $sig = Set-AuthenticodeSignature -FilePath $BinaryPath -Certificate $cert -HashAlgorithm SHA256
+    try {
+        return Set-AuthenticodeSignature -FilePath $file -Certificate $withCert -HashAlgorithm SHA256 -TimestampServer $TimestampServer -IncludeChain All -ErrorAction Stop
+    } catch {
+        # Without a timestamp the signature stops being valid when the certificate
+        # expires, so a release must not be signed that way by accident.
+        throw "Signing or the timestamp server $TimestampServer failed ($($_.Exception.Message)). Try again later, or use -NoTimestamp for a local test build only."
+    }
 }
 
-Write-Host "  -> Signature status: $($sig.Status)" -ForegroundColor Green
+foreach ($file in $BinaryPath) {
+    Write-Host "Signing $file" -ForegroundColor Cyan
+    $sig = $null
+    try {
+        $sig = Sign-One $file $cert
+    } catch {
+        $why = "$_"
+    }
+    if ((-not $sig -or $sig.Status -ne "Valid") -and $ephemeralCert) {
+        # Some Windows signing components cannot use an in-memory key: load the
+        # certificate with the default flags and try once more.
+        Write-Warning "Signing with an in-memory key did not work; retrying with the default key storage."
+        $ephemeralCert = $false
+        $cert = Open-Pfx $PfxPath $pw $false
+        $sig = $null
+        try { $sig = Sign-One $file $cert } catch { $why = "$_" }
+    }
+    if (-not $sig) {
+        Write-Error $why
+        exit 1
+    }
 
-# Update checksum file
-$hash = (Get-FileHash -Path $BinaryPath -Algorithm SHA256).Hash.ToLower()
-$sums = Join-Path (Split-Path -Parent $BinaryPath) "SHA256SUMS.txt"
-"$hash  $([IO.Path]::GetFileName($BinaryPath))" | Set-Content -Path $sums -Encoding ascii
-Write-Host "  -> SHA-256 written to $sums" -ForegroundColor Green
+    Write-Host "  -> Signature status: $($sig.Status)" -ForegroundColor Green
+    if ($sig.Status -ne "Valid" -and -not $AllowSelfSigned) {
+        Write-Error "Signing did not produce a valid signature: $($sig.StatusMessage)"
+        exit 1
+    }
+
+    # Update checksum file
+    $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
+    $sums = Join-Path (Split-Path -Parent $file) "SHA256SUMS.txt"
+    "$hash  $([IO.Path]::GetFileName($file))" | Set-Content -Path $sums -Encoding ascii
+    Write-Host "  -> SHA-256 written to $sums" -ForegroundColor Green
+}

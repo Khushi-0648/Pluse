@@ -18,16 +18,39 @@ P.html = (strings, ...vals) => {
   return new Raw(out);
 };
 P.mount = (el, tpl) => { if (el) el.innerHTML = renderVal(tpl); return el; };
+/* For polled content: redraws only when the markup changed, and then gives the focus back
+   to the same control (matched by data-action with data-id or data-phone) and reopens
+   <details> that were open, so a keyboard user or an expanded section is not lost. */
+const lastDrawn = new WeakMap();
+P.redraw = (el, tpl) => {
+  if (!el) return el;
+  const s = renderVal(tpl);
+  if (lastDrawn.get(el) === s && el.innerHTML !== '') return el;
+  const keyOf = (x) => [x.getAttribute('data-action') || x.id || x.getAttribute('href') || x.tagName, x.getAttribute('data-id') || '', x.getAttribute('data-phone') || ''].join('|');
+  const a = document.activeElement;
+  const focusKey = a && a !== el && el.contains(a) ? keyOf(a) : null;
+  const open = P.$$('details', el).map((d) => d.open);
+  el.innerHTML = s;
+  lastDrawn.set(el, s);
+  P.$$('details', el).forEach((d, i) => { if (open[i]) d.open = true; });
+  if (focusKey) { const b = P.$$('button, a, input, select, textarea, summary, [tabindex]', el).find((x) => keyOf(x) === focusKey); if (b) b.focus(); }
+  return el;
+};
 P.icon = (name, cls) => P.raw(`<svg class="icon ${cls || ''}" aria-hidden="true"><use href="#i-${P.esc(name)}"/></svg>`);
 P.$ = (sel, root) => (root || document).querySelector(sel);
 P.$$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
 /* ---------- Local storage that never throws ---------- */
+/* Chat drafts (customer number and unsent text) live in sessionStorage: kept in memory
+   while the window is open and never written to disk like localStorage (S33). */
+const storeFor = (k) => (k.startsWith('draft.') ? sessionStorage : localStorage);
 P.store = {
-  get(k, d) { try { const v = localStorage.getItem('pulse.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem('pulse.' + k, JSON.stringify(v)); } catch (e) { /* storage unavailable */ } },
-  del(k) { try { localStorage.removeItem('pulse.' + k); } catch (e) { /* ignore */ } },
+  get(k, d) { try { const v = storeFor(k).getItem('pulse.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { storeFor(k).setItem('pulse.' + k, JSON.stringify(v)); } catch (e) { /* storage unavailable */ } },
+  del(k) { try { storeFor(k).removeItem('pulse.' + k); } catch (e) { /* ignore */ } },
 };
+/* Chat drafts and remembered numbers hold customer data: drop them when the session ends. */
+P.clearLocal = () => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) { /* storage unavailable */ } };
 
 /* ---------- API client ---------- */
 P.session = { csrf: '', role: '', product: 'Pulse', version: '' };
@@ -46,7 +69,7 @@ P.api = async function (method, path, body, opts) {
     err.status = 0;
     throw err;
   }
-  if (res.status === 401) { window.location.href = '/login'; throw new Error('Signed out'); }
+  if (res.status === 401) { P.clearLocal(); window.location.href = '/login'; throw new Error('Signed out'); }
   const ct = res.headers.get('Content-Type') || '';
   const data = ct.includes('application/json') ? await res.json().catch(() => ({})) : await res.text();
   if (!res.ok || (data && data.ok === false && data.error)) {
@@ -61,21 +84,39 @@ P.post = (p, b, o) => P.api('POST', p, b || {}, o);
 P.patch = (p, b, o) => P.api('PATCH', p, b || {}, o);
 P.del = (p, o) => P.api('DELETE', p, null, o);
 
-/* Download a file from an authenticated GET endpoint. */
-P.download = (path) => {
+/* Download a file from an authenticated GET endpoint. Fetched first, so an error is shown
+   as a message instead of the browser leaving the dashboard for a JSON error page. */
+P.download = async (path) => {
+  let res;
+  try {
+    res = await fetch('/api/v1' + path, { credentials: 'same-origin' });
+  } catch (e) {
+    throw new Error('Pulse is not responding. Check that the app is still running.');
+  }
+  if (res.status === 401) { P.clearLocal(); window.location.href = '/login'; throw new Error('Signed out'); }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'The download failed (' + res.status + ').');
+  }
+  const m = /filename="?([^";]+)"?/i.exec(res.headers.get('Content-Disposition') || '');
+  const url = URL.createObjectURL(await res.blob());
   const a = document.createElement('a');
-  a.href = '/api/v1' + path;
-  a.rel = 'noopener';
+  a.href = url;
+  a.download = m ? m[1] : path.split('?')[0].split('/').pop();
   document.body.appendChild(a);
   a.click();
   a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 };
 
 /* ---------- Formatting ---------- */
 P.fmtNum = (n) => (n == null ? '-' : Number(n).toLocaleString());
 P.fmtPct = (r) => (r == null ? 'No data yet' : Math.round(r * 1000) / 10 + '%');
 P.fmtTime = (iso) => { if (!iso) return ''; const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); };
-P.fmtDate = (iso) => { if (!iso) return ''; const d = new Date(iso); return isNaN(d) || d.getFullYear() < 2000 ? '' : d.toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' }); };
+/* A bare day (2026-10-24) is that day here: new Date() would read it as UTC midnight,
+   which is the evening before in time zones west of UTC. */
+const toDate = (iso) => new Date(/^\d{4}-\d{2}-\d{2}$/.test(iso) ? iso + 'T00:00:00' : iso);
+P.fmtDate = (iso) => { if (!iso) return ''; const d = toDate(iso); return isNaN(d) || d.getFullYear() < 2000 ? '' : d.toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' }); };
 P.fmtDateTime = (iso) => { const d = P.fmtDate(iso); return d ? d + ' ' + P.fmtTime(iso) : ''; };
 P.fmtRel = (iso) => {
   if (!iso) return '';
@@ -98,8 +139,8 @@ P.toast = (msg, opts) => {
   const o = Object.assign({ type: 'info', timeout: 4500 }, opts || {});
   const root = P.$('#toasts');
   const t = document.createElement('div');
-  t.className = 'toast' + (o.type === 'error' ? ' error' : '');
-  t.setAttribute('role', o.type === 'error' ? 'alert' : 'status');
+  t.className = 'toast' + (o.type === 'error' || o.type === 'warn' ? ' ' + o.type : '');
+  t.setAttribute('role', o.type === 'info' ? 'status' : 'alert');
   const span = document.createElement('span');
   span.className = 'grow';
   span.textContent = msg;
@@ -121,14 +162,57 @@ P.error = (e) => P.toast(e && e.message ? e.message : String(e), { type: 'error'
 /* In-App Audio Synthesizer (Web Audio API)
  * Plays a gentle, pleasant two-tone chime directly inside the browser tab.
  * Does not leak to the Windows desktop and does not require external audio assets. */
+/* Browsers keep audio suspended until the user interacts with the page. The context is
+   created and resumed on the first click or key press, so a hand-over alert that arrives
+   later (from a poll, with no gesture) can still be heard. */
+const audioCtx = () => {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return null;
+  try { return P._audioCtx || (P._audioCtx = new AudioCtx()); } catch (e) { return null; }
+};
+let soundNotice = null;
+const unlockAudio = () => {
+  if (P.store.get('inAppSound', true) === false) return;
+  const ctx = audioCtx();
+  if (!ctx) return;
+  const done = () => {
+    if (ctx.state !== 'running') return;
+    document.removeEventListener('pointerdown', unlockAudio, true);
+    document.removeEventListener('keydown', unlockAudio, true);
+    if (soundNotice) { soundNotice(); soundNotice = null; }
+  };
+  if (ctx.state === 'running') done();
+  else ctx.resume().then(done).catch(() => {});
+};
+document.addEventListener('pointerdown', unlockAudio, true);
+document.addEventListener('keydown', unlockAudio, true);
+/* Shown when an alert could not be heard: one click anywhere unlocks the sound. */
+const soundBlocked = () => {
+  /* The listeners are removed after the first unlock; the browser may suspend the audio
+     again later (tab in the background, device change), so "click anywhere" needs them
+     back. Adding the same listener twice is harmless. */
+  document.addEventListener('pointerdown', unlockAudio, true);
+  document.addEventListener('keydown', unlockAudio, true);
+  if (soundNotice) return;
+  const close = P.toast('Sound is blocked — click anywhere to enable', {
+    type: 'warn', timeout: 86400000,
+    action: { label: 'Enable sound', fn: () => { soundNotice = null; unlockAudio(); } },
+  });
+  soundNotice = () => { soundNotice = null; close(); };
+};
+
 P.playInAppChime = () => {
   if (P.store.get('inAppSound', true) === false) return;
+  const ctx = audioCtx();
+  if (!ctx) return;
+  if (ctx.state === 'running') { chime(ctx); return; }
+  // Without a gesture resume() can stay pending for ever: give it a moment, then say so.
+  let settled = false;
+  const t = setTimeout(() => { if (!settled) { settled = true; soundBlocked(); } }, 400);
+  ctx.resume().then(() => { if (ctx.state === 'running' && !settled) { settled = true; clearTimeout(t); chime(ctx); } }).catch(() => {});
+};
+function chime(ctx) {
   try {
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = P._audioCtx || (P._audioCtx = new AudioCtx());
-    if (ctx.state === 'suspended') ctx.resume();
-
     const vol = Number(P.store.get('inAppSoundVolume', 0.25));
     const now = ctx.currentTime;
 
@@ -154,9 +238,9 @@ P.playInAppChime = () => {
     osc2.start(now + 0.12);
     osc2.stop(now + 0.55);
   } catch (e) {
-    /* AudioContext unavailable or autoplay gated before gesture */
+    /* AudioContext unavailable */
   }
-};
+}
 
 /* Delete with an Undo window instead of a blocking dialog. */
 P.undoable = (label, commit, undo) => {
@@ -290,10 +374,21 @@ P.templateFields = (prefix) => P.html`<details class="full" data-template-fields
     <div class="field"><label for="${prefix}-tname">Template name</label><input type="text" id="${prefix}-tname" name="template_name" maxlength="512" placeholder="order_update" autocomplete="off"><span class="hint">Exactly as in WhatsApp Manager. The template must be approved by Meta.</span></div>
     <div class="field"><label for="${prefix}-tlang">Language code</label><input type="text" id="${prefix}-tlang" name="template_language" maxlength="8" placeholder="en" autocomplete="off"><span class="hint">For example en, en_US or hi.</span></div>
     <div class="field full"><label for="${prefix}-tparams">Values for {{1}}, {{2}}...</label><textarea id="${prefix}-tparams" name="template_params" rows="2" placeholder="{{first_name}}"></textarea><span class="hint">One per line, in order. You can use variables such as {{first_name}}. Leave empty if the template has no variables.</span></div>
+    <div class="field"><label for="${prefix}-theader">Header value (optional)</label><input type="text" id="${prefix}-theader" name="template_header" maxlength="1000" autocomplete="off"><span class="hint">Only if the template's text header has a {{1}}.</span></div>
+    <div class="field"><label for="${prefix}-tmedia">Header photo, video or document link (optional)</label><input type="url" id="${prefix}-tmedia" name="template_header_media" maxlength="2000" placeholder="https://example.com/offer.jpg" autocomplete="off"><span class="hint">Only if the template's header is a photo, video or document. A public https link.</span></div>
+    <div class="field full"><label for="${prefix}-tbuttons">Link button endings (optional)</label><textarea id="${prefix}-tbuttons" name="template_buttons" rows="2" placeholder="order/{{phone}}"></textarea><span class="hint">One line per button, in the template's button order, for buttons whose link ends in {{1}}. Leave a line empty for a button without a variable.</span></div>
   </div>
 </details>`;
+/* Button lines keep their position (an empty line is a button without a variable); the
+   server drops empty lines at the end. */
 P.templateFrom = (d) => (d.template_name && d.template_name.trim()
-  ? { name: d.template_name.trim(), language: (d.template_language || '').trim(), params: (d.template_params || '').split('\n').map((x) => x.trim()).filter(Boolean) }
+  ? {
+    name: d.template_name.trim(), language: (d.template_language || '').trim(),
+    params: (d.template_params || '').split('\n').map((x) => x.trim()).filter(Boolean),
+    header_params: (d.template_header || '').trim() ? [d.template_header.trim()] : [],
+    header_media: (d.template_header_media || '').trim(),
+    button_params: (d.template_buttons || '').split('\n').map((x) => x.trim()),
+  }
   : null);
 
 /* ---------- Forms ---------- */
@@ -363,7 +458,8 @@ P.view = (name, def) => { VIEWS[name] = def; };
 P.every = (ms, fn) => {
   const tok = P.renderToken;
   if (tok !== routeToken) return 0;
-  const id = setInterval(() => { if (tok !== routeToken) { clearInterval(id); return; } if (!document.hidden) fn(); }, ms);
+  // A failed poll is retried by the next tick; it must not surface as an unhandled rejection.
+  const id = setInterval(() => { if (tok !== routeToken) { clearInterval(id); return; } if (!document.hidden) Promise.resolve().then(fn).catch(() => {}); }, ms);
   pollers.push(id);
   return id;
 };

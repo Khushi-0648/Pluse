@@ -19,7 +19,7 @@ func TestVolume(t *testing.T) {
 		if i%2 == 1 {
 			dir = DirectionOutgoing
 		}
-		s.Record(MessageRecord{ID: fmt.Sprint("m", i), Direction: dir, Type: TypeAutoReply, Phone: fmt.Sprint(919800000000 + i%2000), Text: "hello there", Timestamp: start.Add(time.Duration(i) * time.Minute / 2)})
+		s.Record(MessageRecord{ID: fmt.Sprint("m", i), Direction: dir, Type: TypeAutoReply, Phone: fmt.Sprint(int64(919800000000) + int64(i%2000)), Text: "hello there", Timestamp: start.Add(time.Duration(i) * time.Minute / 2)})
 	}
 	t0 := time.Now()
 	convs := s.Conversations()

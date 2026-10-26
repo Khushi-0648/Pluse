@@ -147,6 +147,9 @@ type Runner struct {
 	campaigns []*Campaign
 	byMsg     map[string]*Recipient
 	saver     *securestore.Saver
+	// confirmed holds message IDs Meta reported (by label) while the send was still
+	// waiting for its answer; a send that then times out is recorded as sent with it.
+	confirmed map[string]string
 
 	sender   Sender
 	cfg      *config.Config
@@ -166,6 +169,15 @@ const maxCampaigns = 100
 func NewRunner(path string, s Sender, cfg *config.Config, cs *contacts.Store, hs *history.Store) (*Runner, error) {
 	r := &Runner{path: path, box: securestore.Default(), sender: s, cfg: cfg, contacts: cs, hist: hs, byMsg: map[string]*Recipient{}, wake: make(chan struct{}, 1)}
 	r.saver = securestore.NewSaver(time.Second, r.persist)
+	if rs, ok := s.(receiptSource); ok && cs != nil {
+		// Meta usually reports error 131050 (stopped marketing messages) later, in a
+		// delivery update, for any message: the customer is left out of later campaigns.
+		rs.OnReceipt(func(rc cloudapi.Receipt) {
+			if rc.Status == "failed" {
+				noteMarketingOptOut(cs, rc.Phone, rc.Code)
+			}
+		})
+	}
 	if path != "" {
 		data, err := r.box.ReadFile(path)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -188,7 +200,30 @@ func NewRunner(path string, s Sender, cfg *config.Config, cs *contacts.Store, hs
 		}
 		r.indexLocked(c)
 	}
+	if cs != nil {
+		cs.OnRenamed(r.RenamePhone)
+	}
 	return r, nil
+}
+
+// RenamePhone moves campaign recipients still waiting to be sent from the number Pulse
+// 2.0 saved for a contact to their real number (contacts.OnRenamed), so a paused or
+// unfinished campaign does not send to the mis-prefixed number.
+func (r *Runner) RenamePhone(oldPhone, newPhone string) {
+	r.mu.Lock()
+	changed := false
+	for _, c := range r.campaigns {
+		for i := range c.Recipients {
+			if x := &c.Recipients[i]; x.Phone == oldPhone && x.Status == RPending {
+				x.Phone = newPhone
+				changed = true
+			}
+		}
+	}
+	r.mu.Unlock()
+	if changed {
+		r.saver.Trigger()
+	}
 }
 
 func (r *Runner) indexLocked(c *Campaign) {
@@ -282,7 +317,12 @@ type Sample struct {
 	Text  string `json:"text"`
 }
 
-// DailyRemaining returns how many more messages may be sent today.
+// DailyWindowStart is where the daily limit's count starts: the last 24 hours, like
+// Meta's own messaging limit, rather than local midnight (which would allow twice the
+// limit around midnight).
+func DailyWindowStart(now time.Time) time.Time { return now.Add(-24 * time.Hour) }
+
+// DailyRemaining returns how many more messages may be sent in the current 24 hours.
 func DailyRemaining(cfg config.Config, hs *history.Store, now time.Time) int {
 	limit := cfg.Automation.DailyLimit
 	if cfg.Automation.WarmupMode && limit > 50 {
@@ -291,8 +331,7 @@ func DailyRemaining(cfg config.Config, hs *history.Store, now time.Time) int {
 	if hs == nil {
 		return limit
 	}
-	y, m, d := now.Date()
-	left := limit - hs.SentSince(time.Date(y, m, d, 0, 0, 0, 0, now.Location()))
+	left := limit - hs.SentSince(DailyWindowStart(now))
 	if left < 0 {
 		return 0
 	}
@@ -327,13 +366,49 @@ func ReserveDaily(cfg config.Config, hs *history.Store, now time.Time) (release 
 	}, true
 }
 
+// MaybeSentMessage tells a person that a send's outcome is unknown.
+const MaybeSentMessage = "WhatsApp did not confirm this message, so it may have been sent — check the chat before sending again."
+
+// SendRecorded sends one message the way campaigns and scheduled messages are sent (for
+// the inbox, test messages and the send command). rec, with its Label set, goes into
+// the history as "sending" first, so the send counts towards the daily limit even if
+// Pulse stops mid-send; the send gets that label and up to timeout to finish, even when
+// ctx (a browser request) is cancelled, so closing the tab cannot cut it off halfway;
+// then the record is settled: sent, failed, or failed but possibly sent (uncertain,
+// corrected when Meta reports the label). When WhatsApp was not connected nothing is
+// recorded. Check the error with cloudapi.MaybeSent.
+func SendRecorded(ctx context.Context, hs *history.Store, rec history.MessageRecord, timeout time.Duration, send func(ctx context.Context) (string, error)) (string, error) {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	if rec.Label != "" {
+		sctx = cloudapi.WithCallbackData(sctx, rec.Label)
+	}
+	placeholder := ""
+	if hs != nil {
+		placeholder = hs.Placeholder(rec)
+	}
+	id, err := send(sctx)
+	if hs == nil {
+		return id, err
+	}
+	switch {
+	case cloudapi.IsNotConnected(err):
+		hs.Unsend(placeholder) // nothing left Pulse
+	case err != nil:
+		hs.Settle(placeholder, "fail_"+security.RandomToken(6), history.StatusFailed, err.Error(), cloudapi.MaybeSent(err))
+	default:
+		hs.Settle(placeholder, id, history.StatusSent, "", false)
+	}
+	return id, err
+}
+
 // BuildPlan resolves an audience against the contact list and the safety rules,
 // giving a reason for every contact that is left out.
 func BuildPlan(cfg config.Config, cs *contacts.Store, hs *history.Store, message string, aud Audience) (Plan, error) {
 	if strings.TrimSpace(message) == "" {
 		return Plan{}, errors.New("Write the message first.")
 	}
-	if err := msgtemplate.Validate(message, "email", "notes"); err != nil {
+	if err := msgtemplate.ValidateOutgoing(message, "email", "notes"); err != nil {
 		return Plan{}, err
 	}
 	if cs == nil {
@@ -376,14 +451,17 @@ func BuildPlan(cfg config.Config, cs *contacts.Store, hs *history.Store, message
 			x.Reason = "No usable phone number"
 		case c.IsDND:
 			x.Reason = "Opted out (replied STOP or was marked do-not-message)"
+		case c.MarketingOptOut:
+			x.Reason = marketingOptOutReason
 		case a.RequireOptIn && !c.Consent:
 			x.Reason = "No opt-in recorded. Record consent on the contact, or import a consent column."
 		case containsPhone(a.BlacklistPhones, c.Phone):
 			x.Reason = "On the blocked numbers list"
-		case a.AllowListOnly && !containsPhone(a.AllowList, c.Phone):
+		case a.AllowListOnly && !cs.AllowListed(a.AllowList, c.Phone):
 			x.Reason = "Test mode is on and this is not one of the test numbers"
-		case a.Enforce24hWindow && !c.Consent && !c.InServiceWindow(time.Now()):
-			x.Reason = "No opt-in and no message from them in the last 24 hours"
+		case a.Enforce24hWindow && !c.Consent && !c.CanSendFreeText(time.Now()):
+			// The same cut-off as free text (23h30), so nobody reaches Meta after the window.
+			x.Reason = "No opt-in and no message from them in the last 23 hours 30 minutes"
 		}
 		seen[c.Phone] = true
 		if x.Reason != "" {
@@ -391,9 +469,14 @@ func BuildPlan(cfg config.Config, cs *contacts.Store, hs *history.Store, message
 			continue
 		}
 		vars := map[string]string{"email": c.Email, "notes": c.Notes}
-		text, missing := msgtemplate.Render(message, msgtemplate.Vars{Name: c.Name, Phone: c.Phone, Business: cfg.Business, Extra: vars})
+		text, missing := msgtemplate.Render(message, msgtemplate.Vars{Name: c.Name, Phone: c.Phone, Business: cfg.Business, Extra: vars, Location: msgtemplate.Location(cfg.BusinessHours.Timezone)})
 		if len(missing) > 0 {
 			p.Excluded = append(p.Excluded, Exclusion{Phone: c.Phone, Name: c.Name, Reason: "No value for " + strings.Join(missing, ", ")})
+			continue
+		}
+		// Checked per customer: a long name or note can push one message over the limit.
+		if err := msgtemplate.LengthError(text, false); err != nil {
+			p.Excluded = append(p.Excluded, Exclusion{Phone: c.Phone, Name: c.Name, Reason: err.Error()})
 			continue
 		}
 		p.Recipients = append(p.Recipients, Recipient{Phone: c.Phone, Name: c.Name, Vars: vars, Status: RPending})
@@ -410,11 +493,27 @@ func BuildPlan(cfg config.Config, cs *contacts.Store, hs *history.Store, message
 
 func containsPhone(list []string, phone string) bool {
 	for _, x := range list {
-		if c := contacts.CleanPhone(x); c != "" && c == phone {
+		if contacts.MatchesTyped(x, phone) {
 			return true
 		}
 	}
 	return false
+}
+
+// marketingOptOutReason explains why a customer Meta reported with error 131050 is left out.
+const marketingOptOutReason = "Stopped marketing messages from businesses in WhatsApp (Meta refused an earlier message)"
+
+// noteMarketingOptOut marks the customer when Meta refused a message with error 131050,
+// so the next campaigns leave them out. Replies to their own messages still go.
+func noteMarketingOptOut(cs *contacts.Store, phone string, code int) {
+	if cs != nil && code == cloudapi.CodeMarketingOptOut && phone != "" {
+		cs.SetMarketingOptOut(phone, time.Now())
+	}
+}
+
+// receiptSource is the WhatsApp connection's delivery updates (cloudapi.Client).
+type receiptSource interface {
+	OnReceipt(h func(cloudapi.Receipt))
 }
 
 // Start creates a campaign from a plan and begins sending.
@@ -459,6 +558,9 @@ func (r *Runner) Start(name, message, createdBy string, plan Plan) (Summary, err
 	c := &Campaign{ID: "cmp_" + security.RandomToken(6), Name: strings.TrimSpace(name), Message: message, Audience: plan.Description, Status: CRunning, CreatedBy: createdBy, CreatedAt: now, StartedAt: &now, Recipients: plan.Recipients, Excluded: plan.Excluded, Template: plan.Template}
 	r.campaigns = append(r.campaigns, c)
 	if len(r.campaigns) > maxCampaigns {
+		for _, old := range r.campaigns[:len(r.campaigns)-maxCampaigns] {
+			r.unindexLocked(old)
+		}
 		r.campaigns = r.campaigns[len(r.campaigns)-maxCampaigns:]
 	}
 	r.startLocked(c)
@@ -569,21 +671,23 @@ const pausedOffline = "Paused because WhatsApp is not connected. Press Resume on
 
 // sendSkipReason re-checks the safety rules just before a message goes out, because a
 // paused campaign can be resumed days later and the contact or settings may have changed.
-func sendSkipReason(cfg config.Config, ct *contacts.Contact, ok bool, phone string, now time.Time) string {
+func sendSkipReason(cfg config.Config, cs *contacts.Store, ct *contacts.Contact, ok bool, phone string, now time.Time) string {
 	a := cfg.Automation
 	switch {
 	case !ok:
 		return "Contact was deleted before the message was sent"
 	case ct.IsDND:
 		return "Opted out before the message was sent"
+	case ct.MarketingOptOut:
+		return marketingOptOutReason
 	case containsPhone(a.BlacklistPhones, phone):
 		return "On the blocked numbers list"
-	case a.AllowListOnly && !containsPhone(a.AllowList, phone):
+	case a.AllowListOnly && !cs.AllowListed(a.AllowList, phone):
 		return "Test mode is on and this is not one of the test numbers"
 	case a.RequireOptIn && !ct.Consent:
 		return "Opt-in was withdrawn"
-	case a.Enforce24hWindow && !ct.Consent && !ct.InServiceWindow(now):
-		return "No opt-in and no message from them in the last 24 hours"
+	case a.Enforce24hWindow && !ct.Consent && !ct.CanSendFreeText(now):
+		return "No opt-in and no message from them in the last 23 hours 30 minutes"
 	}
 	return ""
 }
@@ -600,8 +704,35 @@ func recipientIndex(c *Campaign, phone string) int {
 }
 
 func (r *Runner) run(ctx context.Context, c *Campaign, gen int) {
+	// cur is the recipient being handled, so an internal error (a panic) cannot leave it
+	// claimed as "sending" or its history record as "sending" for ever.
+	var cur struct {
+		phone        string // claimed recipient
+		sending      bool   // its message was handed to WhatsApp
+		placeholder  string // its "sending" history record
+		releaseDaily func()
+	}
 	defer func() {
 		if p := recover(); p != nil {
+			if cur.releaseDaily != nil {
+				cur.releaseDaily()
+			}
+			if cur.phone != "" {
+				status, errText := RPending, "" // nothing left Pulse: sent on Resume
+				if cur.sending {
+					// The message may have left before the error: never sent again on Resume.
+					status, errText = RFailed, "Pulse hit an internal error while sending this message. It may have reached the customer: check the chat before sending it again."
+					if r.hist != nil && cur.placeholder != "" {
+						r.hist.Settle(cur.placeholder, "fail_"+security.RandomToken(6), history.StatusFailed, errText, true)
+					}
+				}
+				r.mu.Lock()
+				if j := recipientIndex(c, cur.phone); j >= 0 {
+					c.Recipients[j].Status, c.Recipients[j].Error = status, errText
+				}
+				r.mu.Unlock()
+				r.saver.Trigger()
+			}
 			security.LogAudit("BROADCAST_ERROR", "local", "system", fmt.Sprintf("Campaign %q stopped after an internal error: %v", c.Name, p), "failed")
 			r.finishRun(c, gen, CPaused, "Stopped after an internal error. Press Resume to continue.")
 		}
@@ -638,12 +769,22 @@ func (r *Runner) run(ctx context.Context, c *Campaign, gen int) {
 			r.finishRun(c, gen, CCompleted, "")
 			return
 		}
+		cur.phone, cur.sending, cur.placeholder, cur.releaseDaily = phone, false, "", nil
 		release := func() {
 			r.mu.Lock()
 			if j := recipientIndex(c, phone); j >= 0 {
 				c.Recipients[j].Status = RPending
 			}
 			r.mu.Unlock()
+		}
+		// The claim is on disk before anything is sent: if Pulse dies while the message is
+		// on its way, the restart finds "sending" and marks it interrupted instead of
+		// sending it again on Resume (a debounced save could still say "pending").
+		r.saver.Trigger()
+		if err := r.saver.Flush(); err != nil {
+			release()
+			r.finishRun(c, gen, CPaused, "Pulse could not save the campaign, so it stopped before sending more: "+err.Error())
+			return
 		}
 		cfg := r.cfg.Snapshot()
 		a := cfg.Automation
@@ -653,6 +794,7 @@ func (r *Runner) run(ctx context.Context, c *Campaign, gen int) {
 			r.finishRun(c, gen, CPaused, "Today's sending limit was reached. Press Resume tomorrow to send the rest.")
 			return
 		}
+		cur.releaseDaily = releaseDaily
 		unclaim := release
 		release = func() { releaseDaily(); unclaim() }
 		if reason := r.optOutSpike(c); reason != "" {
@@ -668,17 +810,18 @@ func (r *Runner) run(ctx context.Context, c *Campaign, gen int) {
 
 		status, errText, msgID := RSent, "", ""
 		ct, found := r.contacts.Get(rec.Phone)
-		if reason := sendSkipReason(cfg, ct, found, rec.Phone, time.Now()); reason != "" {
+		if reason := sendSkipReason(cfg, r.contacts, ct, found, rec.Phone, time.Now()); reason != "" {
 			status, errText = RSkipped, reason
 		} else {
-			vars := msgtemplate.Vars{Name: rec.Name, Phone: rec.Phone, Business: cfg.Business, Extra: rec.Vars}
+			// {{greeting}}, {{date}} and {{time}} follow the business's time zone.
+			vars := msgtemplate.Vars{Name: rec.Name, Phone: rec.Phone, Business: cfg.Business, Extra: rec.Vars, Now: time.Now(), Location: msgtemplate.Location(cfg.BusinessHours.Timezone)}
 			text, missing := msgtemplate.Render(c.Message, vars)
 			// A customer who has not written in 24 hours can only get the approved template.
-			var params []string
+			var parts cloudapi.TemplateParts
 			useTemplate := NeedsTemplate(ct, time.Now())
 			if useTemplate && c.Template != nil {
-				params, missing = c.Template.Render(vars)
-				text = c.Template.Describe(params)
+				parts, missing = c.Template.Render(vars)
+				text = c.Template.Describe(parts)
 			}
 			switch {
 			case useTemplate && c.Template == nil:
@@ -695,29 +838,49 @@ func (r *Runner) run(ctx context.Context, c *Campaign, gen int) {
 				// server may have it even if the acknowledgement is cut off, and treating
 				// it as unsent would send it twice on Resume.
 				sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+				label := Label + c.ID + ":" + rec.Phone
+				sctx = cloudapi.WithCallbackData(sctx, label) // see Reconcile
+				// The history gets a "sending" record first: if Pulse dies mid-send it still
+				// counts towards the daily limit and its label corrects it later.
+				hrec := history.MessageRecord{Direction: history.DirectionOutgoing, Type: history.TypeBroadcast, Phone: rec.Phone, Text: text, CampaignID: c.ID, Label: label}
+				placeholder := ""
+				cur.sending = true
+				if r.hist != nil {
+					placeholder = r.hist.Placeholder(hrec)
+					cur.placeholder = placeholder
+					releaseDaily() // the history counts it from here on
+				}
 				var id string
 				var err error
 				if useTemplate {
-					id, err = SendTemplate(sctx, r.sender, rec.Phone, *c.Template, params)
+					id, err = SendTemplate(sctx, r.sender, rec.Phone, *c.Template, parts)
 				} else {
 					id, err = r.sender.SendTextMessage(sctx, rec.Phone, text)
 				}
 				cancel()
+				if confirmedID := r.takeConfirmed(label); err != nil && confirmedID != "" {
+					id, err = confirmedID, nil // Meta reported it sent while the answer was lost
+				}
 				if cloudapi.IsNotConnected(err) {
+					if r.hist != nil {
+						r.hist.Unsend(placeholder) // nothing left Pulse
+					}
 					release()
 					r.finishRun(c, gen, CPaused, pausedOffline)
 					return
 				}
-				hrec := history.MessageRecord{ID: id, Direction: history.DirectionOutgoing, Type: history.TypeBroadcast, Phone: rec.Phone, Text: text, CampaignID: c.ID, Status: history.StatusSent}
 				if err != nil {
 					status, errText = RFailed, err.Error()
-					hrec.ID, hrec.Status, hrec.Error = "fail_"+security.RandomToken(6), history.StatusFailed, err.Error()
+					noteMarketingOptOut(r.contacts, rec.Phone, cloudapi.ErrorCode(err))
+					if r.hist != nil {
+						r.hist.Settle(placeholder, "fail_"+security.RandomToken(6), history.StatusFailed, err.Error(), cloudapi.MaybeSent(err))
+					}
 				} else {
 					msgID = id
 					r.contacts.UpdateLastContacted(rec.Phone)
-				}
-				if r.hist != nil {
-					r.hist.Record(hrec)
+					if r.hist != nil {
+						r.hist.Settle(placeholder, id, history.StatusSent, "", false)
+					}
 				}
 			}
 		}
@@ -734,6 +897,7 @@ func (r *Runner) run(ctx context.Context, c *Campaign, gen int) {
 			}
 		}
 		r.mu.Unlock()
+		cur.phone, cur.sending, cur.placeholder = "", false, ""
 		r.saver.Trigger()
 
 		if status == RFailed {
@@ -817,6 +981,70 @@ func (r *Runner) optOutSpike(c *Campaign) string {
 	return ""
 }
 
+// Label prefixes the label every campaign message is sent with (biz_opaque_callback_data):
+// Label + campaign ID + ":" + phone.
+const Label = "pulse:c:"
+
+// Reconcile applies a delivery update that carries a campaign message's label. A
+// recipient whose send was cut off (Pulse stopped mid-send, or Meta's answer never
+// arrived) is saved as failed without a message ID, so it is not sent again on Resume;
+// when Meta then reports the message sent, delivered or read, the recipient is shown with
+// that status after all. It reports whether the label was a campaign message's.
+func (r *Runner) Reconcile(label, messageID, status string) bool {
+	rest, ok := strings.CutPrefix(label, Label)
+	if !ok {
+		return false
+	}
+	campID, phone, ok := strings.Cut(rest, ":")
+	if !ok || (status != RSent && status != RDelivered && status != RRead) {
+		return true
+	}
+	changed := false
+	r.mu.Lock()
+	if _, known := r.byMsg[messageID]; known {
+		// The usual case: the send got its answer, so OnReceipt updates the recipient
+		// through its message ID without scanning the campaign.
+		r.mu.Unlock()
+		return true
+	}
+	for _, c := range r.campaigns {
+		if c.ID != campID {
+			continue
+		}
+		for j := range c.Recipients {
+			x := &c.Recipients[j]
+			if x.Phone == phone && x.Status == RSending {
+				// The send is still waiting for its answer: remember the ID for it.
+				if r.confirmed == nil {
+					r.confirmed = map[string]string{}
+				}
+				r.confirmed[label] = messageID
+			}
+			if x.Phone == phone && x.Status == RFailed && x.MessageID == "" {
+				now := time.Now()
+				x.Status, x.MessageID, x.Error, x.SentAt = status, messageID, "", &now
+				r.byMsg[messageID] = x
+				changed = true
+			}
+		}
+	}
+	r.mu.Unlock()
+	if changed {
+		r.saver.Trigger()
+	}
+	return true
+}
+
+// takeConfirmed returns (and forgets) a message ID Meta reported for label while its
+// send was waiting.
+func (r *Runner) takeConfirmed(label string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := r.confirmed[label]
+	delete(r.confirmed, label)
+	return id
+}
+
 // OnFailed records that WhatsApp could not deliver a message it had accepted.
 func (r *Runner) OnFailed(id, reason string) {
 	r.mu.Lock()
@@ -877,12 +1105,23 @@ func (r *Runner) Delete(id string) bool {
 	defer r.mu.Unlock()
 	for i, c := range r.campaigns {
 		if c.ID == id && c.Status != CRunning {
+			r.unindexLocked(c)
 			r.campaigns = append(r.campaigns[:i], r.campaigns[i+1:]...)
 			r.saver.Trigger()
 			return true
 		}
 	}
 	return false
+}
+
+// unindexLocked drops a removed campaign's message IDs from the receipt index, which
+// would otherwise keep its whole recipient list in memory until Pulse restarts.
+func (r *Runner) unindexLocked(c *Campaign) {
+	for _, x := range c.Recipients {
+		if x.MessageID != "" {
+			delete(r.byMsg, x.MessageID)
+		}
+	}
 }
 
 // ForgetPhone removes one customer from every campaign report (erasure requests).

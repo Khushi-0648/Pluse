@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"net"
 	"net/url"
 	"strings"
 
@@ -48,7 +49,16 @@ func ValidatePublicURL(raw string) error {
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
-		return errors.New("The public address must be an https address such as https://shop-pulse.trycloudflare.com, without anything after the name.")
+		return errors.New("The public address must be an https address such as https://pulse.yourdomain.com (your fixed tunnel address), without anything after the name.")
+	}
+	// Meta must be able to reach it from the internet: a name on this computer or a
+	// private network address can never work (S42).
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || !strings.Contains(host, ".") && net.ParseIP(host) == nil {
+		return errors.New("The public address must be reachable from the internet (your tunnel address), not a name on this computer.")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return errors.New("Enter the tunnel's name (such as https://pulse.yourdomain.com), not an IP address.")
 	}
 	return nil
 }
@@ -91,6 +101,11 @@ func (c *Config) SetCloudCredentials(in CloudCredentials) error {
 	}
 	return c.Update(func(x *Config) error {
 		ca := &x.CloudAPI
+		if !strings.EqualFold(strings.TrimRight(ca.PublicURL, "/"), in.PublicURL) {
+			// Phone access was approved for the old address: a new one must be approved
+			// again (with the admin password) before the dashboard is served there.
+			x.Server.RemoteAccess = false
+		}
 		ca.PhoneNumberID, ca.BusinessAccountID, ca.PublicURL, ca.APIVersion = in.PhoneNumberID, in.BusinessAccountID, in.PublicURL, in.APIVersion
 		if tok != "" {
 			ca.AccessToken = tok
@@ -111,9 +126,15 @@ func (c *Config) SetCloudCredentials(in CloudCredentials) error {
 // ClearCloudCredentials removes the number, token and app secret, and switches
 // automatic replies off. The verify token and public address are kept for reconnecting.
 func (c *Config) ClearCloudCredentials() error {
-	return c.Update(func(x *Config) error {
+	if err := c.Update(func(x *Config) error {
 		x.CloudAPI.AccessToken, x.CloudAPI.AppSecret, x.CloudAPI.PhoneNumberID, x.CloudAPI.BusinessAccountID = "", "", "", ""
 		x.Automation.Enabled = false
+		x.Server.RemoteAccess = false // nothing should be reachable from the internet after a disconnect
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	// Each save copies the previous file to config.yaml.bak, which still holds the sealed
+	// token and secret. Save once more so the backup copy is the cleared version too (S37).
+	return c.Save()
 }

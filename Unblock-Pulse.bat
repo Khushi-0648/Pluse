@@ -2,18 +2,34 @@
 setlocal
 title Unblock Pulse
 echo ===================================================
-echo     Unblocking Pulse files for Windows...
+echo     Unblock Pulse files for Windows
 echo ===================================================
 cd /d "%~dp0"
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%~dp0' -Recurse | Unblock-File -ErrorAction SilentlyContinue; Write-Host 'All Pulse files unblocked successfully!' -ForegroundColor Green"
+set "PULSE_DIR=%~dp0"
+if not exist "whatsapp-auto.exe" (
+    echo [ERROR] whatsapp-auto.exe was not found in:
+    echo "%~dp0"
+    echo If you opened this file inside the zip, unzip the whole Pulse folder first
+    echo ^(right-click the zip, Extract All^), then run it from the unzipped folder.
+    echo.
+    pause
+    exit /b 1
+)
+echo SHA-256 of whatsapp-auto.exe:
+powershell -NoProfile -Command "(Get-FileHash -LiteralPath (Join-Path $env:PULSE_DIR 'whatsapp-auto.exe') -Algorithm SHA256).Hash.ToLower()"
 echo.
-echo ===================================================
-echo NOTE FOR WINDOWS 11 SMART APP CONTROL:
-echo If Smart App Control is strictly ON on this machine:
-echo   1. Open Windows Security from the Start menu.
-echo   2. Click 'App & browser control' > 'Smart App Control'.
-echo   3. Set it to 'Evaluation' or 'Off'.
-echo ===================================================
+echo Compare it with the checksum published on the page you downloaded Pulse from.
+echo Only continue if both match exactly.
+echo.
+choice /c YN /m "Do the checksums match"
+if errorlevel 2 (
+    echo Nothing was changed. Download Pulse again from the official page.
+    pause
+    exit /b 1
+)
+powershell -NoProfile -Command "Get-ChildItem -LiteralPath $env:PULSE_DIR -Recurse | Unblock-File; Write-Host 'All Pulse files unblocked.' -ForegroundColor Green"
+echo.
+echo Smart App Control blocks unsigned programs and cannot be bypassed for one
+echo program. Use an official signed release instead of switching it off.
 echo.
 pause

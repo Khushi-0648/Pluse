@@ -4,8 +4,9 @@ Pulse compiles to a single, self-contained executable on Windows, macOS and Linu
 
 ## Requirements
 
-- Go 1.22 or newer (`go version`)
+- Go 1.26 or newer (`go version`; `go.mod` requires 1.26 and pins the toolchain)
 - Windows 10/11 x64 (for the Windows build)
+- go-winres for the icon, version info and manifest: `go install github.com/tc-hib/go-winres@v0.3.3` (`Build.bat` generates them from `winres/winres.json` and the version in `pkg/version/version.go`)
 - Optional: Node.js (for syntax-checking dashboard scripts during `Build.bat`)
 - Optional: Code-signing certificate (OV/EV or Microsoft Trusted Signing for production releases; self-signed for local testing)
 
@@ -29,6 +30,10 @@ Build.bat
 
 `Build.bat` runs the checks and tests, builds `whatsapp-auto-exe\whatsapp-auto.exe` with `-trimpath -ldflags="-s -w"`, signs it when a certificate is configured, and writes `dist\Pulse-<version>.zip` plus a `.sha256` checksum file. The zip contains only the files listed under *Customer package* below and a `VERSION.txt`; anything else in `whatsapp-auto-exe\` is left out and named in a note. Always ship the zip from `dist\`, never a hand-made zip of the folder.
 
+`Build.bat` refuses to build when `git status --porcelain` lists anything: changed files and new files that are not ignored by `.gitignore` (a new `.go` file would be compiled in). When git is not installed or the folder is not a git repository (for example an unpacked source zip), the build cannot be matched to a commit and is treated the same way. For a local test only, `set PULSE_ALLOW_DIRTY=1`: the build then prints a large warning and the zips are named `Pulse-<version>-DIRTY.zip` (and `-DIRTY-arm64`, `-DIRTY-x86`). Never ship a `-DIRTY` zip.
+
+With `PULSE_SIGN_PFX`, the three programs (x64, ARM64, x86) are signed in one run of `scripts\Sign-Executable.ps1`, so the certificate password is asked once. The key is loaded in memory only (`EphemeralKeySet`) where Windows supports it.
+
 The version is set in one place: `pkg/version/version.go`. Change it there before a release; the app, `VERSION.txt` and the zip name all follow.
 
 ### Binary Stripping & Symbols
@@ -37,8 +42,8 @@ Production builds compile with:
 ```cmd
 go build -trimpath -ldflags="-s -w" -o whatsapp-auto.exe ./cmd/whatsapp-auto
 ```
-- `-s`: Strips the DWARF symbol table (verified via `go tool nm`: reports `no symbols`).
-- `-w`: Strips DWARF debug symbols.
+- `-s`: Strips the symbol table (verified via `go tool nm`: reports `no symbols`).
+- `-w`: Strips DWARF debug information.
 - `-trimpath`: Strips absolute file system paths from stack traces and binaries.
 
 *Technical Note on Go Binaries:* As designed in the Go runtime architecture, the Go compiler preserves the PC-Line Table (`runtime.pclntab`) in the `.rdata` PE section. This is required for runtime stack unwinding during panics, garbage collection root-finding, and reflection. Low-level PE inspect tools can read function names from this table; this is normal Go runtime behavior and not an unstripped debug build.
@@ -49,7 +54,7 @@ Windows SmartScreen warns about unsigned programs, and **Smart App Control block
 
 #### 1. Production Releases (Public CA)
 For public distribution, obtain a code signing certificate from a recognized Certificate Authority (DigiCert, Sectigo, SSL.com) or Microsoft Azure Trusted Signing.
-Set your certificate environment variable and run `Build.bat`:
+Set your certificate environment variable and run `Build.bat`. Build.bat refuses a certificate whose chain is not trusted, unless `PULSE_SIGN_ALLOW_SELF_SIGNED=1` is set for a local test build:
 ```cmd
 set PULSE_SIGN_PFX=C:\certs\pulse.pfx
 rem or by installed certificate thumbprint:
@@ -67,12 +72,9 @@ For internal testing without a commercial certificate, run:
 ```cmd
 powershell -ExecutionPolicy Bypass -File scripts\Create-DevCertificate.ps1
 ```
-This generates a local code-signing certificate (`CN=PulseAutomation`), exports `certs\PulseAutomation.cer` and `certs\PulseAutomation.pfx` (password: `PulseDev123!`), registers it in the local `TrustedPublisher` store, and signs `whatsapp-auto.exe` with RFC 3161 DigiCert timestamping.
+This generates a local code-signing certificate (`CN=PulseAutomation`), asks for a password and exports `certs\PulseAutomation.cer` and `certs\PulseAutomation.pfx`, registers it in the local `TrustedPublisher` store, and signs `whatsapp-auto.exe` with RFC 3161 DigiCert timestamping.
 
-To eliminate SmartScreen warnings on the local test machine, import the public certificate into the Windows Trusted Root store:
-```cmd
-certutil -addstore -user root certs\PulseAutomation.cer
-```
+**Only trust this certificate on your own test machine.** Adding it to Trusted Root means anyone holding the `.pfx` can sign programs that machine trusts. Never ship the `.pfx`, never ask customers to install the `.cer`, and never sign a release with it: on other machines the signature shows as untrusted.
 
 ## Other platforms
 
@@ -81,7 +83,7 @@ GOOS=linux  GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o whatsapp-auto   
 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o whatsapp-auto-macos ./cmd/whatsapp-auto
 ```
 
-On macOS and Linux the data key is protected by file permissions only (no DPAPI equivalent is used).
+On macOS and Linux the data key is protected by file permissions only (no DPAPI equivalent is used), and the "sealed" settings secrets (access token, app secret) are **not encrypted**: they are only encoded and rely on the 0600 permissions of `config.yaml`. Pulse prints a warning about this at every start on those systems.
 
 ## Customer package (`whatsapp-auto-exe/`)
 
@@ -90,8 +92,11 @@ On macOS and Linux the data key is protected by file permissions only (no DPAPI 
 - `whatsapp-auto.exe` (fresh, signed build) and `SHA256SUMS.txt`
 - `Run-App.bat`, `Run-Server.bat`, `Run-Unlink.bat`, `Reset-Password.bat`, `Create-Desktop-Shortcut.bat`
 - `HOW-TO-RUN.txt`, `BUILD.md`, `SETUP-GUIDE.md`, `COMPLIANCE.md`, `LICENSE`, `contacts.example.csv`
-- `scripts\Install-Service.ps1`, `scripts\Uninstall-Service.ps1`, `scripts\Stop-Background.ps1`, `scripts\Sign-Executable.ps1`, `scripts\Create-DevCertificate.ps1`
+- `Unblock-Pulse.bat`, `config.example.yaml`
+- `scripts\Install-Service.ps1`, `scripts\Uninstall-Service.ps1`, `scripts\Stop-Background.ps1`, `scripts\Check-SmartAppControl.bat`
 - `docs\meta-whatsapp-setup.md`, `docs\architecture.md`, `docs\security.md`
 - `VERSION.txt` (written by the build)
+
+Publish the SHA-256 of `whatsapp-auto.exe` (and of the zip) on the download page as well: a checksum file inside the zip can be swapped along with the program. The signing scripts are developer tools and stay out of the package.
 
 Never ship `config.yaml` (it would give every customer the same password), any `*.db` or `*.json` data files, `.env`, or internal audit and test reports. Pulse creates `config.yaml` and a one-time password on first start.

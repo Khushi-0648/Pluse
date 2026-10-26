@@ -6,18 +6,9 @@ The linked-device (WhatsApp Web style, QR code) connection of Pulse 1.x has been
 
 ## What you need
 
-> [!WARNING]
-> **Phone Number Coexistence Limitation (Mobile WhatsApp Disconnection):**
-> Meta's official WhatsApp Business Platform (Cloud API) is strictly mutually exclusive with the WhatsApp mobile apps.
-> - A phone number registered to Cloud API **cannot be logged into the WhatsApp consumer app or WhatsApp Business app on a mobile phone at the same time**.
-> - If you register an existing mobile number, you must delete/deregister the WhatsApp account on your smartphone before adding it to Meta's API Setup.
-> - Once connected, all messaging and customer chats are handled exclusively through Pulse's Web Inbox. Attempting to log back into WhatsApp on a phone will deactivate Cloud API message routing.
-> - **Recommendation:** Use a dedicated business SIM, a virtual phone number, or a business landline.
-
 - A Meta (Facebook) account and a Meta Business portfolio for your business.
-- A dedicated phone number for the business (SMS or voice call capable for receiving Meta's 6-digit registration code).
-- A permanent HTTPS webhook ingress (e.g. a Named Cloudflare Tunnel or static ngrok domain) so Meta can deliver incoming messages to Pulse.
-- A permanent System User Access Token from Meta Business Manager with `whatsapp_business_messaging` permissions.
+- A phone number for the business that is **not** in use in the WhatsApp or WhatsApp Business app (or one you move to the platform). Meta sends it a verification code by SMS or call.
+- A way to make Pulse reachable over https from the internet, so Meta can deliver incoming messages, for example Cloudflare Tunnel (free).
 
 ## Step by step
 
@@ -31,9 +22,9 @@ The linked-device (WhatsApp Web style, QR code) connection of Pulse 1.x has been
    - **Quick Test (Changes on restart):** `cloudflared tunnel --url http://127.0.0.1:8085` prints a temporary address (e.g. `https://xyz.trycloudflare.com`). **Note:** Quick tunnels generate a new address each time they restart, which breaks Meta's webhook delivery until updated.
    - **Production (Fixed Hostname):** Set up a free **Named Cloudflare Tunnel** with a permanent custom domain (e.g. `webhook.yourcompany.com`) or reserve a free static ngrok domain (`ngrok http 8085 --domain=your-name.ngrok-free.app`). These retain the exact same URL across reboots and run as an automatic Windows service.
    - **Tunnel Privacy Disclosure:** Managed tunnels (Cloudflare, ngrok) terminate TLS at their edge, meaning the tunnel provider technically decrypts the incoming webhook payload (customer numbers, names, and messages) before forwarding it to your computer. For strict data sovereignty (healthcare, legal, finance), terminate TLS directly on your own infrastructure using a local reverse proxy (such as Caddy or Nginx with Let's Encrypt), or use a private TCP pass-through stream proxy.
-   - **Isolation:** Only Pulse's webhook address (`/cloud/webhook`) answers through the public tunnel; the dashboard and sign-in page remain private (they answer 404 under the tunnel's hostname).
+   - **Isolation:** Only Pulse's webhook address (`/cloud/webhook`) answers through the public tunnel; the dashboard and sign-in page remain private (they answer 404 under the tunnel's hostname). With your own Caddy or Nginx, forward only `/cloud/webhook` to Pulse (see docs/security.md).
 7. **Enter the details in Pulse.** In the dashboard, open *Settings > WhatsApp connection*. Paste the phone number ID, the WhatsApp Business account ID, the access token, the app secret and, as **Public address of this computer**, the https address of the tunnel. Press **Test connection**: Pulse shows your number and the name WhatsApp displays to customers. Press **Save** and enter your admin password.
-8. **Set up the webhook in Meta.** Pulse now shows the **Webhook address** (the public address followed by `/cloud/webhook`) and a **Verify token**. In the app, *WhatsApp > Configuration*, press *Edit* next to Webhook, paste both, and press *Verify and save*. Then, under *Webhook fields*, **subscribe to `messages`**. Send a message from another phone to your business number: it appears in the Pulse inbox, and the *Get started* list on Home ticks off "Receive messages".
+8. **Set up the webhook in Meta.** Pulse now shows the **Webhook address** (the public address followed by `/cloud/webhook`) and a **Verify token**. In the app, *WhatsApp > Configuration*, press *Edit* next to Webhook, paste both, and press *Verify and save*. Then, under *Webhook fields*, **subscribe to `messages`**. Meta also delivers a real number's messages only to apps subscribed to its WhatsApp Business account: Pulse does this for you when the WhatsApp Business account ID is entered (Settings > WhatsApp connection shows a warning if it could not). Send a message from another phone to your business number: it appears in the Pulse inbox, and the *Get started* list on Home ticks off "Receive messages".
 9. **Create message templates.** WhatsApp lets you reply freely for **24 hours** after a customer's last message. To reach anyone outside that window (campaigns, reminders), create templates in [WhatsApp Manager](https://business.facebook.com/wa/manage/message-templates/) and wait for Meta to approve them. In Pulse, enter the template name, language code and which values fill `{{1}}`, `{{2}}`... under *Official WhatsApp template* in a campaign or scheduled message.
 10. **Billing.** Meta charges per message for some categories (mostly templates: marketing, utility, authentication); replies within the 24-hour window are generally free. Add a payment method in WhatsApp Manager and check Meta's current pricing for your country.
 
@@ -57,7 +48,8 @@ The linked-device (WhatsApp Web style, QR code) connection of Pulse 1.x has been
 | WhatsApp refused the template | Check the template name, language code and number of values in WhatsApp Manager, and that it is approved. |
 | This number is not on your test number's list | You are using Meta's test number: add the recipient under API Setup, or register your real number. |
 | Messages are being sent too fast | Wait a few minutes; slow the pace in Settings > Safety and pace. |
-| Nothing arrives in the inbox | Check that the tunnel is running and its address matches the Public address, that the webhook is verified in Meta and subscribed to `messages`, and that the app secret is saved. Rejected deliveries are listed in the activity log as "Blocked a webhook call that did not come from Meta". |
+| This business number is not registered | The number was added but not registered on the platform. In *WhatsApp > API Setup*, register it (Meta asks for a 6-digit two-step PIN), then try again. |
+| Nothing arrives in the inbox | Check that the tunnel is running and its address matches the Public address, that the webhook is verified in Meta and subscribed to `messages`, that the app secret is saved, and that the WhatsApp Business account ID is entered (Pulse uses it to subscribe your app to the account's messages). If test messages arrive but real customers' do not, switch the app to *Live* (published) in the App Dashboard. Rejected deliveries are listed in the activity log as "Blocked a webhook call that did not come from Meta". |
 
 ## Moving from Pulse 1.x (linked device)
 

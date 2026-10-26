@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -30,6 +31,10 @@ type ServerConfig struct {
 	MustChangePassword bool     `yaml:"must_change_password" json:"must_change_password"`
 	AllowedHosts       []string `yaml:"allowed_hosts" json:"allowed_hosts"`
 	TrustedProxies     []string `yaml:"trusted_proxies" json:"trusted_proxies"`
+	// RemoteAccess serves the dashboard through the public https address too, so phones
+	// (the installed Android app) can use it. Off by default: then the public address
+	// answers only Meta's webhook.
+	RemoteAccess bool `yaml:"remote_access" json:"remote_access"`
 }
 
 // CloudAPIConfig holds this install's own connection to Meta's WhatsApp Business
@@ -150,15 +155,42 @@ type BusinessHoursConfig struct {
 }
 
 type NotificationsConfig struct {
+	// Desktop plays the alert chime on this computer. Despite the name it never shows a
+	// Windows pop-up: customer messages stay inside the Pulse window.
 	Desktop bool `yaml:"desktop" json:"desktop"`
 }
 
 type WebhookConfig struct {
-	Enabled        bool   `yaml:"enabled" json:"enabled"`
-	URL            string `yaml:"url" json:"url"`
-	Secret         string `yaml:"secret" json:"secret"`
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	URL     string `yaml:"url" json:"url"`
+	// Secret signs the events Pulse sends out (X-Signature-SHA256).
+	Secret string `yaml:"secret" json:"secret"`
+	// InboundSecret is what another system must present to send messages through Pulse's
+	// inbound integration endpoint. It is separate from Secret, so the receiving system
+	// (which knows Secret to check signatures) cannot also send as Pulse. Use
+	// InboundSecret() to read it: older settings without it fall back to Secret.
+	InboundSecret  string `yaml:"inbound_secret,omitempty" json:"inbound_secret"`
 	TimeoutSeconds int    `yaml:"timeout_seconds" json:"timeout_seconds"`
 	MaxRetries     int    `yaml:"max_retries" json:"max_retries"`
+}
+
+// InboundSecretValue returns the secret the inbound integration endpoint accepts. When
+// webhook.inbound_secret is not set it falls back to webhook.secret (the outbound signing
+// key), as versions up to 2.1.0 did, and legacy is true: the caller should recommend
+// setting a separate inbound secret.
+func (w WebhookConfig) InboundSecretValue() (secret string, legacy bool) {
+	if s := strings.TrimSpace(w.InboundSecret); s != "" {
+		return s, false
+	}
+	return w.Secret, w.Secret != ""
+}
+
+// InboundSecret returns the secret the inbound integration endpoint must check; see
+// WebhookConfig.InboundSecretValue.
+func (c *Config) InboundSecret() (secret string, legacy bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Webhook.InboundSecretValue()
 }
 
 // SetupState tracks the first-run checklist.
@@ -361,6 +393,18 @@ func DefaultConfig() *Config {
 	return c
 }
 
+// ErrEmptySettings is returned by LoadConfig for an empty settings file without a usable
+// backup in a folder that already holds Pulse data (store.key). Starting with defaults
+// would create a new one-time password and hand the existing data to whoever runs it.
+var ErrEmptySettings = errors.New("the settings file is empty")
+
+// HasDataKey reports whether dir holds Pulse's data key (store.key), that is, data from
+// an earlier start.
+func HasDataKey(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "store.key"))
+	return err == nil
+}
+
 // LoadConfig reads path, creating it with defaults when missing.
 func LoadConfig(path string) (*Config, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -381,6 +425,9 @@ func LoadConfig(path string) (*Config, error) {
 		if bak, bErr := os.ReadFile(path + ".bak"); bErr == nil && len(strings.TrimSpace(string(bak))) > 0 {
 			fmt.Printf("[Config] %s was empty; restored the settings from its backup.\n", path)
 			data = bak
+		} else if HasDataKey(filepath.Dir(path)) {
+			// Defaults here would mean a new one-time password for existing customer data.
+			return nil, fmt.Errorf("%s is empty and has no usable backup (%s.bak), but the folder holds Pulse data: %w", path, path, ErrEmptySettings)
 		}
 	}
 	cfg := loadBase()
@@ -393,6 +440,7 @@ func LoadConfig(path string) (*Config, error) {
 		if err2 := yaml.Unmarshal(bak, cfg); err2 != nil {
 			return nil, fmt.Errorf("cannot parse %s or its backup: %w", path, err)
 		}
+		fmt.Printf("[Config] %s could not be read (%v); using the settings from its backup %s.bak.\n", path, err, path)
 	}
 	if cfg.Rules == nil {
 		cfg.Rules = DefaultRules()
@@ -520,6 +568,9 @@ func (c *Config) normalize() {
 	ca := &c.CloudAPI
 	ca.PhoneNumberID, ca.BusinessAccountID = strings.TrimSpace(ca.PhoneNumberID), strings.TrimSpace(ca.BusinessAccountID)
 	ca.PublicURL = strings.TrimRight(strings.TrimSpace(ca.PublicURL), "/")
+	if !strings.HasPrefix(strings.ToLower(ca.PublicURL), "https://") {
+		c.Server.RemoteAccess = false // phone access only ever runs over a fixed https address
+	}
 	if !ValidGraphVersion(ca.APIVersion) {
 		ca.APIVersion = DefaultGraphVersion
 	}
@@ -634,6 +685,9 @@ func (c *Config) Save() error {
 		if old, err := os.ReadFile(path); err == nil {
 			if os.WriteFile(path+".bak", old, 0600) == nil {
 				securestore.RestrictToUser(path + ".bak")
+			} else {
+				// An older backup left in place could still hold a removed access token.
+				_ = os.Remove(path + ".bak")
 			}
 		}
 	}
@@ -652,7 +706,9 @@ func (c *Config) Save() error {
 	// Only this Windows user may read the file: it holds the webhook secret and the
 	// password hashes. Done before the rename so the final file is never left open.
 	securestore.RestrictToUser(tmp)
-	if err := os.Rename(tmp, path); err != nil {
+	// A virus scanner or the search indexer briefly holding config.yaml makes a plain
+	// rename fail on Windows; retry like the data files do.
+	if err := securestore.RenameRetry(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -683,14 +739,24 @@ func (c *Config) copyLocked() Config {
 	return s
 }
 
+// updateMu runs one Update at a time from change to save, so undoing a failed save can
+// never also undo another change that was saved in between.
+var updateMu sync.Mutex
+
 // Update applies fn under the write lock and saves the result.
 func (c *Config) Update(fn func(*Config) error) error {
+	updateMu.Lock()
+	defer updateMu.Unlock()
 	c.mu.Lock()
 	before := c.copyLocked()
 	if err := fn(c); err != nil {
 		c.restoreLocked(before)
 		c.mu.Unlock()
 		return err
+	}
+	// A form that sends back the masked placeholder (SafeClone) keeps the stored value.
+	if IsMasked(c.Webhook.InboundSecret) {
+		c.Webhook.InboundSecret = before.Webhook.InboundSecret
 	}
 	c.normalize()
 	c.mu.Unlock()
@@ -725,6 +791,9 @@ func (c *Config) SafeClone() Config {
 	}
 	if s.Webhook.Secret != "" {
 		s.Webhook.Secret = mask
+	}
+	if s.Webhook.InboundSecret != "" {
+		s.Webhook.InboundSecret = mask
 	}
 	s.CloudAPI.AccessToken, s.CloudAPI.AppSecret = "", "" // never leave Pulse, not even masked
 	return s
@@ -774,7 +843,9 @@ func (c *Config) EnsureAdminPassword() (string, bool) {
 	c.Server.AdminPassword = string(hash)
 	c.Server.MustChangePassword = true
 	c.mu.Unlock()
-	_ = c.Save()
+	if err := c.Save(); err != nil {
+		fmt.Printf("[Settings] The one-time password could not be saved (%v). It works until Pulse closes.\n", err)
+	}
 	return gen, true
 }
 
@@ -788,6 +859,10 @@ func (c *Config) ResetAdminPassword() (string, error) {
 	pass, ok := c.EnsureAdminPassword()
 	if !ok {
 		return "", errors.New("could not create a new password")
+	}
+	// The reset tool exits right away: a password that is not on disk would never work.
+	if err := c.Save(); err != nil {
+		return "", fmt.Errorf("The new password could not be saved (%v). Nothing was changed; close any program that may be using config.yaml and try again.", err)
 	}
 	return pass, nil
 }
@@ -901,8 +976,28 @@ func (c *Config) GetRules() []Rule {
 	c.mu.RLock()
 	res := append([]Rule{}, c.Rules...)
 	c.mu.RUnlock()
-	sort.SliceStable(res, func(i, j int) bool { return res[i].Priority > res[j].Priority })
+	// The owner's priority decides first; at equal priority the more specific match type
+	// is tried first (exact, regex, starts with, contains), so a broad "contains" rule
+	// cannot hide an exact one.
+	sort.SliceStable(res, func(i, j int) bool {
+		if res[i].Priority != res[j].Priority {
+			return res[i].Priority > res[j].Priority
+		}
+		return matchRank(res[i].Type) < matchRank(res[j].Type)
+	})
 	return res
+}
+
+func matchRank(t string) int {
+	switch t {
+	case "regex":
+		return 1
+	case "prefix":
+		return 2
+	case "contains":
+		return 3
+	}
+	return 0 // exact
 }
 
 const (
@@ -987,6 +1082,11 @@ func (c *Config) AddOrUpdateRule(rule Rule, originalName ...string) error {
 			}
 		}
 		if idx >= 0 {
+			// The editor does not send a priority (the order is set by moving rules), so an
+			// edit keeps the rule's place instead of dropping it to the bottom.
+			if rule.Priority == 0 {
+				rule.Priority = cfg.Rules[idx].Priority
+			}
 			rules := append([]Rule{}, cfg.Rules...)
 			rules[idx] = rule
 			cfg.Rules = rules
