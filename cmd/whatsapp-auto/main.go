@@ -1087,6 +1087,9 @@ func runSend(cfgPath, session, to, text string) {
 		atFail(releaseInstanceLock)
 		defer releaseInstanceLock()
 	}
+	// Opened before the contact list: on the first start of this version the list works
+	// out from the activity log when Pulse 2.1 first ran (contacts.NewStore).
+	security.OpenAuditLog(e.path("audit"), e.box)
 	cs, err := contacts.NewStore(e.path("contacts"))
 	if err != nil {
 		fail("%v", err)
@@ -1095,7 +1098,6 @@ func runSend(cfgPath, session, to, text string) {
 	if err != nil {
 		fail("%v", err)
 	}
-	security.OpenAuditLog(e.path("audit"), e.box)
 	save := func() {
 		for _, f := range []func() error{cs.Flush, hs.Flush} {
 			if err := f(); err != nil {
@@ -1105,11 +1107,12 @@ func runSend(cfgPath, session, to, text string) {
 		security.FlushAuditLog()
 	}
 	atFail(save)
-	// A saved contact is found as written first, so a number that came from WhatsApp keeps
-	// its country; only an unknown number is read as typed (a 10-digit Indian mobile gets 91).
-	phone := contacts.CleanPhone(to)
-	if c, ok := cs.Get(to); ok {
-		phone = c.Phone
+	// Read as typed (contacts.ResolveTyped): a stored number (a contact or a chat in the
+	// history) keeps its country; only another bare 10-digit mobile gets India's 91, and
+	// nothing is matched by its last digits.
+	phone, err := cs.Resolve(to, hs.HasPhone)
+	if err != nil {
+		fail("%v", err)
 	}
 	if len(phone) < 7 || len(phone) > 15 {
 		fail("Enter a valid phone number with country code, for example +919876543210.")

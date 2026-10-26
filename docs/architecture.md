@@ -28,12 +28,33 @@ Each install (and each `-session` profile) stores its own phone number ID, Whats
 
 ## Phone numbers
 
-Contacts are keyed by the full international number, digits only (`contacts.NormalizePhone`). Numbers from Meta (`from`, `wa_id`) are taken as they are (`contacts.CleanWAID`); only a number a person typed goes through `contacts.CleanPhone`, which adds India's 91 to a bare 10-digit mobile starting 6-9 (a number typed with `+` or `00` keeps its country).
+Contacts are keyed by the full international number, digits only (`contacts.NormalizePhone`). Numbers from Meta (`from`, `wa_id`) are taken as they are (`contacts.CleanWAID`).
 
-- `Store.GetExact` matches a stored number exactly. Everything that decides whether or where a message goes (campaigns, scheduled messages, the inbox, test messages, integrations, the bot), backup restore and every update (`SetDND`, `SetConsent`, `RecordInbound`, delete, erase) uses it; a number that is not a contact is checked with `WasOptedOut`.
-- `Store.Get` is a lookup aid for typed input only (forms, search, "send to" fields): an exact match first, then the 91 reading and a unique last-10-digit match for a bare number.
-- `Store.Save` stores the number as typed (an existing contact keeps its stored number); `Store.SaveExact` stores digits that are already international, such as the number an integration just sent to. Neither ever replaces another number's contact.
-- Pulse 2.0 stored foreign 10-digit numbers with 91 in front (`contacts.LegacyWAID`). The opt-out list file (`contacts-suppressed.json`) records `upgraded_at`, the first time 2.1 opened the list; only contacts created before it can be moved to the real number (`Store.Upsert`, which calls the `OnRenamed` hooks so history, campaigns and scheduled messages follow) or have their old-form opt-out applied once (`legacy_done`).
+**The rule: a stored number is an exact identity.** A number Pulse stored (a contact, a message in the history, a scheduled message, a campaign recipient, a webhook event, a backup) is compared digit for digit everywhere: contacts, history, scheduler, campaigns, erasure, exports and display. Nothing that decides who is messaged, whose data is shown or exported, or who is erased ever adds a country code to a stored number or matches one by its last digits.
+
+India's 91 is guessed in one place only, `contacts.ResolveTyped`, which turns something a person typed (a form, the "send to" field, an erasure or export request, a campaign's number list, an integration's `to`, the `send` command) into the stored number it means, and only when that is unambiguous:
+
+1. typed with `+` or `00`: the number has its country code, nothing is guessed;
+2. bare digits that are a stored number (a contact, or known to the history or scheduler): exactly that number, so Singapore's 6591234567 stays Singapore even when India's 916591234567 is also a customer;
+3. a bare 10-digit mobile starting 6-9 that is not stored: India (`contacts.CleanPhone`); a longer number: taken as international;
+4. anything else of 10 digits or fewer is refused (`ErrNeedsCountryCode`), and formatted digits without `+` that are stored both as typed and with 91 in front are refused (`ErrAmbiguousNumber`).
+
+No path matches a number by its last 10 digits; the contact search box matches parts of numbers but never decides anything.
+
+- `server.resolvePhone` (contacts, history and scheduled messages as "known") resolves a request's number once; the handler then uses the result with exact lookups only. `contacts.Store.Resolve` and `Store.Get` (typed lookup, contacts only) use the same function, as do `scheduler.Validate` and `campaign.BuildPlan`.
+- `Store.GetExact` matches a stored number exactly. Everything that decides whether or where a message goes (campaigns, scheduled messages, the inbox, test messages, integrations, the bot), the inbox and overview display, backup restore and every update (`SetDND`, `SetConsent`, `RecordInbound`, delete, erase) uses it; a number that is not a contact is checked with `WasOptedOut`.
+- `history.Query`'s phone filter, `ClearPhone`, `Scheduler.ForgetPhone`, `Runner.ForgetPhone` and `Dispatcher.Forget` match stored numbers exactly and never fall back to a typed reading.
+- `Store.Save` stores a typed number (through `ResolveTyped`; an existing contact keeps its stored number); `Store.SaveExact` stores digits that are already international, such as the number an integration just sent to or a number the server resolved. Neither ever replaces another number's contact.
+- Blocked and test-number lists are typed lists matched with `MatchesTyped` / `AllowListed`, which only ever widen the block (the safe side).
+
+### Numbers saved by Pulse 2.0
+
+Pulse 2.0 stored foreign 10-digit numbers with 91 in front (`contacts.LegacyWAID`: 6591234567 became 916591234567). The opt-out list file (`contacts-suppressed.json`) records when 2.1 first ran on the list (`upgraded_at`). 2.1.0 recorded nothing and 2.1.1 recorded its own first start, so on lists 2.1.0 had used, customers added under 2.1.0 looked like 2.0 contacts. Since then the time is worked out once (`upgrade_checked`, `contacts.settleUpgradeLocked`) from evidence on the PC: the activity log's `APP_STARTED` entries name each version (the first 2.1 start is exact when a 2.0 start is still logged before it; the log keeps the newest 2,000 entries); a contact under a bare 10-digit number starting 6-9 can only have been written by 2.1 (2.0 ran every number through `CleanPhone`); 2.1.1's `upgraded_at`. When the first 2.1 start is not known exactly, `legacy_before` marks the contacts that surely predate it (before a logged 2.0 start, else none).
+
+- A contact under the 91 form that surely comes from 2.0 and came from WhatsApp, wrote or opted out is moved to the real number when that number writes (`Store.Upsert`, which calls the `OnRenamed` hooks so history, campaigns and scheduled messages follow); its consent never moves.
+- One that only may come from 2.0 is never moved; its opt-out still applies to the real number (the safe side). An opt-out under the old form is also applied once to a contact 2.1.0 created under the real number before Pulse looked for the old form (`legacy_aware_at`, `legacy_done`).
+- Erasing the real number also erases the 91-form contact and its messages, scheduled and campaign entries, webhook events and backup entries when it surely is 2.0's record of that customer (`Store.ForgetLegacy`); otherwise it is left alone (it may be an Indian customer) and the response tells the admin (`not_erased`). The 91 form is masked in the activity log and blocked from restores either way, and stays opted out if it had opted out.
+- Erasure deletes the `.bak` copies of every file it changes (history, contacts, scheduled messages, campaigns, webhook queue, activity log), since a `.bak` holds the previous version.
 
 ## Incoming message
 

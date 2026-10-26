@@ -159,7 +159,21 @@ func (s *Scheduler) Stop() {
 
 // Validate checks a message before it is scheduled and returns warnings about policy.
 func (s *Scheduler) Validate(recipient, message string, at time.Time, tmpl *campaign.Template) (string, []string, error) {
-	phone := contacts.CleanPhone(recipient)
+	// Read as typed (contacts.ResolveTyped): a stored number (a contact, a number in the
+	// history or another scheduled message) keeps its country, so the form's Singapore
+	// contact 6591234567 is not India's 916591234567; only another bare 10-digit mobile
+	// gets India's 91. No number is matched by its last digits.
+	known := func(p string) bool { return s.hasJob(p) || (s.hist != nil && s.hist.HasPhone(p)) }
+	var phone string
+	var err error
+	if s.contacts != nil {
+		phone, err = s.contacts.Resolve(recipient, known)
+	} else {
+		phone, err = contacts.ResolveTyped(recipient, known)
+	}
+	if err != nil {
+		return "", nil, err
+	}
 	if len(phone) < 7 || len(phone) > 15 {
 		return "", nil, errors.New("Enter a valid phone number with country code.")
 	}
@@ -181,10 +195,7 @@ func (s *Scheduler) Validate(recipient, message string, at time.Time, tmpl *camp
 	}
 	var warn []string
 	if s.contacts != nil {
-		// Looked up as typed first, so a saved contact keeps its own number (the form sends
-		// the Singapore contact 6591234567 as digits, which CleanPhone would read as Indian).
-		if c, ok := s.contacts.Get(recipient); ok {
-			phone = c.Phone
+		if c, ok := s.contacts.GetExact(phone); ok {
 			if c.IsDND {
 				return "", nil, errors.New("This customer opted out. Messages to them are blocked.")
 			}
@@ -294,6 +305,49 @@ func (s *Scheduler) Retry(id string, confirmed bool) (ScheduledJob, error) {
 		}
 	}
 	return ScheduledJob{}, errors.New("Scheduled message not found.")
+}
+
+// hasJob reports whether a scheduled message is stored for exactly phone.
+func (s *Scheduler) hasJob(phone string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs {
+		if j.Recipient == phone && phone != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// ForgetPhone deletes every scheduled message for the stored numbers phones (an erasure
+// request) and the file's backup copy, which still held them. It returns how many went.
+func (s *Scheduler) ForgetPhone(phones ...string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	drop := map[string]bool{}
+	for _, p := range phones {
+		if p = contacts.NormalizePhone(p); p != "" {
+			drop[p] = true
+		}
+	}
+	kept := s.jobs[:0:0]
+	for _, j := range s.jobs {
+		// Stored numbers are compared as stored: CleanPhone would read the Singapore
+		// 6591234567 as India's 916591234567.
+		if !drop[contacts.NormalizePhone(j.Recipient)] {
+			kept = append(kept, j)
+		}
+	}
+	n := len(s.jobs) - len(kept)
+	var err error
+	if n > 0 {
+		s.jobs = kept
+		err = s.saveLocked()
+	}
+	// Also when nothing is left to delete: a message deleted by hand earlier is still in
+	// the backup copy.
+	securestore.RemoveBackup(s.filePath)
+	return n, err
 }
 
 // Delete removes a job.

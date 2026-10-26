@@ -106,8 +106,14 @@ func (s *Server) handleGetContact(w http.ResponseWriter, r *http.Request) {
 	if !s.needContacts(w) {
 		return
 	}
-	c, ok := s.Contacts.Get(r.PathValue("phone"))
+	phone, ok := s.requestPhone(w, r.PathValue("phone"))
 	if !ok {
+		return
+	}
+	// Exactly that number, and its own messages only: the Singapore contact 6591234567
+	// never shows India's 916591234567 or that customer's chat.
+	c, ok := s.Contacts.GetExact(phone)
+	if !ok || phone == "" {
 		writeError(w, http.StatusNotFound, "Contact not found.")
 		return
 	}
@@ -134,47 +140,56 @@ func (s *Server) handleSaveContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := req.Contact
-	if req.SeenDND != nil && req.SeenConsent != nil && req.OriginalPhone != "" {
-		if ex, ok := s.Contacts.Get(req.OriginalPhone); ok && (ex.IsDND != *req.SeenDND || ex.Consent != *req.SeenConsent) {
+	// Both numbers are resolved once (resolvePhone) and then used exactly: the form sends
+	// a saved contact's number as stored digits, and a typed one is read like any other.
+	orig, ok := s.requestPhone(w, req.OriginalPhone)
+	if !ok {
+		return
+	}
+	if c.Phone, ok = s.requestPhone(w, c.Phone); !ok {
+		return
+	}
+	if req.SeenDND != nil && req.SeenConsent != nil && orig != "" {
+		if ex, ok := s.Contacts.GetExact(orig); ok && (ex.IsDND != *req.SeenDND || ex.Consent != *req.SeenConsent) {
 			c.IsDND, c.Consent, c.ConsentSource = ex.IsDND, ex.Consent, ex.ConsentSource
 		}
 	}
-	if !c.IsDND && authOf(r).role != "admin" && s.isOptedOut(req.OriginalPhone, c.Phone) {
+	if !c.IsDND && authOf(r).role != "admin" && s.isOptedOut(orig, c.Phone) {
 		writeError(w, http.StatusForbidden, optOutAdminOnly)
 		return
 	}
 	if c.Consent && strings.TrimSpace(c.ConsentSource) == "" {
-		if ex, ok := s.Contacts.Get(c.Phone); !ok || !ex.Consent {
+		if ex, ok := s.Contacts.GetExact(c.Phone); !ok || !ex.Consent {
 			writeError(w, http.StatusBadRequest, "Say how this person agreed to receive messages (for example: signed up in store on 12 Oct).")
 			return
 		}
 	}
 	renamed := false
-	if req.OriginalPhone != "" && contacts.CleanPhone(req.OriginalPhone) != contacts.CleanPhone(c.Phone) {
+	if orig != "" && orig != c.Phone {
 		if authOf(r).role != "admin" {
 			// A new number replaces the old entry, which is a delete: admin only, like deleting.
 			writeError(w, http.StatusForbidden, "Only the admin can change a contact's number.")
 			return
 		}
-		if _, exists := s.Contacts.Get(c.Phone); exists {
+		if _, exists := s.Contacts.GetExact(c.Phone); exists {
 			writeError(w, http.StatusConflict, "Another contact already has that number.")
 			return
 		}
-		if old, ok := s.Contacts.Get(req.OriginalPhone); ok {
+		if old, ok := s.Contacts.GetExact(orig); ok {
 			c.CreatedAt = old.CreatedAt
 			c.IsDND = c.IsDND || old.IsDND // a new number must not undo an opt-out
 			renamed = true
 		}
 	}
 	// Save first: the old entry is only removed once the new number was accepted.
-	if err := s.Contacts.Save(c); err != nil {
+	if err := s.Contacts.SaveExact(c); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if renamed {
-		s.Contacts.Delete(req.OriginalPhone)
+		s.Contacts.Delete(orig)
 	}
-	saved, _ := s.Contacts.Get(c.Phone)
+	saved, _ := s.Contacts.GetExact(c.Phone)
 	security.LogAudit("CONTACT_SAVED", clientIP(r), actor(r), "Saved contact +"+saved.Phone, "success")
 	writeOK(w, map[string]any{"contact": saved})
 }
@@ -183,12 +198,15 @@ func (s *Server) handleDeleteContact(w http.ResponseWriter, r *http.Request) {
 	if !s.needContacts(w) {
 		return
 	}
-	phone := r.PathValue("phone")
-	if !s.Contacts.Delete(phone) {
+	phone, ok := s.requestPhone(w, r.PathValue("phone"))
+	if !ok {
+		return
+	}
+	if phone == "" || !s.Contacts.Delete(phone) {
 		writeError(w, http.StatusNotFound, "Contact not found.")
 		return
 	}
-	security.LogAudit("CONTACT_DELETED", clientIP(r), actor(r), "Deleted contact +"+contacts.CleanPhone(phone), "success")
+	security.LogAudit("CONTACT_DELETED", clientIP(r), actor(r), "Deleted contact +"+phone, "success")
 	writeOK(w, nil)
 }
 
@@ -234,8 +252,12 @@ func (s *Server) handleBulkContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	n := 0
 	for _, p := range req.Phones {
-		c, ok := s.Contacts.Get(p)
-		if !ok {
+		phone, err := s.resolvePhone(p)
+		if err != nil {
+			continue
+		}
+		c, ok := s.Contacts.GetExact(phone)
+		if !ok || phone == "" {
 			continue
 		}
 		switch req.Action {
@@ -283,16 +305,20 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 	if !req.Consent && src == "" {
 		src = "Withdrawn by staff on " + time.Now().Format("2006-01-02")
 	}
-	if req.Consent && authOf(r).role != "admin" && s.isOptedOut(req.Phone) {
+	phone, ok := s.requestPhone(w, req.Phone)
+	if !ok {
+		return
+	}
+	if req.Consent && authOf(r).role != "admin" && s.isOptedOut(phone) {
 		// Recording consent also lifts the opt-out, so staff cannot do it.
 		writeError(w, http.StatusForbidden, optOutAdminOnly)
 		return
 	}
-	if !s.Contacts.SetConsent(req.Phone, req.Consent, src) {
+	if phone == "" || !s.Contacts.SetConsent(phone, req.Consent, src) {
 		writeError(w, http.StatusNotFound, "Contact not found.")
 		return
 	}
-	security.LogAudit("CONSENT_CHANGED", clientIP(r), actor(r), fmt.Sprintf("+%s consent=%v (%s)", contacts.CleanPhone(req.Phone), req.Consent, src), "success")
+	security.LogAudit("CONSENT_CHANGED", clientIP(r), actor(r), fmt.Sprintf("+%s consent=%v (%s)", phone, req.Consent, src), "success")
 	writeOK(w, nil)
 }
 
@@ -307,16 +333,20 @@ func (s *Server) handleDND(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if !req.DND && authOf(r).role != "admin" && s.isOptedOut(req.Phone) {
+	phone, ok := s.requestPhone(w, req.Phone)
+	if !ok {
+		return
+	}
+	if !req.DND && authOf(r).role != "admin" && s.isOptedOut(phone) {
 		writeError(w, http.StatusForbidden, optOutAdminOnly)
 		return
 	}
 	reason := "Marked do-not-message by staff on " + time.Now().Format("2006-01-02")
-	if !s.Contacts.SetDND(req.Phone, req.DND, reason) {
+	if phone == "" || !s.Contacts.SetDND(phone, req.DND, reason) {
 		writeError(w, http.StatusNotFound, "Contact not found.")
 		return
 	}
-	security.LogAudit("DND_CHANGED", clientIP(r), actor(r), fmt.Sprintf("+%s do-not-message=%v", contacts.CleanPhone(req.Phone), req.DND), "success")
+	security.LogAudit("DND_CHANGED", clientIP(r), actor(r), fmt.Sprintf("+%s do-not-message=%v", phone, req.DND), "success")
 	writeOK(w, nil)
 }
 
@@ -330,11 +360,15 @@ func (s *Server) handleResumeBot(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if !s.Contacts.ResumeBot(req.Phone) {
+	phone, ok := s.requestPhone(w, req.Phone)
+	if !ok {
+		return
+	}
+	if phone == "" || !s.Contacts.ResumeBot(phone) {
 		writeError(w, http.StatusNotFound, "Contact not found.")
 		return
 	}
-	security.LogAudit("BOT_RESUMED", clientIP(r), actor(r), "Automatic replies resumed for +"+contacts.CleanPhone(req.Phone), "success")
+	security.LogAudit("BOT_RESUMED", clientIP(r), actor(r), "Automatic replies resumed for +"+phone, "success")
 	writeOK(w, nil)
 }
 
@@ -352,13 +386,17 @@ func (s *Server) handlePauseBot(w http.ResponseWriter, r *http.Request) {
 	if req.Hours <= 0 || req.Hours > 720 {
 		req.Hours = 24
 	}
-	if _, ok := s.Contacts.Get(req.Phone); !ok {
+	phone, ok := s.requestPhone(w, req.Phone)
+	if !ok {
+		return
+	}
+	if _, ok := s.Contacts.GetExact(phone); !ok || phone == "" {
 		writeError(w, http.StatusNotFound, "Contact not found.")
 		return
 	}
-	s.Contacts.PauseBot(req.Phone, time.Duration(req.Hours)*time.Hour, fmt.Sprintf("Staff took over this chat (%s)", actor(r)))
-	s.Contacts.ResumeAttentionOnly(req.Phone)
-	security.LogAudit("BOT_PAUSED", clientIP(r), actor(r), fmt.Sprintf("Automatic replies paused for +%s for %d hours", contacts.CleanPhone(req.Phone), req.Hours), "success")
+	s.Contacts.PauseBot(phone, time.Duration(req.Hours)*time.Hour, fmt.Sprintf("Staff took over this chat (%s)", actor(r)))
+	s.Contacts.ResumeAttentionOnly(phone)
+	security.LogAudit("BOT_PAUSED", clientIP(r), actor(r), fmt.Sprintf("Automatic replies paused for +%s for %d hours", phone, req.Hours), "success")
 	writeOK(w, nil)
 }
 
@@ -447,14 +485,15 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 const optOutAdminOnly = "This customer asked not to be messaged. Only the admin can undo that, or the customer can reply START."
 
-// isOptedOut reports whether any of the given numbers belongs to an opted-out contact.
-// Staff may mark a customer do-not-message, but only the admin may undo it.
+// isOptedOut reports whether any of the given stored numbers (resolvePhone) belongs to an
+// opted-out contact. Staff may mark a customer do-not-message, but only the admin may
+// undo it.
 func (s *Server) isOptedOut(phones ...string) bool {
 	for _, p := range phones {
 		if p == "" {
 			continue
 		}
-		if c, ok := s.Contacts.Get(p); ok && c.IsDND {
+		if c, ok := s.Contacts.GetExact(p); ok && c.IsDND {
 			return true
 		}
 		if s.Contacts.WasOptedOut(p) {

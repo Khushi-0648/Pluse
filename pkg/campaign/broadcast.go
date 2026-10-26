@@ -420,11 +420,23 @@ func BuildPlan(cfg config.Config, cs *contacts.Store, hs *history.Store, message
 	switch {
 	case len(aud.Phones) > 0:
 		p.Description = fmt.Sprintf("%d selected contacts", len(aud.Phones))
+		var known []func(string) bool
+		if hs != nil {
+			known = append(known, hs.HasPhone)
+		}
 		for _, raw := range aud.Phones {
-			if c, ok := cs.Get(raw); ok {
+			// Typed numbers: a stored number (a contact, or one in the history) is that
+			// number exactly; only another bare mobile gets India's 91. Never matched by
+			// its last digits (contacts.ResolveTyped).
+			phone, err := cs.Resolve(raw, known...)
+			if err != nil {
+				p.Excluded = append(p.Excluded, Exclusion{Phone: contacts.CleanWAID(raw), Reason: "Type this number with its country code: it matches two customers"})
+				continue
+			}
+			if c, ok := cs.GetExact(phone); ok && phone != "" {
 				pool = append(pool, *c)
 			} else {
-				p.Excluded = append(p.Excluded, Exclusion{Phone: contacts.CleanPhone(raw), Reason: "Not in your contact list"})
+				p.Excluded = append(p.Excluded, Exclusion{Phone: phone, Reason: "Not in your contact list"})
 			}
 		}
 	case aud.All || strings.EqualFold(tag, "all"):

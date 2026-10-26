@@ -128,24 +128,14 @@ func (s *Server) handleAuditCSV(w http.ResponseWriter, r *http.Request) {
 	cw.Flush()
 }
 
-// storedPhone turns a typed number into the one Pulse stores. The contact list also finds
-// a number typed without its country code, but messages, schedules and campaigns are
-// matched exactly, so an erasure or export must use the stored form or miss their data.
-func (s *Server) storedPhone(typed string) string {
-	phone := contacts.CleanPhone(typed)
-	if s.Contacts != nil && phone != "" {
-		// Looked up as typed: a saved contact matches exactly first (the Singapore
-		// 6591234567 is not India's 916591234567).
-		if c, ok := s.Contacts.Get(typed); ok {
-			return c.Phone
-		}
-	}
-	return phone
-}
-
 func (s *Server) handlePrivacyExport(w http.ResponseWriter, r *http.Request) {
 	typed := strings.TrimSpace(r.URL.Query().Get("phone"))
-	phone := s.storedPhone(typed)
+	// Resolved once (resolvePhone), then everything is matched exactly: the contact, the
+	// messages. A stored number never exports another customer's data.
+	phone, ok := s.requestPhone(w, typed)
+	if !ok {
+		return
+	}
 	bundle := map[string]any{"product": version.Product, "version": version.Version, "exported_at": time.Now().Format(time.RFC3339)}
 	name := "all"
 	if typed != "" {
@@ -251,54 +241,87 @@ func (s *Server) handleForgetContact(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) || !s.reauth(w, r, req.Password) {
 		return
 	}
-	phone := s.storedPhone(req.Phone)
+	// Resolved once, then every store is matched exactly: an erasure never removes a
+	// customer whose number only looks alike.
+	phone, ok := s.requestPhone(w, req.Phone)
+	if !ok {
+		return
+	}
 	if phone == "" {
 		writeError(w, http.StatusBadRequest, "Enter the phone number.")
 		return
 	}
+	// Pulse 2.0 kept a foreign number such as 6591234567 as 916591234567. That record is
+	// erased too when it is certainly this customer's (written by 2.0, from WhatsApp);
+	// otherwise it may be someone in India, so it stays and the admin is told.
+	erase := []string{phone}
+	legacy := contacts.LegacyWAID(phone)
+	kept := ""
+	if legacy != "" {
+		lc, sure := (*contacts.Contact)(nil), false
+		if s.Contacts != nil {
+			lc, sure = s.Contacts.LegacyContact(phone)
+		}
+		switch {
+		case lc != nil && sure && s.Contacts.ForgetLegacy(phone):
+			erase = append(erase, legacy)
+		case lc != nil:
+			kept = fmt.Sprintf(" A contact under +%s also exists. Pulse 2.0 may have saved this customer under that number, but it can also be a different customer in India, so it was not erased; if it is the same person, erase +%s as well.", legacy, legacy)
+		case s.History != nil && s.History.HasPhone(legacy):
+			kept = fmt.Sprintf(" Messages under +%s also exist. Pulse 2.0 may have saved this customer's messages under that number, but it can also be a different customer in India, so they were not erased; if it is the same person, erase +%s as well.", legacy, legacy)
+		}
+	}
 	msgs := 0
-	if s.History != nil {
-		msgs = s.History.ClearPhone(phone)
+	for _, p := range erase {
+		if s.History != nil {
+			msgs += s.History.ClearPhone(p)
+		}
+		if s.Campaigns != nil {
+			s.Campaigns.ForgetPhone(p)
+		}
+		if s.Hooks != nil {
+			s.Hooks.Forget("+" + p)
+		}
 	}
 	if s.Contacts != nil {
 		s.Contacts.Forget(phone) // also keeps a later "Restore backup" from bringing them back
 	}
 	if s.Scheduler != nil {
-		for _, j := range s.Scheduler.List() {
-			// Stored numbers are compared as stored: CleanPhone would read the Singapore
-			// 6591234567 as India's 916591234567 and keep that customer's messages.
-			if contacts.NormalizePhone(j.Recipient) == phone {
-				_ = s.Scheduler.Delete(j.ID)
-			}
+		// Also deletes scheduled.json.bak, which still held their messages.
+		if _, err := s.Scheduler.ForgetPhone(erase...); err != nil {
+			fmt.Printf("[Privacy] The scheduled messages could not be saved yet: %v\n", err)
 		}
-	}
-	if s.Campaigns != nil {
-		s.Campaigns.ForgetPhone(phone)
-	}
-	if s.Hooks != nil {
-		s.Hooks.Forget("+" + phone)
 	}
 	// The activity log keeps the entries (what happened, and that an erasure was done)
 	// but no longer names the customer.
 	security.RedactAudit(phone)
-	if legacy := contacts.LegacyWAID(phone); legacy != "" {
+	if legacy != "" {
 		// Pulse 2.0 logged a foreign number such as 6591234567 as 916591234567.
 		security.RedactAudit(legacy)
 	}
-	s.forgetInBackups(phone)
+	for _, p := range erase {
+		s.forgetInBackups(p)
+	}
 	security.LogAudit("CONTACT_FORGOTTEN", clientIP(r), actor(r), fmt.Sprintf("All data for %s deleted (%d messages)", security.MaskPhone(phone), msgs), "success")
+	if kept != "" {
+		security.LogAudit("CONTACT_FORGOTTEN", clientIP(r), actor(r), fmt.Sprintf("Data under %s (the form Pulse 2.0 used) was not erased: it may be a different customer", security.MaskPhone(legacy)), "warning")
+	}
 	if s.History != nil {
 		if err := s.History.Flush(); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("The contact and %d messages are deleted in Pulse, but the message file could not be saved yet (%v). Pulse keeps trying; check again in a minute.", msgs, err))
 			return
 		}
 	}
-	msg := fmt.Sprintf("Deleted the contact and %d messages.", msgs)
+	msg := fmt.Sprintf("Deleted the contact and %d messages.", msgs) + kept
 	if s.DataDir != "" && s.oldCopies() > 0 {
 		// Those files are not edited here; the owner removes them in one step.
 		msg += " Unencrypted copies from a version before 1.4 still exist: delete them under Settings > Privacy and data > Old copies."
 	}
-	writeOK(w, map[string]any{"message": msg})
+	resp := map[string]any{"message": msg}
+	if kept != "" {
+		resp["not_erased"] = "+" + legacy
+	}
+	writeOK(w, resp)
 }
 
 type backupBundle struct {
@@ -542,7 +565,12 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	if to == "" {
 		to = p.Phone
 	}
-	phone := contacts.CleanPhone(to)
+	// Resolved once (resolvePhone): a stored number keeps its country, so the Singapore
+	// 6591234567 is never India's 916591234567; only another bare mobile gets 91.
+	phone, ok := s.requestPhone(w, to)
+	if !ok {
+		return
+	}
 	if len(phone) < 7 || len(phone) > 15 {
 		writeError(w, http.StatusBadRequest, "Field 'to' must be a phone number with country code.")
 		return
@@ -577,12 +605,8 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	var ct contacts.Contact
 	known := false
 	if s.Contacts != nil {
-		// A saved contact's own number matches first (the Singapore contact 6591234567 is
-		// not India's 916591234567), then the number as read above. Nothing else is
-		// matched: this decides who gets the message.
-		if c, ok := s.Contacts.GetExact(to); ok {
-			ct, phone, known = *c, c.Phone, true
-		} else if c, ok := s.Contacts.GetExact(phone); ok {
+		// Exactly the number resolved above: this decides who gets the message.
+		if c, ok := s.Contacts.GetExact(phone); ok {
 			ct, phone, known = *c, c.Phone, true
 		}
 	}

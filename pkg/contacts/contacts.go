@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -109,11 +110,23 @@ type suppression struct {
 	// OptedOutAt keeps when an opted-out number last opted out, so a contact created for
 	// it again keeps that time and a START written before it still cannot subscribe them.
 	OptedOutAt map[string]time.Time `json:"opted_out_at,omitempty"`
-	// UpgradedAt is when Pulse 2.1 first opened this contact list. Only contacts created
-	// before it can have been saved by Pulse 2.0 under a wrong number (see LegacyWAID), so
-	// only those are ever moved or have their opt-out applied to the real number; a
-	// customer added since is never mistaken for one.
+	// UpgradedAt is when Pulse 2.1 first ran on this contact list (see settleUpgradeLocked).
+	// Only contacts created before it can have been saved by Pulse 2.0 under a wrong number
+	// (see LegacyWAID); a customer added since is never mistaken for one.
 	UpgradedAt *time.Time `json:"upgraded_at,omitempty"`
+	// LegacyBefore is set when the first start of 2.1 is not known exactly: contacts
+	// created before it surely come from Pulse 2.0; one created between it and UpgradedAt
+	// only may. Such a contact is never moved or erased with the real number, but its
+	// opt-out still counts for the real number (the safe side). nil: same as UpgradedAt.
+	LegacyBefore *time.Time `json:"legacy_before,omitempty"`
+	// LegacyAwareAt is when Pulse first looked for Pulse 2.0's numbers on this list (2.1.0
+	// did not): a contact created before it may have missed an opt-out kept under the old
+	// form, which is then applied once (applyLegacyOptOutLocked). nil: UpgradedAt.
+	LegacyAwareAt *time.Time `json:"legacy_aware_at,omitempty"`
+	// UpgradeChecked records that UpgradedAt was worked out from the evidence on this PC.
+	// 2.1.1 set UpgradedAt to its own first start, even on lists Pulse 2.1.0 had been
+	// using for hours, so those contacts looked older than they are.
+	UpgradeChecked bool `json:"upgrade_checked,omitempty"`
 	// LegacyDone lists (hashed) numbers whose Pulse 2.0 form was already folded in, so
 	// an opt-out taken over from it is applied once and an opt-in afterwards stays.
 	LegacyDone map[string]bool `json:"legacy_done,omitempty"`
@@ -143,10 +156,12 @@ func NewStore(filePath string) (*Store, error) {
 	s.saver = securestore.NewSaver(750*time.Millisecond, s.persist)
 	ext := filepath.Ext(filePath)
 	s.supPath = strings.TrimSuffix(filePath, ext) + "-suppressed" + ext
+	supExisted := false
 	if data, err := s.box.ReadFile(s.supPath); err == nil && len(data) > 0 {
 		if err := json.Unmarshal(data, &s.sup); err != nil {
 			return nil, fmt.Errorf("the opt-out list %s is damaged: %w", s.supPath, err)
 		}
+		supExisted = true
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("cannot read the opt-out list %s: %w", s.supPath, err)
 	}
@@ -181,11 +196,10 @@ func NewStore(filePath string) (*Store, error) {
 			s.contacts[c.Phone] = c
 		}
 	}
-	if s.sup.UpgradedAt == nil {
-		// The first start of 2.1 on this list (or a new list): every contact here now was
-		// written by an earlier version. Recorded at once, so it is never moved later.
-		now := time.Now()
-		s.sup.UpgradedAt = &now
+	if s.sup.UpgradedAt == nil || !s.sup.UpgradeChecked {
+		// Recorded at once, so a contact added from now on is never taken for one from
+		// Pulse 2.0.
+		s.settleUpgradeLocked(supExisted)
 		if err := s.saveSuppression(); err != nil {
 			fmt.Printf("[Contacts] The opt-out list could not be saved: %v\n", err)
 		}
@@ -193,26 +207,176 @@ func NewStore(filePath string) (*Store, error) {
 	return s, nil
 }
 
-// preUpgradeLocked reports whether c existed before Pulse 2.1 first opened this list, so
-// it may have been saved by Pulse 2.0 under a wrong number. Callers hold s.mu.
+// processStart is when this program started: the activity log's "started" entry for
+// this run is not evidence of an earlier version.
+var processStart = time.Now()
+
+// startEvents returns the activity log's APP_STARTED entries ("Pulse 2.1.0 started").
+// A variable so tests can supply a log.
+var startEvents = func() []security.AuditEvent {
+	return security.QueryAuditLog(0, "APP_STARTED", time.Time{})
+}
+
+var startedVersion = regexp.MustCompile(`(\d+)\.(\d+)\.\d+\S* started$`)
+
+// startedVersion21 reads an APP_STARTED entry: ok when it names a version, is21 when
+// that version is 2.1 or later.
+func startedVersion21(details string) (is21, ok bool) {
+	m := startedVersion.FindStringSubmatch(strings.TrimSpace(details))
+	if m == nil {
+		return false, false
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	return major > 2 || (major == 2 && minor >= 1), true
+}
+
+// settleUpgradeLocked works out, once, when Pulse 2.1 first ran on this list, so that
+// only contacts Pulse 2.0 wrote are treated as possibly saved under a wrong number.
+// Pulse 2.1.0 did not record it, and 2.1.1 recorded its own first start instead, so a
+// customer added under 2.1.0 looked like a 2.0 contact. The evidence, all of it from this
+// PC:
+//
+//   - the activity log's APP_STARTED entries name each version that started: the first
+//     2.1 start is exact when a 2.0 (or older) start is still logged before it (the log
+//     keeps the newest 2,000 entries);
+//   - Pulse 2.0 stored every number through CleanPhone, so a contact under a bare
+//     10-digit number starting 6-9 (6591234567) was written by 2.1, when it was created;
+//   - Pulse 2.0 kept no opt-out list file, and 2.1.1 recorded UpgradedAt.
+//
+// With no sign of 2.1 at all this is the first start of 2.1, and every contact is from
+// an earlier version. Otherwise UpgradedAt is the earliest sign of 2.1, and when the
+// first start is not known exactly, LegacyBefore marks the contacts that surely predate
+// it (created before a 2.0 start that is logged, else none): the others may be from
+// either version, so they are never moved (see legacyContactLocked). Callers hold s.mu
+// or own s.
+func (s *Store) settleUpgradeLocked(supExisted bool) {
+	now := time.Now()
+	aware := now
+	if s.sup.UpgradedAt != nil && s.sup.UpgradedAt.Before(now) {
+		aware = *s.sup.UpgradedAt // 2.1.1 looked for 2.0's numbers from then on
+	}
+	var upper *time.Time
+	note := func(t time.Time) {
+		if !t.IsZero() && (upper == nil || t.Before(*upper)) {
+			upper = &t
+		}
+	}
+	ran21 := supExisted
+	if s.sup.UpgradedAt != nil {
+		ran21 = true
+		note(*s.sup.UpgradedAt)
+	}
+	for _, c := range s.contacts {
+		if LegacyWAID(c.Phone) != "" {
+			ran21 = true
+			note(c.CreatedAt)
+		}
+	}
+	var first21 *time.Time
+	var starts20 []time.Time
+	for _, e := range startEvents() {
+		if !e.Timestamp.Before(processStart) {
+			continue
+		}
+		is21, ok := startedVersion21(e.Details)
+		switch {
+		case !ok:
+		case is21:
+			if first21 == nil || e.Timestamp.Before(*first21) {
+				t := e.Timestamp
+				first21 = &t
+			}
+		default:
+			starts20 = append(starts20, e.Timestamp)
+		}
+	}
+	var last20 *time.Time
+	for _, t := range starts20 {
+		if (first21 == nil || t.Before(*first21)) && (last20 == nil || t.After(*last20)) {
+			t := t
+			last20 = &t
+		}
+	}
+	if first21 != nil {
+		ran21 = true
+		note(*first21)
+	}
+	if !ran21 {
+		s.sup.UpgradedAt, s.sup.LegacyBefore = &now, nil
+		aware = now
+	} else {
+		up := now
+		if upper != nil {
+			up = *upper
+		}
+		var lower time.Time // nothing surely from Pulse 2.0
+		switch {
+		case first21 != nil && last20 != nil:
+			lower = *first21 // the first start of 2.1 is in the log
+		case last20 != nil:
+			lower = *last20 // 2.0 still ran then
+		}
+		if lower.After(up) {
+			lower = up
+		}
+		s.sup.UpgradedAt = &up
+		s.sup.LegacyBefore = nil
+		if !lower.Equal(up) {
+			s.sup.LegacyBefore = &lower
+		}
+	}
+	s.sup.LegacyAwareAt = &aware
+	s.sup.UpgradeChecked = true
+}
+
+// preUpgradeLocked reports whether c may have been written by Pulse 2.0 (created before
+// UpgradedAt), so it may be saved under a wrong number. Callers hold s.mu.
 func (s *Store) preUpgradeLocked(c Contact) bool {
 	return s.sup.UpgradedAt != nil && c.CreatedAt.Before(*s.sup.UpgradedAt)
 }
 
+// surelyPreUpgradeLocked reports whether c was certainly written by Pulse 2.0 (see
+// LegacyBefore). Callers hold s.mu.
+func (s *Store) surelyPreUpgradeLocked(c Contact) bool {
+	if s.sup.LegacyBefore != nil {
+		return c.CreatedAt.Before(*s.sup.LegacyBefore)
+	}
+	return s.preUpgradeLocked(c)
+}
+
 // legacyContactLocked returns the contact Pulse 2.0 may have saved for phone under
-// LegacyWAID(phone): one that existed before the upgrade and came from WhatsApp, wrote
-// or opted out (one typed in by staff for the Indian number is not taken). Callers hold
-// s.mu.
-func (s *Store) legacyContactLocked(phone string) (Contact, bool) {
+// LegacyWAID(phone): one written by Pulse 2.0 that came from WhatsApp, wrote or opted
+// out (one typed in by staff for the Indian number is not taken). sure reports that it
+// was certainly written by Pulse 2.0 (surelyPreUpgradeLocked): only then may it be moved
+// to phone or erased with it. Either way its opt-out counts for phone. Callers hold s.mu.
+func (s *Store) legacyContactLocked(phone string) (c Contact, sure, ok bool) {
 	legacy := LegacyWAID(phone)
 	if legacy == "" {
-		return Contact{}, false
+		return Contact{}, false, false
 	}
-	c, ok := s.contacts[legacy]
+	c, ok = s.contacts[legacy]
 	if !ok || !s.preUpgradeLocked(c) || !(c.Source == "whatsapp" || c.LastInboundAt != nil || c.IsDND) {
-		return Contact{}, false
+		return Contact{}, false, false
 	}
-	return c, true
+	return c, s.surelyPreUpgradeLocked(c), true
+}
+
+// LegacyContact returns the contact stored under Pulse 2.0's form of phone (LegacyWAID:
+// 916591234567 for 6591234567), if there is one. sure reports that it is certainly
+// Pulse 2.0's record of phone's customer (see legacyContactLocked); otherwise it may be a
+// different, Indian customer and must be left alone.
+func (s *Store) LegacyContact(phone string) (c *Contact, sure bool) {
+	phone = NormalizePhone(phone)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	legacy := LegacyWAID(phone)
+	ex, ok := s.contacts[legacy]
+	if legacy == "" || !ok {
+		return nil, false
+	}
+	_, sure, _ = s.legacyContactLocked(phone)
+	return &ex, sure
 }
 
 func cleanName(name, phone string) string {
@@ -321,19 +485,101 @@ func sortContacts(list []Contact) {
 	})
 }
 
-// Get finds a contact by a number a person typed, tolerating formatting differences: it
-// is a lookup aid for the dashboard and the command line (see typedKeyLocked). Anything
-// that decides whether or where a message is sent uses GetExact on the stored number.
+// Get finds a contact by a number a person typed (see ResolveTyped): a stored number
+// matches exactly, a number typed with its country code means that number, and only a
+// bare number that is no stored number gets India's 91 (CleanPhone). No number is ever
+// matched by its last digits. Code holding a stored number uses GetExact.
 func (s *Store) Get(phone string) (*Contact, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key, ok := s.typedKeyLocked(phone)
-	if !ok {
+	key, err := ResolveTyped(phone, s.hasLocked)
+	if err != nil {
 		return nil, false
 	}
-	c := s.contacts[key]
+	c, ok := s.contacts[key]
+	if !ok || key == "" {
+		return nil, false
+	}
 	return &c, true
 }
+
+// Resolve turns a number a person typed into the stored number it means (ResolveTyped).
+// A number is known when it is a contact or when one of known says so (for example the
+// message history), so a stored number that is no longer a contact keeps its country.
+func (s *Store) Resolve(typed string, known ...func(string) bool) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return ResolveTyped(typed, func(p string) bool {
+		if s.hasLocked(p) {
+			return true
+		}
+		for _, k := range known {
+			if k != nil && k(p) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// hasLocked reports whether phone is a contact's stored number. Callers hold s.mu.
+func (s *Store) hasLocked(phone string) bool {
+	_, ok := s.contacts[phone]
+	return ok && phone != ""
+}
+
+// ErrAmbiguousNumber is returned for a typed number that can mean two stored numbers.
+var ErrAmbiguousNumber = errors.New("That number matches two customers (one with India's +91 in front). Type it with its country code, for example +65 9123 4567 or +91 65912 34567.")
+
+// ResolveTyped turns a number a person typed (a form, a search for one customer, the
+// "send to" field, an integration's "to") into the stored number it means. This is the
+// only place where India's 91 is guessed (CleanPhone), and only for typed input:
+//
+//   - a number typed with + or 00 has its country code: nothing is guessed;
+//   - a bare run of digits that is a stored number (known) is that number exactly, so
+//     the Singapore 6591234567 is never India's 916591234567;
+//   - other digits get the reading of a person typing a local number: a 10-digit mobile
+//     starting 6-9 is Indian (CleanPhone); a longer number is taken as international;
+//     one of 10 digits or fewer with no such reading has no known country:
+//     ErrNeedsCountryCode;
+//   - formatted digits without a + ("65 9123 4567") that are a stored number as they are
+//     and also with 91 in front name two customers: ErrAmbiguousNumber.
+//
+// No number is ever matched by its last digits. Code that already holds a stored number
+// (from a contact, the history, a scheduled message or Meta) uses it as it is.
+func ResolveTyped(typed string, known func(string) bool) (string, error) {
+	t := strings.TrimSpace(typed)
+	if t == "" {
+		return "", nil
+	}
+	guess := CleanPhone(t)
+	raw := CleanWAID(t)
+	if strings.Contains(t, "@") {
+		return raw, nil // a WhatsApp ID (6591234567@s.whatsapp.net) is international
+	}
+	if strings.HasPrefix(t, "+") || strings.HasPrefix(raw, "00") {
+		return guess, nil
+	}
+	if known == nil {
+		known = func(string) bool { return false }
+	}
+	if raw != "" && known(raw) {
+		if raw != guess && nonDigits.FindStringIndex(t) != nil && known(guess) {
+			return "", ErrAmbiguousNumber
+		}
+		return raw, nil
+	}
+	if guess == raw && len(raw) > 0 && len(raw) <= 10 {
+		// Not a stored number and no reading applies (not an Indian mobile): a local
+		// number without its country code. Never matched by its last digits.
+		return "", ErrNeedsCountryCode
+	}
+	return guess, nil
+}
+
+// ErrNeedsCountryCode is returned for a typed number of 10 digits or fewer that is not a
+// stored number and not an Indian mobile (6-9...), so its country is unknown.
+var ErrNeedsCountryCode = errors.New("Type the number with its country code, for example +1 202 555 0123 or +91 98765 43210.")
 
 // GetExact finds the contact stored under phone, an international number (a stored
 // contact number, a Meta wa_id, or one typed with its +country code). No country code is
@@ -360,62 +606,17 @@ func (s *Store) exactKeyLocked(phone string) (string, bool) {
 	return k, ok
 }
 
-// typedKeyLocked finds the stored key for a number a person typed. A number typed with
-// its country code (+65 9123 4567, 0065...) or a stored number matches exactly, so the
-// Singapore number 6591234567 finds its own contact, not the Indian 916591234567; only
-// then is a bare number read as typed by a person (CleanPhone, which adds India's 91 to
-// a 10-digit mobile) or matched by its last 10 digits.
-func (s *Store) typedKeyLocked(phone string) (string, bool) {
-	if k, ok := s.exactKeyLocked(phone); ok {
-		return k, true
-	}
-	t := strings.TrimSpace(phone)
-	if strings.HasPrefix(t, "+") || strings.HasPrefix(CleanWAID(t), "00") {
-		k := CleanPhone(t) // the country code was given: nothing is guessed
-		_, ok := s.contacts[k]
-		return k, ok && k != ""
-	}
-	for _, k := range []string{CleanPhone(phone), CleanWAID(phone)} {
-		if _, ok := s.contacts[k]; ok && k != "" {
-			return k, true
-		}
-	}
-	raw := CleanWAID(phone)
-	// A bare 10-digit number without a country code may match one saved contact by its
-	// last digits; numbers with a country code must match exactly.
-	if len(raw) == 10 {
-		found := ""
-		for k := range s.contacts {
-			if len(k) > 10 && strings.HasSuffix(k, raw) {
-				if found != "" {
-					return "", false
-				}
-				found = k
-			}
-		}
-		if found != "" {
-			return found, true
-		}
-	}
-	return "", false
-}
-
 // Save creates or replaces a contact's editable fields; system timestamps are preserved.
-// c.Phone is the number as a person typed it (a 10-digit Indian mobile gets its 91), or
-// a saved contact's stored number. Only the contact under that exact number is changed:
-// saving one number never replaces or deletes another number's contact or opt-out.
+// c.Phone is the number as a person typed it, or a saved contact's stored number, read by
+// ResolveTyped: a saved contact keeps its number (6591234567 is Singapore, not India's
+// 916591234567). Only the contact under that exact number is changed: saving one number
+// never replaces or deletes another number's contact or opt-out.
 func (s *Store) Save(c Contact) error {
-	typed := c.Phone
-	c.Phone = CleanPhone(typed)
-	if exact := NormalizePhone(typed); exact != c.Phone {
-		// The form sends a saved contact's number back as stored digits: an existing
-		// contact keeps its number (6591234567 is Singapore, not India's 916591234567).
-		s.mu.RLock()
-		if _, ok := s.contacts[exact]; ok {
-			c.Phone = exact
-		}
-		s.mu.RUnlock()
+	phone, err := s.Resolve(c.Phone)
+	if err != nil {
+		return err
 	}
+	c.Phone = phone
 	return s.save(c)
 }
 
@@ -613,11 +814,12 @@ func (s *Store) Upsert(phone, name, source string) Contact {
 	}
 	legacy := LegacyWAID(phone)
 	supChanged := s.carryLegacySuppressionLocked(legacy, phone)
-	if c, ok := s.legacyContactLocked(phone); ok {
-		// Only a contact from before the upgrade that came from WhatsApp, wrote, or opted
-		// out moves: one typed in by staff for the Indian number, or any contact added
-		// since (a real Indian customer), is left alone. An opt-out also stays on the old
-		// number, so if it really was India's 91 number, that customer stays opted out.
+	if c, sure, ok := s.legacyContactLocked(phone); ok && sure {
+		// Only a contact certainly written by Pulse 2.0 that came from WhatsApp, wrote, or
+		// opted out moves: one typed in by staff for the Indian number, or any contact that
+		// may have been added since (a real Indian customer), is left alone; its opt-out
+		// still applies to the new contact below. An opt-out also stays on the old number,
+		// so if it really was India's 91 number, that customer stays opted out.
 		if c.IsDND {
 			// The list is saved below in any case (markLegacyDoneLocked changes it too).
 			s.suppressLocked(legacy, suppressOptedOut)
@@ -715,20 +917,31 @@ func (s *Store) markLegacyDoneLocked(phone string) {
 	s.sup.LegacyDone[s.suppressKeyLocked(phone)] = true
 }
 
-// applyLegacyOptOutLocked applies to c, a contact from before the upgrade, an opt-out
-// that Pulse 2.0 recorded under its wrong form of the number (LegacyWAID): a live
-// contact there that opted out, or one deleted after opting out. It is done once per
-// number (an opt-in afterwards stays), and not when the customer's own START is newer.
+// beforeLegacyAwareLocked reports whether c was created before Pulse looked for Pulse
+// 2.0's numbers (LegacyAwareAt; Pulse 2.1.0 created contacts under the real number
+// without doing so). Callers hold s.mu.
+func (s *Store) beforeLegacyAwareLocked(c Contact) bool {
+	if s.sup.LegacyAwareAt != nil {
+		return c.CreatedAt.Before(*s.sup.LegacyAwareAt)
+	}
+	return s.preUpgradeLocked(c)
+}
+
+// applyLegacyOptOutLocked applies to c, a contact created before Pulse looked for Pulse
+// 2.0's numbers (beforeLegacyAwareLocked), an opt-out that Pulse 2.0 recorded under its
+// wrong form of the number (LegacyWAID): a live contact there that opted out, or one
+// deleted after opting out. It is done once per number (an opt-in afterwards stays), and
+// not when the customer's own START is newer or the opt-out was made since the upgrade.
 // It reports whether c changed and whether the suppression list changed. Callers hold
 // s.mu.
 func (s *Store) applyLegacyOptOutLocked(c *Contact) (optedOut, supChanged bool) {
 	legacy := LegacyWAID(c.Phone)
-	if legacy == "" || c.IsDND || !s.preUpgradeLocked(*c) || s.sup.LegacyDone[s.suppressKeyLocked(c.Phone)] {
+	if legacy == "" || c.IsDND || !s.beforeLegacyAwareLocked(*c) || s.sup.LegacyDone[s.suppressKeyLocked(c.Phone)] {
 		return false, false
 	}
 	var at *time.Time
 	found := false
-	if lc, ok := s.legacyContactLocked(c.Phone); ok && lc.IsDND {
+	if lc, _, ok := s.legacyContactLocked(c.Phone); ok && lc.IsDND {
 		found, at = true, lc.ConsentAt
 	} else if lk := s.suppressKeyLocked(legacy); isOptOutMark(s.sup.Numbers[lk]) {
 		found = true
@@ -838,6 +1051,37 @@ func (s *Store) Forget(phone string) bool {
 	return s.remove(phone, suppressForgotten)
 }
 
+// ForgetLegacy erases, for an erasure request for phone, the contact Pulse 2.0 kept for
+// that customer under LegacyWAID(phone) (916591234567 for 6591234567), but only when it
+// is certainly that customer's record (LegacyContact reports sure); a contact that may
+// belong to someone in India is left alone. Like Forget, the old form is never restored
+// from a backup; if it had opted out it also stays opted out, in case that number
+// belongs to someone else too. Call it before Forget(phone). It reports whether a contact
+// was erased.
+func (s *Store) ForgetLegacy(phone string) bool {
+	phone = NormalizePhone(phone)
+	s.mu.Lock()
+	c, sure, ok := s.legacyContactLocked(phone)
+	if !ok || !sure {
+		s.mu.Unlock()
+		return false
+	}
+	legacy := LegacyWAID(phone)
+	delete(s.contacts, legacy)
+	if c.IsDND {
+		s.sup.Numbers[s.suppressKeyLocked(legacy)] = suppressForgottenOptedOut
+	} else {
+		s.forgetLegacyLocked(legacy)
+	}
+	s.mu.Unlock()
+	if err := s.saveSuppression(); err != nil {
+		fmt.Printf("[Contacts] The opt-out list could not be saved: %v\n", err)
+	}
+	s.changed(true)
+	securestore.RemoveBackup(s.filePath)
+	return true
+}
+
 // remove deletes a contact. A contact who had opted out is remembered as such (a restore
 // brings them back only as do-not-message); reason "forgotten" blocks any restore.
 func (s *Store) remove(phone, reason string) bool {
@@ -898,7 +1142,7 @@ func (s *Store) optedOutBeforeLocked(phone string) bool {
 	if isOptOutMark(s.sup.Numbers[s.suppressKeyLocked(legacy)]) {
 		return true
 	}
-	lc, ok := s.legacyContactLocked(phone)
+	lc, _, ok := s.legacyContactLocked(phone)
 	return ok && lc.IsDND
 }
 
@@ -928,7 +1172,7 @@ func (s *Store) optedOutAtLocked(phone string) *time.Time {
 		if t, ok := s.sup.OptedOutAt[s.suppressKeyLocked(legacy)]; ok {
 			return &t
 		}
-		if lc, ok := s.legacyContactLocked(phone); ok && lc.IsDND && lc.ConsentAt != nil {
+		if lc, _, ok := s.legacyContactLocked(phone); ok && lc.IsDND && lc.ConsentAt != nil {
 			t := *lc.ConsentAt
 			return &t
 		}
@@ -1198,7 +1442,7 @@ func (s *Store) ResumeAttentionOnly(phone string) bool {
 
 // IsBotPaused reports whether automated replies are paused.
 func (s *Store) IsBotPaused(phone string) bool {
-	c, ok := s.Get(phone)
+	c, ok := s.GetExact(phone)
 	return ok && c.BotPaused(time.Now())
 }
 
@@ -1538,13 +1782,13 @@ func (s *Store) ImportCSV(r io.Reader, mapping ...*CSVMapping) (CSVImportResult,
 			res.Warnings = append(res.Warnings, fmt.Sprintf("Row %d: the phone %q was changed by Excel. Format the phone column as Text, type the numbers again and save.", rowNum, raw))
 			continue
 		}
-		phone := CleanPhone(raw)
-		if exact := NormalizePhone(raw); exact != phone {
-			// A saved contact's number exported as digits keeps its country (6591234567
-			// is Singapore, not India's 916591234567).
-			if _, ok := s.contacts[exact]; ok {
-				phone = exact
-			}
+		// Read like a typed number: a saved contact's number exported as digits keeps its
+		// country (6591234567 is Singapore, not India's 916591234567).
+		phone, rerr := ResolveTyped(raw, s.hasLocked)
+		if rerr != nil {
+			res.Skipped++
+			res.Warnings = append(res.Warnings, fmt.Sprintf("Row %d: %q matches two contacts; write it with its country code (+...).", rowNum, raw))
+			continue
 		}
 		if len(phone) < 7 || len(phone) > 15 {
 			res.Skipped++

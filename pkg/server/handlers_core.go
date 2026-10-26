@@ -190,7 +190,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		for _, c := range s.History.Conversations() {
 			var lastRead *time.Time
 			if s.Contacts != nil {
-				if ct, ok := s.Contacts.Get(c.Phone); ok {
+				if ct, ok := s.Contacts.GetExact(c.Phone); ok { // a stored number: its own contact only
 					lastRead = ct.LastReadAt
 				}
 			}

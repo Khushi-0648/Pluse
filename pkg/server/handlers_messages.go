@@ -52,12 +52,20 @@ func (s *Server) handleChatMeta(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) || !s.needContacts(w) {
 		return
 	}
-	before, _ := s.Contacts.Get(req.Phone)
-	if err := s.Contacts.SetChatMeta(req.Phone, req.AssignedTo, req.Notes); err != nil {
+	phone, ok := s.requestPhone(w, req.Phone)
+	if !ok {
+		return
+	}
+	before, _ := s.Contacts.GetExact(phone)
+	if err := s.Contacts.SetChatMeta(phone, req.AssignedTo, req.Notes); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	c, _ := s.Contacts.Get(req.Phone)
+	c, ok := s.Contacts.GetExact(phone)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "Enter a valid phone number.")
+		return
+	}
 	if req.AssignedTo != nil && (before == nil || before.AssignedTo != c.AssignedTo) {
 		who := c.AssignedTo
 		if who == "" {
@@ -88,7 +96,9 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 			v := conversationView{Phone: c.Phone, Name: c.Name, LastText: c.LastText, LastAt: c.LastAt, LastDirection: string(c.LastDirection), LastStatus: c.LastStatus}
 			var lastRead *time.Time
 			if s.Contacts != nil {
-				if ct, ok := s.Contacts.Get(c.Phone); ok {
+				// A stored number: its own contact only (the Singapore chat 6591234567
+				// never shows India's 916591234567).
+				if ct, ok := s.Contacts.GetExact(c.Phone); ok {
 					if ct.Name != "" {
 						v.Name = ct.Name
 					}
@@ -170,7 +180,14 @@ func (s *Server) handleMarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.Contacts != nil {
-		phone := s.resolvePhone(req.Phone)
+		phone, ok := s.requestPhone(w, req.Phone)
+		if !ok {
+			return
+		}
+		if len(phone) < 7 {
+			writeOK(w, nil)
+			return
+		}
 		if _, ok := s.Contacts.GetExact(phone); !ok {
 			s.Contacts.Upsert(phone, "", "whatsapp")
 		}
@@ -188,7 +205,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	q := history.Query{Limit: limit, Phone: r.URL.Query().Get("phone"), Search: r.URL.Query().Get("search")}
+	// The chat's stored number, or one typed by a person: resolved once, then matched
+	// exactly, so a stored number never shows another customer's messages.
+	phone, ok := s.requestPhone(w, r.URL.Query().Get("phone"))
+	if !ok {
+		return
+	}
+	q := history.Query{Limit: limit, Phone: phone, Search: r.URL.Query().Get("search")}
 	if b := r.URL.Query().Get("before"); b != "" {
 		if t, err := time.Parse(time.RFC3339Nano, b); err == nil {
 			q.Before = t
@@ -205,7 +228,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteMessages(w http.ResponseWriter, r *http.Request) {
-	phone := s.resolvePhone(r.URL.Query().Get("phone"))
+	phone, ok := s.requestPhone(w, r.URL.Query().Get("phone"))
+	if !ok {
+		return
+	}
 	if phone == "" {
 		writeError(w, http.StatusBadRequest, "Choose a conversation to clear. To delete everything use Settings > Privacy.")
 		return
@@ -271,7 +297,10 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	phone := s.resolvePhone(req.To)
+	phone, ok := s.requestPhone(w, req.To)
+	if !ok {
+		return
+	}
 	if len(phone) < 7 || len(phone) > 15 {
 		writeError(w, http.StatusBadRequest, "Enter a valid phone number with country code, for example +919876543210.")
 		return
@@ -381,17 +410,49 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"message_id": id, "to": phone, "text": rendered})
 }
 
-// resolvePhone turns a number from the dashboard or an integration into the stored form.
-// A saved contact is found as written first, so a number that came from WhatsApp (for
-// example Singapore's 6591234567) keeps its country; only a number that matches no
-// contact is read as typed by hand, where a 10-digit Indian mobile gets its 91.
-func (s *Server) resolvePhone(raw string) string {
-	if s.Contacts != nil && strings.TrimSpace(raw) != "" {
-		if c, ok := s.Contacts.Get(raw); ok {
-			return c.Phone
-		}
+// resolvePhone turns a number from the dashboard, a form or an integration into the
+// stored number it means (contacts.ResolveTyped). Every handler that takes a number from
+// a request goes through it once and then uses the result exactly (GetExact, history and
+// schedule matches), so a number is never read two ways in one request:
+//
+//   - a stored number (a contact, a chat in the history, a scheduled message) is that
+//     number, so the Singapore 6591234567 keeps its country even when India's
+//     916591234567 is also a customer;
+//   - a number typed with + or 00 has its country code;
+//   - only another bare 10-digit mobile gets India's 91; nothing is matched by its last
+//     digits, and a number that could mean two customers is refused.
+func (s *Server) resolvePhone(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", nil
 	}
-	return contacts.CleanPhone(raw)
+	known := func(p string) bool {
+		if s.History != nil && s.History.HasPhone(p) {
+			return true
+		}
+		if s.Scheduler != nil {
+			for _, j := range s.Scheduler.List() {
+				if j.Recipient == p {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if s.Contacts != nil {
+		return s.Contacts.Resolve(raw, known)
+	}
+	return contacts.ResolveTyped(raw, known)
+}
+
+// requestPhone is resolvePhone for a handler: a number that could mean two customers is
+// answered with 400 and ok is false.
+func (s *Server) requestPhone(w http.ResponseWriter, raw string) (string, bool) {
+	phone, err := s.resolvePhone(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return "", false
+	}
+	return phone, true
 }
 
 // DirectLabel prefixes the label of messages typed in the inbox, test messages and the

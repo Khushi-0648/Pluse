@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/securestore"
 )
 
@@ -467,13 +466,22 @@ func (s *Store) Get(id string) (MessageRecord, bool) {
 	return MessageRecord{}, false
 }
 
-// normPhone applies the same rules as contact numbers: stored digits are kept as they
-// are (the Singapore 6591234567 is not India's 916591234567), typed ones are cleaned.
-func normPhone(p string) string {
-	if strings.TrimSpace(p) == "" {
-		return ""
+// HasPhone reports whether any message is stored under exactly phone (international
+// digits), so a number typed by a person can be read as a stored number first
+// (contacts.ResolveTyped).
+func (s *Store) HasPhone(phone string) bool {
+	p := digits(phone)
+	if p == "" {
+		return false
 	}
-	return contacts.NormalizePhone(p)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := len(s.messages) - 1; i >= 0; i-- {
+		if s.messages[i].Phone == p {
+			return true
+		}
+	}
+	return false
 }
 
 func phoneMatch(stored, filter string) bool {
@@ -490,7 +498,11 @@ func (s *Store) List(limit int, phone, search string) []MessageRecord {
 
 // Query filters messages.
 type Query struct {
-	Limit    int
+	Limit int
+	// Phone is a stored number (international digits; a leading + or spaces are
+	// ignored), matched exactly: no country code is guessed, so the Singapore 6591234567
+	// never shows India's 916591234567. Turn a number a person typed into a stored number
+	// first (contacts.Store.Resolve).
 	Phone    string
 	Search   string
 	Before   time.Time
@@ -499,19 +511,12 @@ type Query struct {
 }
 
 // Query returns matching messages, newest first. A phone filter matches the stored
-// number exactly; only when nothing matches is it read as typed (9876543210 finds
-// 919876543210).
+// number exactly (see Query.Phone); a filter that is not a number matches nothing.
 func (s *Store) Query(q Query) []MessageRecord {
-	out := s.query(q, normPhone(q.Phone))
-	if len(out) == 0 && strings.TrimSpace(q.Phone) != "" {
-		if typed := contacts.CleanPhone(q.Phone); typed != normPhone(q.Phone) {
-			out = s.query(q, typed)
-		}
+	phone := digits(q.Phone)
+	if phone == "" && strings.TrimSpace(q.Phone) != "" {
+		return []MessageRecord{}
 	}
-	return out
-}
-
-func (s *Store) query(q Query, phone string) []MessageRecord {
 	search := strings.ToLower(strings.TrimSpace(q.Search))
 	s.mu.RLock()
 	defer s.mu.RUnlock()

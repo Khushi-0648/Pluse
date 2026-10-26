@@ -131,8 +131,10 @@ func TestOnlyPreUpgradeContactsMove(t *testing.T) {
 // Pulse 2.0 kept under the 91 form still applies (once), and WasOptedOut sees a live
 // opted-out contact under that form.
 func TestLegacyOptOutAppliesBesideExistingContact(t *testing.T) {
+	// Pulse 2.0 stored every number through CleanPhone, so the contact under the real
+	// number was added later, by 2.1.0 (which did not look for the 91 form).
 	s, _ := seeded(t,
-		Contact{Phone: "6591234567", Name: "Wei", Source: "manual", CreatedAt: before},
+		Contact{Phone: "6591234567", Name: "Wei", Source: "manual", CreatedAt: before.Add(time.Hour)},
 		Contact{Phone: "916591234567", Source: "whatsapp", IsDND: true, ConsentAt: &before, CreatedAt: before},
 		Contact{Phone: "916591234568", Source: "whatsapp", IsDND: true, ConsentAt: &before, CreatedAt: before},
 	)

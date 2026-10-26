@@ -131,8 +131,13 @@ func TestQueriesAndConversations(t *testing.T) {
 	s.Record(MessageRecord{ID: "1", Direction: DirectionIncoming, Phone: "919876543210", Name: "Asha", Text: "hello", Timestamp: base})
 	s.Record(MessageRecord{ID: "2", Direction: DirectionOutgoing, Type: TypeAutoReply, Phone: "919876543210", Text: "hi there", Timestamp: base.Add(time.Second)})
 	s.Record(MessageRecord{ID: "3", Direction: DirectionIncoming, Phone: "14155550100", Text: "price?", Timestamp: base.Add(2 * time.Second)})
-	if got := s.List(10, "9876543210", ""); len(got) != 2 || got[0].ID != "2" {
+	if got := s.List(10, "919876543210", ""); len(got) != 2 || got[0].ID != "2" {
 		t.Fatalf("phone filter or order wrong: %+v", got)
+	}
+	// The filter is a stored number: a typed one is resolved by the caller
+	// (contacts.ResolveTyped), never guessed here.
+	if got := s.List(10, "9876543210", ""); len(got) != 0 {
+		t.Fatalf("a different stored number must not match: %+v", got)
 	}
 	if got := s.List(10, "", "PRICE"); len(got) != 1 {
 		t.Fatal("search should be case-insensitive")

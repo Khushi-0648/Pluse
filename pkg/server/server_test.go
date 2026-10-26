@@ -909,13 +909,22 @@ func TestContactSaveKeepsOptOutsAndAdminRights(t *testing.T) {
 	}
 }
 
-// "Delete all their data" typed without the country code must still find their messages.
+// "Delete all their data" finds the stored number's messages when typed with its country
+// code; a bare number is not matched to it by its last 10 digits (A5).
 func TestForgetFindsMessagesOfANumberTypedWithoutCountryCode(t *testing.T) {
 	h := newHarness(t)
 	h.login(adminPass)
 	_ = h.cs.Save(contacts.Contact{Phone: "12025550123"})
 	h.hs.Record(history.MessageRecord{ID: "f1", Direction: history.DirectionIncoming, Type: history.TypeUserMessage, Phone: "12025550123", Text: "hi", Timestamp: time.Now()})
-	w, out := h.api("POST", "/privacy/forget-contact", map[string]any{"phone": "2025550123", "password": adminPass})
+	// A bare number is never matched to a stored one by its last digits (that could erase
+	// another customer): without the country code it is refused.
+	if w, out := h.api("POST", "/privacy/forget-contact", map[string]any{"phone": "2025550123", "password": adminPass}); w.Code != http.StatusBadRequest {
+		t.Fatalf("a number without its country code erased another customer: %d %v", w.Code, out)
+	}
+	if _, ok := h.cs.GetExact("12025550123"); !ok {
+		t.Fatal("the US contact was erased by its last 10 digits")
+	}
+	w, out := h.api("POST", "/privacy/forget-contact", map[string]any{"phone": "+1 202 555 0123", "password": adminPass})
 	if w.Code != 200 || !strings.Contains(fmt.Sprint(out["message"]), "1 messages") {
 		t.Fatalf("the stored number's messages must be deleted too: %d %v", w.Code, out)
 	}
