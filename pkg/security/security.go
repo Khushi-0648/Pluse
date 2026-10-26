@@ -482,6 +482,9 @@ func NamesHost(r *http.Request, host string) bool {
 }
 
 // viaTunnel reports whether r is a loopback request addressed to the registered tunnel host.
+// The Host header itself must name the public host (cloudflared and ngrok pass it on as
+// the browser sent it). X-Forwarded-Host is not enough: a web page can set that header,
+// so a DNS-rebinding page on this computer could otherwise pass as the tunnel (F9).
 func viaTunnel(r *http.Request, ip net.IP) bool {
 	if ip == nil || !ip.IsLoopback() {
 		return false
@@ -492,7 +495,12 @@ func viaTunnel(r *http.Request, ip net.IP) bool {
 	if f == nil {
 		return false
 	}
-	return NamesHost(r, f())
+	host := strings.ToLower(strings.TrimSpace(f()))
+	h := r.Host
+	if name, _, err := net.SplitHostPort(h); err == nil {
+		h = name
+	}
+	return host != "" && strings.ToLower(strings.Trim(h, "[]")) == host
 }
 
 // trustedPeer reports whether r's TCP peer is a proxy whose forwarding headers are believed.

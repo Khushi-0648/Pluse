@@ -154,3 +154,20 @@ func TestRemoteOriginHTTPSAndHSTS(t *testing.T) {
 		t.Fatal("no HSTS on the computer's plain http address")
 	}
 }
+
+// F9: a DNS-rebinding page on this computer can set X-Forwarded-Host to the public host
+// (it is not a forbidden header), but its Host is still the rebound name: it must not be
+// treated as the tunnel, not even for GET requests.
+func TestRebindingPageNamingThePublicHostIsRefused(t *testing.T) {
+	h := newHarness(t)
+	remoteOn(t, h)
+	req := remoteReq("GET", "/login", "", "https", "203.0.113.9")
+	req.Host = "evil.example:8085"
+	req.Header.Set("X-Forwarded-Host", hostOnly(strings.TrimPrefix(publicURL, "https://")))
+	if w := serveRemote(h, req); w.Code != http.StatusNotFound {
+		t.Fatalf("a rebinding page naming the public host in X-Forwarded-Host must get 404, got %d", w.Code)
+	}
+	if security.FromTrustedProxy(req) {
+		t.Fatal("its X-Forwarded-For must not be believed")
+	}
+}

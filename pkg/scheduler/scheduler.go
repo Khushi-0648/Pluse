@@ -45,6 +45,9 @@ type ScheduledJob struct {
 	MessageID     string     `json:"message_id,omitempty"`
 	Error         string     `json:"error,omitempty"`
 	CreatedBy     string     `json:"created_by,omitempty"`
+	// MaybeSent is set when the last attempt may have reached the customer (Meta's answer
+	// was lost, or Pulse stopped while sending): Retry then needs an explicit confirmation.
+	MaybeSent bool `json:"maybe_sent,omitempty"`
 	// Template is sent instead of Message when the customer has not written in the
 	// 24 hours before the scheduled time.
 	Template *campaign.Template `json:"template,omitempty"`
@@ -91,6 +94,7 @@ func NewScheduler(filePath string, s campaign.Sender, cfg *config.Config, cs *co
 		if sc.jobs[i].Status == StatusSending {
 			sc.jobs[i].Status = StatusFailed
 			sc.jobs[i].Error = "Pulse stopped while sending. Check the chat before retrying."
+			sc.jobs[i].MaybeSent = true
 		}
 	}
 	if cs != nil {
@@ -264,16 +268,27 @@ func (s *Scheduler) Cancel(id string) error {
 	return errors.New("Scheduled message not found.")
 }
 
-// Retry sends a failed or skipped job again now.
-func (s *Scheduler) Retry(id string) (ScheduledJob, error) {
+// ErrRetryNeedsConfirm is returned by Retry for a message that may already have reached
+// the customer, unless the owner confirmed they checked the chat.
+var ErrRetryNeedsConfirm = errors.New("This message may already have reached the customer (WhatsApp's answer was lost or Pulse stopped while sending). Check the chat, then confirm to send it again.")
+
+// Retry sends a failed or skipped job again now. A job still being sent is refused, and
+// one whose last attempt may have reached the customer (MaybeSent) is only sent again
+// when confirmed is true.
+func (s *Scheduler) Retry(id string, confirmed bool) (ScheduledJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.jobs {
 		if s.jobs[i].ID == id {
-			if s.jobs[i].Status == StatusSent {
+			switch {
+			case s.jobs[i].Status == StatusSent:
 				return ScheduledJob{}, errors.New("This message was already sent.")
+			case s.jobs[i].Status == StatusSending:
+				return ScheduledJob{}, errors.New("This message is being sent right now.")
+			case s.jobs[i].MaybeSent && !confirmed:
+				return ScheduledJob{}, ErrRetryNeedsConfirm
 			}
-			s.jobs[i].Status, s.jobs[i].ScheduledAt, s.jobs[i].Error = StatusPending, time.Now(), ""
+			s.jobs[i].Status, s.jobs[i].ScheduledAt, s.jobs[i].Error, s.jobs[i].MaybeSent = StatusPending, time.Now(), "", false
 			s.pausedTo = time.Time{} // the owner asked to try now
 			return s.jobs[i], s.saveLocked()
 		}
@@ -329,6 +344,19 @@ func (s *Scheduler) finish(id string, st JobStatus, msgID, errText string) {
 	}
 }
 
+// markMaybeSent records that a failed job may still have reached the customer.
+func (s *Scheduler) markMaybeSent(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.jobs {
+		if s.jobs[i].ID == id && s.jobs[i].Status == StatusFailed {
+			s.jobs[i].MaybeSent = true
+			_ = s.saveLocked()
+			return
+		}
+	}
+}
+
 func (s *Scheduler) processDue(ctx context.Context) {
 	s.mu.Lock()
 	if s.sending {
@@ -373,7 +401,10 @@ func (s *Scheduler) processDue(ctx context.Context) {
 		name, vars := j.RecipientName, map[string]string{}
 		var ct *contacts.Contact
 		if s.contacts != nil {
-			if c, ok := s.contacts.Get(j.Recipient); ok {
+			// The stored number, matched exactly: a recipient who is no longer a contact
+			// (deleted after opting out, say) is never taken for a look-alike contact, and
+			// is checked against the opt-out list below.
+			if c, ok := s.contacts.GetExact(j.Recipient); ok {
 				ct = c
 				if name == "" {
 					name = c.Name
@@ -396,8 +427,10 @@ func (s *Scheduler) processDue(ctx context.Context) {
 		case a.RequireOptIn && (ct == nil || !ct.Consent):
 			s.finish(j.ID, StatusSkipped, "", "Not sent: no opt-in is recorded for this customer, and \"Require opt-in\" is on.")
 			continue
-		case a.Enforce24hWindow && (ct == nil || (!ct.Consent && !ct.InServiceWindow(time.Now()))):
-			s.finish(j.ID, StatusSkipped, "", "Not sent: no opt-in recorded and the customer has not written in the last 24 hours.")
+		// Like campaigns, the window closes half an hour early (contacts.FreeTextWindow), so
+		// a message paced or retried at the end cannot reach Meta after it closed.
+		case a.Enforce24hWindow && (ct == nil || (!ct.Consent && !ct.CanSendFreeText(time.Now()))):
+			s.finish(j.ID, StatusSkipped, "", "Not sent: no opt-in recorded and the customer has not written in the last 23 hours 30 minutes.")
 			continue
 		}
 		releaseDaily, ok := campaign.ReserveDaily(cfg, s.hist, time.Now())
@@ -466,6 +499,9 @@ func (s *Scheduler) processDue(ctx context.Context) {
 					s.hist.Settle(placeholder, "fail_"+security.RandomToken(6), history.StatusFailed, err.Error(), cloudapi.MaybeSent(err))
 				}
 				s.finish(j.ID, StatusFailed, "", err.Error())
+				if cloudapi.MaybeSent(err) {
+					s.markMaybeSent(j.ID)
+				}
 				s.mu.Lock()
 				s.fails++
 				s.mu.Unlock()
@@ -554,7 +590,7 @@ func (s *Scheduler) Reconcile(label, messageID, status string) bool {
 		}
 		if j := &s.jobs[i]; j.ID == id && j.Status == StatusFailed && j.MessageID == "" {
 			now := time.Now()
-			j.Status, j.MessageID, j.SentAt, j.Error = StatusSent, messageID, &now, ""
+			j.Status, j.MessageID, j.SentAt, j.Error, j.MaybeSent = StatusSent, messageID, &now, "", false
 			if err := s.saveLocked(); err != nil {
 				fmt.Printf("[Schedule] Could not save that message %s was delivered: %v\n", id, err)
 			}

@@ -144,19 +144,33 @@ func (s *Server) storedPhone(typed string) string {
 }
 
 func (s *Server) handlePrivacyExport(w http.ResponseWriter, r *http.Request) {
-	phone := s.storedPhone(r.URL.Query().Get("phone"))
+	typed := strings.TrimSpace(r.URL.Query().Get("phone"))
+	phone := s.storedPhone(typed)
 	bundle := map[string]any{"product": version.Product, "version": version.Version, "exported_at": time.Now().Format(time.RFC3339)}
 	name := "all"
-	if phone != "" {
-		name = phone
+	if typed != "" {
+		// A number was asked for: never fall back to everyone's data.
+		if len(phone) < 7 || len(phone) > 15 {
+			writeError(w, http.StatusBadRequest, "Enter a valid phone number with country code, for example +919876543210.")
+			return
+		}
+		var c *contacts.Contact
+		var msgs []history.MessageRecord
 		if s.Contacts != nil {
-			if c, ok := s.Contacts.Get(phone); ok {
-				bundle["contact"] = c
-			}
+			c, _ = s.Contacts.GetExact(phone)
 		}
 		if s.History != nil {
-			bundle["messages"] = s.History.Query(history.Query{Phone: phone})
+			msgs = s.History.Query(history.Query{Phone: phone})
 		}
+		if c == nil && len(msgs) == 0 {
+			writeError(w, http.StatusBadRequest, "Pulse has no contact or messages for that number.")
+			return
+		}
+		name = phone
+		if c != nil {
+			bundle["contact"] = c
+		}
+		bundle["messages"] = msgs
 	} else {
 		if s.Contacts != nil {
 			bundle["contacts"] = s.Contacts.List()
@@ -267,6 +281,10 @@ func (s *Server) handleForgetContact(w http.ResponseWriter, r *http.Request) {
 	// The activity log keeps the entries (what happened, and that an erasure was done)
 	// but no longer names the customer.
 	security.RedactAudit(phone)
+	if legacy := contacts.LegacyWAID(phone); legacy != "" {
+		// Pulse 2.0 logged a foreign number such as 6591234567 as 916591234567.
+		security.RedactAudit(legacy)
+	}
 	s.forgetInBackups(phone)
 	security.LogAudit("CONTACT_FORGOTTEN", clientIP(r), actor(r), fmt.Sprintf("All data for %s deleted (%d messages)", security.MaskPhone(phone), msgs), "success")
 	if s.History != nil {
@@ -559,7 +577,12 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	var ct contacts.Contact
 	known := false
 	if s.Contacts != nil {
-		if c, ok := s.Contacts.Get(to); ok { // as typed: a saved contact matches exactly first
+		// A saved contact's own number matches first (the Singapore contact 6591234567 is
+		// not India's 916591234567), then the number as read above. Nothing else is
+		// matched: this decides who gets the message.
+		if c, ok := s.Contacts.GetExact(to); ok {
+			ct, phone, known = *c, c.Phone, true
+		} else if c, ok := s.Contacts.GetExact(phone); ok {
 			ct, phone, known = *c, c.Phone, true
 		}
 	}
@@ -570,7 +593,9 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	saveNew := func() {
 		if !known && s.Contacts != nil {
-			_ = s.Contacts.Save(ct)
+			// Saved under exactly the number the message went to: Save would read
+			// 6591234567 as India's 916591234567 and overwrite that customer.
+			_ = s.Contacts.SaveExact(ct)
 		}
 	}
 	// "consent" in the request is only the other system's claim. It is not recorded and

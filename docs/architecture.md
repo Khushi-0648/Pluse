@@ -26,6 +26,15 @@ cmd/uismoke            browser click-through test with a stand-in Graph API (bui
 
 Each install (and each `-session` profile) stores its own phone number ID, WhatsApp Business account ID, access token, app secret, verify token, Graph API version and public address in the `cloud_api` section of its `config.yaml`. `config.SetCloudCredentials` is the single place they are checked, sealed (`securestore.SealString`, DPAPI) and saved; the Settings form calls it, and a future sign-up flow can call it too. `config.ClearCloudCredentials` removes them (Settings > WhatsApp connection > Disconnect, `whatsapp-auto disconnect`). `cloudapi.Client` reads the settings on every call, so a change applies without a restart. A new `-session` profile starts as a copy of the main settings with the `cloud_api` section cleared.
 
+## Phone numbers
+
+Contacts are keyed by the full international number, digits only (`contacts.NormalizePhone`). Numbers from Meta (`from`, `wa_id`) are taken as they are (`contacts.CleanWAID`); only a number a person typed goes through `contacts.CleanPhone`, which adds India's 91 to a bare 10-digit mobile starting 6-9 (a number typed with `+` or `00` keeps its country).
+
+- `Store.GetExact` matches a stored number exactly. Everything that decides whether or where a message goes (campaigns, scheduled messages, the inbox, test messages, integrations, the bot), backup restore and every update (`SetDND`, `SetConsent`, `RecordInbound`, delete, erase) uses it; a number that is not a contact is checked with `WasOptedOut`.
+- `Store.Get` is a lookup aid for typed input only (forms, search, "send to" fields): an exact match first, then the 91 reading and a unique last-10-digit match for a bare number.
+- `Store.Save` stores the number as typed (an existing contact keeps its stored number); `Store.SaveExact` stores digits that are already international, such as the number an integration just sent to. Neither ever replaces another number's contact.
+- Pulse 2.0 stored foreign 10-digit numbers with 91 in front (`contacts.LegacyWAID`). The opt-out list file (`contacts-suppressed.json`) records `upgraded_at`, the first time 2.1 opened the list; only contacts created before it can be moved to the real number (`Store.Upsert`, which calls the `OnRenamed` hooks so history, campaigns and scheduled messages follow) or have their old-form opt-out applied once (`legacy_done`).
+
 ## Incoming message
 
 1. Meta posts to `https://<public address>/cloud/webhook` through the owner's tunnel. `server.handleCloudWebhook` checks the `X-Hub-Signature-256` HMAC with the app secret, then hands the raw body to `cloudapi.Client.HandleWebhook`. Parsing is separate from the signature check, so another authenticated source (for example a relay) can feed the same parser.

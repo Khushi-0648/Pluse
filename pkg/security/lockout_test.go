@@ -151,9 +151,14 @@ func TestTunnelTrustNeedsPublicHost(t *testing.T) {
 		t.Fatal("only the last X-Forwarded-Host entry counts")
 	}
 	r.Header.Set("X-Forwarded-Host", "evil.example, pulse.example.com")
-	if !FromTrustedProxy(r) {
-		t.Fatal("a tunnel that rewrites Host names the public host in X-Forwarded-Host")
+	if FromTrustedProxy(r) {
+		t.Fatal("F9: X-Forwarded-Host alone (settable by a rebinding page) must not make a local request the tunnel")
 	}
+	r.Host = "pulse.example.com"
+	if !FromTrustedProxy(r) {
+		t.Fatal("the tunnel passes the public host in Host")
+	}
+	r.Host = "127.0.0.1:8085"
 	r.RemoteAddr = "203.0.113.9:4000"
 	if FromTrustedProxy(r) {
 		t.Fatal("only a loopback peer can be the tunnel")

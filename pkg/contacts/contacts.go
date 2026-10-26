@@ -109,12 +109,30 @@ type suppression struct {
 	// OptedOutAt keeps when an opted-out number last opted out, so a contact created for
 	// it again keeps that time and a START written before it still cannot subscribe them.
 	OptedOutAt map[string]time.Time `json:"opted_out_at,omitempty"`
+	// UpgradedAt is when Pulse 2.1 first opened this contact list. Only contacts created
+	// before it can have been saved by Pulse 2.0 under a wrong number (see LegacyWAID), so
+	// only those are ever moved or have their opt-out applied to the real number; a
+	// customer added since is never mistaken for one.
+	UpgradedAt *time.Time `json:"upgraded_at,omitempty"`
+	// LegacyDone lists (hashed) numbers whose Pulse 2.0 form was already folded in, so
+	// an opt-out taken over from it is applied once and an opt-in afterwards stays.
+	LegacyDone map[string]bool `json:"legacy_done,omitempty"`
 }
 
 const (
 	suppressOptedOut  = "opted_out"
 	suppressForgotten = "forgotten"
+	// suppressForgottenOptedOut marks the Pulse 2.0 form of an erased number that had
+	// itself opted out: it is never restored, and still counts as opted out in case it
+	// really is a different (Indian) customer.
+	suppressForgottenOptedOut = "forgotten_opted_out"
 )
+
+// isOptOutMark reports whether a suppression entry means "opted out".
+func isOptOutMark(v string) bool { return v == suppressOptedOut || v == suppressForgottenOptedOut }
+
+// isForgottenMark reports whether a suppression entry means "erased: never restore".
+func isForgottenMark(v string) bool { return v == suppressForgotten || v == suppressForgottenOptedOut }
 
 // NewStore loads contacts from filePath using the process-wide encryption box.
 func NewStore(filePath string) (*Store, error) {
@@ -163,7 +181,38 @@ func NewStore(filePath string) (*Store, error) {
 			s.contacts[c.Phone] = c
 		}
 	}
+	if s.sup.UpgradedAt == nil {
+		// The first start of 2.1 on this list (or a new list): every contact here now was
+		// written by an earlier version. Recorded at once, so it is never moved later.
+		now := time.Now()
+		s.sup.UpgradedAt = &now
+		if err := s.saveSuppression(); err != nil {
+			fmt.Printf("[Contacts] The opt-out list could not be saved: %v\n", err)
+		}
+	}
 	return s, nil
+}
+
+// preUpgradeLocked reports whether c existed before Pulse 2.1 first opened this list, so
+// it may have been saved by Pulse 2.0 under a wrong number. Callers hold s.mu.
+func (s *Store) preUpgradeLocked(c Contact) bool {
+	return s.sup.UpgradedAt != nil && c.CreatedAt.Before(*s.sup.UpgradedAt)
+}
+
+// legacyContactLocked returns the contact Pulse 2.0 may have saved for phone under
+// LegacyWAID(phone): one that existed before the upgrade and came from WhatsApp, wrote
+// or opted out (one typed in by staff for the Indian number is not taken). Callers hold
+// s.mu.
+func (s *Store) legacyContactLocked(phone string) (Contact, bool) {
+	legacy := LegacyWAID(phone)
+	if legacy == "" {
+		return Contact{}, false
+	}
+	c, ok := s.contacts[legacy]
+	if !ok || !s.preUpgradeLocked(c) || !(c.Source == "whatsapp" || c.LastInboundAt != nil || c.IsDND) {
+		return Contact{}, false
+	}
+	return c, true
 }
 
 func cleanName(name, phone string) string {
@@ -272,11 +321,13 @@ func sortContacts(list []Contact) {
 	})
 }
 
-// Get finds a contact by phone, tolerating formatting differences.
+// Get finds a contact by a number a person typed, tolerating formatting differences: it
+// is a lookup aid for the dashboard and the command line (see typedKeyLocked). Anything
+// that decides whether or where a message is sent uses GetExact on the stored number.
 func (s *Store) Get(phone string) (*Contact, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key, ok := s.keyLocked(phone)
+	key, ok := s.typedKeyLocked(phone)
 	if !ok {
 		return nil, false
 	}
@@ -284,12 +335,47 @@ func (s *Store) Get(phone string) (*Contact, bool) {
 	return &c, true
 }
 
-// keyLocked finds the stored key for phone. An international number (bare digits, as
-// stored or as Meta sends it) matches exactly first, so the Singapore number 6591234567
-// finds its own contact, not the Indian 916591234567; then the number is read as typed
-// by a person (CleanPhone).
-func (s *Store) keyLocked(phone string) (string, bool) {
-	for _, k := range []string{NormalizePhone(phone), CleanPhone(phone), CleanWAID(phone)} {
+// GetExact finds the contact stored under phone, an international number (a stored
+// contact number, a Meta wa_id, or one typed with its +country code). No country code is
+// guessed and no other number is matched by its last digits, so a number that is not a
+// contact (for example one deleted after opting out) never resolves to someone else.
+func (s *Store) GetExact(phone string) (*Contact, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok := s.exactKeyLocked(phone)
+	if !ok {
+		return nil, false
+	}
+	c := s.contacts[key]
+	return &c, true
+}
+
+// exactKeyLocked finds the stored key for an international number, exactly.
+func (s *Store) exactKeyLocked(phone string) (string, bool) {
+	k := NormalizePhone(phone)
+	if k == "" {
+		return "", false
+	}
+	_, ok := s.contacts[k]
+	return k, ok
+}
+
+// typedKeyLocked finds the stored key for a number a person typed. A number typed with
+// its country code (+65 9123 4567, 0065...) or a stored number matches exactly, so the
+// Singapore number 6591234567 finds its own contact, not the Indian 916591234567; only
+// then is a bare number read as typed by a person (CleanPhone, which adds India's 91 to
+// a 10-digit mobile) or matched by its last 10 digits.
+func (s *Store) typedKeyLocked(phone string) (string, bool) {
+	if k, ok := s.exactKeyLocked(phone); ok {
+		return k, true
+	}
+	t := strings.TrimSpace(phone)
+	if strings.HasPrefix(t, "+") || strings.HasPrefix(CleanWAID(t), "00") {
+		k := CleanPhone(t) // the country code was given: nothing is guessed
+		_, ok := s.contacts[k]
+		return k, ok && k != ""
+	}
+	for _, k := range []string{CleanPhone(phone), CleanWAID(phone)} {
 		if _, ok := s.contacts[k]; ok && k != "" {
 			return k, true
 		}
@@ -297,7 +383,7 @@ func (s *Store) keyLocked(phone string) (string, bool) {
 	raw := CleanWAID(phone)
 	// A bare 10-digit number without a country code may match one saved contact by its
 	// last digits; numbers with a country code must match exactly.
-	if len(raw) == 10 && !strings.HasPrefix(strings.TrimSpace(phone), "+") {
+	if len(raw) == 10 {
 		found := ""
 		for k := range s.contacts {
 			if len(k) > 10 && strings.HasSuffix(k, raw) {
@@ -315,6 +401,9 @@ func (s *Store) keyLocked(phone string) (string, bool) {
 }
 
 // Save creates or replaces a contact's editable fields; system timestamps are preserved.
+// c.Phone is the number as a person typed it (a 10-digit Indian mobile gets its 91), or
+// a saved contact's stored number. Only the contact under that exact number is changed:
+// saving one number never replaces or deletes another number's contact or opt-out.
 func (s *Store) Save(c Contact) error {
 	typed := c.Phone
 	c.Phone = CleanPhone(typed)
@@ -327,6 +416,17 @@ func (s *Store) Save(c Contact) error {
 		}
 		s.mu.RUnlock()
 	}
+	return s.save(c)
+}
+
+// SaveExact is Save for a number that is already international digits (for example the
+// number a message was just sent to): no country code is guessed.
+func (s *Store) SaveExact(c Contact) error {
+	c.Phone = NormalizePhone(c.Phone)
+	return s.save(c)
+}
+
+func (s *Store) save(c Contact) error {
 	if len(c.Phone) < 7 || len(c.Phone) > 15 {
 		return errors.New("Enter a valid phone number with country code, for example +919876543210.")
 	}
@@ -343,11 +443,7 @@ func (s *Store) Save(c Contact) error {
 
 	s.mu.Lock()
 	critical := false
-	if key, ok := s.keyLocked(c.Phone); ok {
-		ex := s.contacts[key]
-		if key != c.Phone {
-			delete(s.contacts, key)
-		}
+	if ex, ok := s.contacts[c.Phone]; ok {
 		c.CreatedAt = ex.CreatedAt
 		c.LastContactedAt, c.LastInboundAt, c.LastReadAt = ex.LastContactedAt, ex.LastInboundAt, ex.LastReadAt
 		c.BotPausedUntil, c.NeedsAttention, c.AttentionReason, c.AttentionAt = ex.BotPausedUntil, ex.NeedsAttention, ex.AttentionReason, ex.AttentionAt
@@ -431,7 +527,10 @@ func (s *Store) Restore(c Contact) error {
 	}
 	c.Name = cleanName(c.Name, c.Phone)
 	s.mu.Lock()
-	if key, ok := s.keyLocked(c.Phone); ok {
+	// The backup's numbers are stored numbers: matched exactly, never by a guessed
+	// country code or their last digits, so a contact deleted after opting out is not
+	// merged into someone else (and comes back only as do-not-message, below).
+	if key, ok := s.exactKeyLocked(c.Phone); ok {
 		ex := s.contacts[key]
 		if ex.Name == "" {
 			ex.Name = c.Name
@@ -445,11 +544,11 @@ func (s *Store) Restore(c Contact) error {
 		ex.Tags = normalizeTags(append(ex.Tags, c.Tags...))
 		s.contacts[key] = ex
 	} else {
-		switch s.sup.Numbers[s.suppressKeyLocked(c.Phone)] {
-		case suppressForgotten:
+		if s.forgottenLocked(c) {
 			s.mu.Unlock()
 			return nil // they asked to be erased after this backup was made
-		case suppressOptedOut:
+		}
+		if s.optedOutBeforeLocked(c.Phone) {
 			c.IsDND = true // opted out after this backup was made: never undone by a restore
 		}
 		n := Contact{Phone: c.Phone, Name: c.Name, Email: strings.TrimSpace(c.Email), Notes: strings.TrimSpace(c.Notes), Tags: normalizeTags(c.Tags), Source: "backup", IsDND: c.IsDND, CreatedAt: c.CreatedAt}
@@ -478,37 +577,63 @@ func (s *Store) Restore(c Contact) error {
 // match a contact exactly: a sender from Singapore (6591234567) is never taken for the
 // Indian contact 916591234567. It returns the stored contact.
 //
-// The one exception is a contact Pulse 2.0 saved under the wrong number (LegacyWAID):
-// when no contact has phone itself, that contact moves to phone with everything it had
-// (opt-out, consent, times, tags, notes), so an upgrade never loses an opt-out.
+// The one exception is a contact Pulse 2.0 saved under the wrong number (LegacyWAID)
+// before this list was upgraded (see suppression.UpgradedAt): when no contact has phone
+// itself, that contact moves to phone with its opt-out, times, tags and notes, so an
+// upgrade never loses an opt-out. Its consent does not move: it was recorded for the
+// other number. When phone already has a contact from before the upgrade, an opt-out
+// recorded under the old form is applied to it once.
 func (s *Store) Upsert(phone, name, source string) Contact {
 	phone = NormalizePhone(phone)
 	name = cleanName(name, phone)
 	s.mu.Lock()
 	if c, ok := s.contacts[phone]; ok {
+		changed := false
 		if c.Name == "" && name != "" {
 			c.Name = name
+			changed = true
+		}
+		optedOut, supChanged := s.applyLegacyOptOutLocked(&c)
+		if changed || optedOut {
 			s.contacts[phone] = c
-			s.saver.Trigger()
 		}
 		s.mu.Unlock()
+		if supChanged {
+			if err := s.saveSuppression(); err != nil {
+				fmt.Printf("[Contacts] The opt-out list could not be saved: %v\n", err)
+			}
+		}
+		if optedOut {
+			s.changed(true)
+			security.LogAudit("CONTACT_NUMBER_CORRECTED", "local", "system", fmt.Sprintf("Contact %s marked do-not-message: it opted out under %s, the number an earlier version saved for it", security.MaskPhone(phone), security.MaskPhone(LegacyWAID(phone))), "success")
+		} else if changed {
+			s.saver.Trigger()
+		}
 		return c
 	}
 	legacy := LegacyWAID(phone)
 	supChanged := s.carryLegacySuppressionLocked(legacy, phone)
-	if c, ok := s.contacts[legacy]; ok && legacy != "" && (c.Source == "whatsapp" || c.LastInboundAt != nil || c.IsDND) {
-		// Only a contact that came from WhatsApp, wrote, or opted out moves: one typed in
-		// by staff for the Indian number is left alone. An opt-out also stays on the old
+	if c, ok := s.legacyContactLocked(phone); ok {
+		// Only a contact from before the upgrade that came from WhatsApp, wrote, or opted
+		// out moves: one typed in by staff for the Indian number, or any contact added
+		// since (a real Indian customer), is left alone. An opt-out also stays on the old
 		// number, so if it really was India's 91 number, that customer stays opted out.
 		if c.IsDND {
-			supChanged = s.suppressLocked(legacy, suppressOptedOut) || supChanged
-			supChanged = s.noteOptOutTimeLocked(legacy, c) || supChanged
+			// The list is saved below in any case (markLegacyDoneLocked changes it too).
+			s.suppressLocked(legacy, suppressOptedOut)
+			s.noteOptOutTimeLocked(legacy, c)
+		} else {
+			c.ConsentSource, c.ConsentAt = "", nil
 		}
+		// Only the opt-out moves, never consent: it was recorded for the other number.
+		c.Consent, c.OptInAt = false, nil
 		delete(s.contacts, legacy)
 		c.Phone = phone
 		if c.Name == "" {
 			c.Name = name
 		}
+		s.markLegacyDoneLocked(phone)
+		supChanged = true
 		s.contacts[phone] = c
 		hooks := append([]func(string, string){}, s.onRenamed...)
 		s.mu.Unlock()
@@ -582,9 +707,102 @@ func (s *Store) carryLegacySuppressionLocked(legacy, phone string) bool {
 	return changed
 }
 
+// markLegacyDoneLocked records that phone's Pulse 2.0 form was folded in.
+func (s *Store) markLegacyDoneLocked(phone string) {
+	if s.sup.LegacyDone == nil {
+		s.sup.LegacyDone = map[string]bool{}
+	}
+	s.sup.LegacyDone[s.suppressKeyLocked(phone)] = true
+}
+
+// applyLegacyOptOutLocked applies to c, a contact from before the upgrade, an opt-out
+// that Pulse 2.0 recorded under its wrong form of the number (LegacyWAID): a live
+// contact there that opted out, or one deleted after opting out. It is done once per
+// number (an opt-in afterwards stays), and not when the customer's own START is newer.
+// It reports whether c changed and whether the suppression list changed. Callers hold
+// s.mu.
+func (s *Store) applyLegacyOptOutLocked(c *Contact) (optedOut, supChanged bool) {
+	legacy := LegacyWAID(c.Phone)
+	if legacy == "" || c.IsDND || !s.preUpgradeLocked(*c) || s.sup.LegacyDone[s.suppressKeyLocked(c.Phone)] {
+		return false, false
+	}
+	var at *time.Time
+	found := false
+	if lc, ok := s.legacyContactLocked(c.Phone); ok && lc.IsDND {
+		found, at = true, lc.ConsentAt
+	} else if lk := s.suppressKeyLocked(legacy); isOptOutMark(s.sup.Numbers[lk]) {
+		found = true
+		if t, ok := s.sup.OptedOutAt[lk]; ok {
+			at = &t
+		}
+	}
+	if !found || (at != nil && !at.Before(*s.sup.UpgradedAt)) {
+		// Nothing there, or an opt-out made since the upgrade: Meta reports this customer
+		// under their real number now, so that one came from whoever has the 91 number.
+		return false, false
+	}
+	s.markLegacyDoneLocked(c.Phone)
+	if c.OptInAt != nil && at != nil && c.OptInAt.After(*at) {
+		return false, true // the customer's START is newer than that opt-out
+	}
+	when := time.Now()
+	if at != nil {
+		when = *at
+	}
+	c.IsDND, c.Consent, c.OptInAt = true, false, nil
+	c.ConsentAt = &when
+	c.ConsentSource = "Opted out under +" + legacy + ", the number an earlier version of Pulse saved"
+	c.Tags = removeTag(c.Tags, "Subscribed")
+	c.Tags = addTag(c.Tags, "Opted out")
+	return true, true
+}
+
+// forgottenLocked reports whether c (from a backup) belongs to a customer who asked to be
+// erased, under its own number or the other form Pulse 2.0 used for it. Callers hold s.mu.
+func (s *Store) forgottenLocked(c Contact) bool {
+	if isForgottenMark(s.sup.Numbers[s.suppressKeyLocked(c.Phone)]) {
+		return true
+	}
+	if legacy := LegacyWAID(c.Phone); legacy != "" && isForgottenMark(s.sup.Numbers[s.suppressKeyLocked(legacy)]) {
+		return true
+	}
+	// A contact from before the upgrade under 91 + a 10-digit number may be how Pulse 2.0
+	// kept a foreign number (91 6591234567 for Singapore's 6591234567) that was erased.
+	if real := realFromLegacy(c.Phone); real != "" && s.preUpgradeLocked(c) && isForgottenMark(s.sup.Numbers[s.suppressKeyLocked(real)]) {
+		return true
+	}
+	return false
+}
+
+// realFromLegacy undoes LegacyWAID: 916591234567 -> 6591234567, or "".
+func realFromLegacy(phone string) string {
+	if len(phone) == 12 && strings.HasPrefix(phone, "91") && phone[2] >= '6' && phone[2] <= '9' && nonDigits.FindStringIndex(phone) == nil {
+		return phone[2:]
+	}
+	return ""
+}
+
+// forgetLegacyLocked records the Pulse 2.0 form of an erased number, so an old backup
+// cannot bring the customer back under it. If that form had opted out itself (it may
+// really be an Indian customer), it stays opted out too. It reports a change.
+func (s *Store) forgetLegacyLocked(legacy string) bool {
+	k := s.suppressKeyLocked(legacy)
+	switch v := s.sup.Numbers[k]; {
+	case isForgottenMark(v):
+		return false
+	case v == suppressOptedOut:
+		s.sup.Numbers[k] = suppressForgottenOptedOut
+	default:
+		s.sup.Numbers[k] = suppressForgotten
+	}
+	return true
+}
+
 func (s *Store) update(phone string, critical bool, fn func(*Contact)) bool {
 	s.mu.Lock()
-	key, ok := s.keyLocked(phone)
+	// Every change goes to the contact stored under exactly this number: a STOP, a START
+	// or a consent change must never land on another customer whose number looks alike.
+	key, ok := s.exactKeyLocked(phone)
 	if !ok {
 		s.mu.Unlock()
 		return false
@@ -624,7 +842,8 @@ func (s *Store) Forget(phone string) bool {
 // brings them back only as do-not-message); reason "forgotten" blocks any restore.
 func (s *Store) remove(phone, reason string) bool {
 	s.mu.Lock()
-	key, ok := s.keyLocked(phone)
+	// Stored numbers only: deleting one number never removes a look-alike contact.
+	key, ok := s.exactKeyLocked(phone)
 	timeNoted := false
 	if ok {
 		if s.contacts[key].IsDND && reason == "" {
@@ -632,13 +851,18 @@ func (s *Store) remove(phone, reason string) bool {
 			timeNoted = s.noteOptOutTimeLocked(key, s.contacts[key])
 		}
 		delete(s.contacts, key)
-	} else {
-		key = NormalizePhone(phone)
 	}
 	if reason == suppressForgotten && s.sup.OptedOutAt != nil {
 		delete(s.sup.OptedOutAt, s.suppressKeyLocked(key)) // erased: keep nothing about them
 	}
 	sup := reason != "" && key != "" && s.suppressLocked(key, reason)
+	if reason == suppressForgotten {
+		if legacy := LegacyWAID(key); legacy != "" {
+			// Pulse 2.0 may have kept this foreign number as 91 + the number, so a backup
+			// made before 2.1 may hold the customer under that form.
+			sup = s.forgetLegacyLocked(legacy) || sup
+		}
+	}
 	sup = sup || timeNoted
 	s.mu.Unlock()
 	if sup {
@@ -662,12 +886,20 @@ func (s *Store) suppressKeyLocked(phone string) string {
 // before it was deleted. Callers hold s.mu.
 func (s *Store) optedOutBeforeLocked(phone string) bool {
 	phone = NormalizePhone(phone)
-	if s.sup.Numbers[s.suppressKeyLocked(phone)] == suppressOptedOut {
+	if isOptOutMark(s.sup.Numbers[s.suppressKeyLocked(phone)]) {
 		return true
 	}
-	// Pulse 2.0 kept a Meta number such as 6591234567 as 916591234567 (LegacyWAID).
+	// Pulse 2.0 kept a Meta number such as 6591234567 as 916591234567 (LegacyWAID): an
+	// opt-out recorded there, deleted or on a contact from before the upgrade, applies.
 	legacy := LegacyWAID(phone)
-	return legacy != "" && s.sup.Numbers[s.suppressKeyLocked(legacy)] == suppressOptedOut
+	if legacy == "" {
+		return false
+	}
+	if isOptOutMark(s.sup.Numbers[s.suppressKeyLocked(legacy)]) {
+		return true
+	}
+	lc, ok := s.legacyContactLocked(phone)
+	return ok && lc.IsDND
 }
 
 // noteOptOutTimeLocked keeps when c (being removed) opted out. It reports a change.
@@ -688,13 +920,25 @@ func (s *Store) noteOptOutTimeLocked(phone string, c Contact) bool {
 
 // optedOutAtLocked returns when a deleted opted-out number opted out, if known.
 func (s *Store) optedOutAtLocked(phone string) *time.Time {
-	if t, ok := s.sup.OptedOutAt[s.suppressKeyLocked(NormalizePhone(phone))]; ok {
+	phone = NormalizePhone(phone)
+	if t, ok := s.sup.OptedOutAt[s.suppressKeyLocked(phone)]; ok {
 		return &t
+	}
+	if legacy := LegacyWAID(phone); legacy != "" {
+		if t, ok := s.sup.OptedOutAt[s.suppressKeyLocked(legacy)]; ok {
+			return &t
+		}
+		if lc, ok := s.legacyContactLocked(phone); ok && lc.IsDND && lc.ConsentAt != nil {
+			t := *lc.ConsentAt
+			return &t
+		}
 	}
 	return nil
 }
 
-// WasOptedOut reports whether phone opted out and was then deleted.
+// WasOptedOut reports whether phone, a number that is not a contact, opted out: it was
+// deleted after opting out, or Pulse 2.0 recorded the opt-out under its old form of the
+// number (LegacyWAID), on a contact from before the upgrade or one deleted since.
 func (s *Store) WasOptedOut(phone string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -706,9 +950,13 @@ func (s *Store) WasOptedOut(phone string) bool {
 func (s *Store) unsuppress(phone string) {
 	s.mu.Lock()
 	k := s.suppressKeyLocked(NormalizePhone(phone))
-	changed := s.sup.Numbers[k] == suppressOptedOut
+	changed := isOptOutMark(s.sup.Numbers[k])
 	if changed {
-		delete(s.sup.Numbers, k)
+		if s.sup.Numbers[k] == suppressForgottenOptedOut {
+			s.sup.Numbers[k] = suppressForgotten
+		} else {
+			delete(s.sup.Numbers, k)
+		}
 		delete(s.sup.OptedOutAt, k)
 	}
 	s.mu.Unlock()
@@ -722,7 +970,7 @@ func (s *Store) unsuppress(phone string) {
 // suppressLocked records phone; "forgotten" is never weakened to "opted out".
 func (s *Store) suppressLocked(phone, reason string) bool {
 	k := s.suppressKeyLocked(phone)
-	if s.sup.Numbers[k] == reason || s.sup.Numbers[k] == suppressForgotten {
+	if v := s.sup.Numbers[k]; v == reason || v == suppressForgotten || (v == suppressForgottenOptedOut && reason == suppressOptedOut) {
 		return false
 	}
 	s.sup.Numbers[k] = reason
@@ -752,8 +1000,14 @@ func (s *Store) UpdateLastContacted(phone string) {
 }
 
 // RecordInbound stamps an incoming customer message (opens the 24-hour service window).
+// Meta does not keep the order of deliveries: an older message arriving late does not
+// move the time back.
 func (s *Store) RecordInbound(phone string, at time.Time) {
-	s.update(phone, false, func(c *Contact) { c.LastInboundAt = &at })
+	s.update(phone, false, func(c *Contact) {
+		if c.LastInboundAt == nil || at.After(*c.LastInboundAt) {
+			c.LastInboundAt = &at
+		}
+	})
 }
 
 // MarkRead records that staff opened the conversation.
@@ -766,10 +1020,7 @@ func (s *Store) MarkRead(phone string) {
 // the customer sent the opt-out (default now), so a later START can be told apart from
 // an older one that arrived late.
 func (s *Store) SetDND(phone string, dnd bool, reason string, at ...time.Time) bool {
-	if !dnd {
-		defer s.unsuppress(phone)
-	}
-	return s.update(phone, true, func(c *Contact) {
+	ok := s.update(phone, true, func(c *Contact) {
 		already := c.IsDND
 		sentAt := len(at) > 0 && !at[0].IsZero()
 		if dnd && sentAt && !already && c.OptInAt != nil && at[0].Before(*c.OptInAt) {
@@ -797,6 +1048,12 @@ func (s *Store) SetDND(phone string, dnd bool, reason string, at ...time.Time) b
 			c.Tags = removeTag(c.Tags, "Opted out")
 		}
 	})
+	if ok && !dnd {
+		// Only once the contact was found and opted in: a number that is not a contact
+		// keeps its earlier opt-out.
+		s.unsuppress(phone)
+	}
+	return ok
 }
 
 // ToggleDND flips the opt-out flag.
@@ -830,10 +1087,7 @@ func (s *Store) ToggleDND(phone string) (bool, error) {
 // when the customer sent their own opt-in (START): it is kept as the consent time and as
 // OptInAt, so an older STOP that arrives after it is not applied.
 func (s *Store) SetConsent(phone string, consent bool, source string, at ...time.Time) bool {
-	if consent {
-		defer s.unsuppress(phone)
-	}
-	return s.update(phone, true, func(c *Contact) {
+	ok := s.update(phone, true, func(c *Contact) {
 		c.Consent = consent
 		c.ConsentSource = source
 		now := time.Now()
@@ -850,6 +1104,10 @@ func (s *Store) SetConsent(phone string, consent bool, source string, at ...time
 			c.MarketingOptOut, c.MarketingOptOutAt = false, nil
 		}
 	})
+	if ok && consent {
+		s.unsuppress(phone) // only for a contact that was found and opted in
+	}
+	return ok
 }
 
 // SetMarketingOptOut records that Meta refused a message because the customer stopped
@@ -880,7 +1138,13 @@ func (s *Store) PauseBot(phone string, duration time.Duration, reason ...string)
 		c.BotPausedUntil, c.NeedsAttention, c.AttentionReason, c.AttentionAt = &until, true, r, &now
 	}) && len(phone) >= 7 {
 		s.mu.Lock()
-		s.contacts[phone] = Contact{Phone: phone, CreatedAt: now, Source: "whatsapp", BotPausedUntil: &until, NeedsAttention: true, AttentionReason: r, AttentionAt: &now}
+		c := Contact{Phone: phone, CreatedAt: now, Source: "whatsapp", BotPausedUntil: &until, NeedsAttention: true, AttentionReason: r, AttentionAt: &now}
+		if s.optedOutBeforeLocked(phone) {
+			c.IsDND, c.ConsentAt = true, s.optedOutAtLocked(phone) // opted out, then deleted
+		}
+		if _, exists := s.contacts[phone]; !exists {
+			s.contacts[phone] = c
+		}
 		s.mu.Unlock()
 		s.changed(true)
 	}
@@ -1275,6 +1539,13 @@ func (s *Store) ImportCSV(r io.Reader, mapping ...*CSVMapping) (CSVImportResult,
 			continue
 		}
 		phone := CleanPhone(raw)
+		if exact := NormalizePhone(raw); exact != phone {
+			// A saved contact's number exported as digits keeps its country (6591234567
+			// is Singapore, not India's 916591234567).
+			if _, ok := s.contacts[exact]; ok {
+				phone = exact
+			}
+		}
 		if len(phone) < 7 || len(phone) > 15 {
 			res.Skipped++
 			res.Warnings = append(res.Warnings, fmt.Sprintf("Row %d: invalid phone %q", rowNum, raw))
@@ -1297,8 +1568,10 @@ func (s *Store) ImportCSV(r io.Reader, mapping ...*CSVMapping) (CSVImportResult,
 			rowDate = d
 		}
 
-		key, exists := s.keyLocked(phone)
-		if exists {
+		// Only the contact under exactly this number is updated: an opt-out or consent in
+		// the file never lands on a different customer whose number looks alike.
+		key := phone
+		if _, exists := s.contacts[key]; exists {
 			c := s.contacts[key]
 			changes := []string{}
 			if name != "" && name != c.Name {

@@ -543,6 +543,9 @@ func setup(cfgPath, session string, port int, migrate bool) env {
 			c.Setup.WebhookSeenAt, c.Setup.TestMessageSentAt = nil, nil
 			return nil
 		})
+		// That save copied the main profile's file, with its sealed token, to
+		// config-<name>.yaml.bak; save once more so the backup copy is cleared too (F13).
+		_ = cfg.Save()
 	}
 	snap := cfg.Snapshot()
 	dataDir := dataDirFor(snap.Storage.DataDir, suffix)
@@ -1062,6 +1065,16 @@ func retention(ctx context.Context, cfg *config.Config, hs *history.Store) {
 	}
 }
 
+// sendContact returns the contact the send command checks before messaging phone. It
+// uses the exact number that will be messaged, never a guess, so a number cannot borrow
+// another contact's consent or skip the opt-out of a deleted contact (F3).
+func sendContact(cs *contacts.Store, phone string) contacts.Contact {
+	if c, ok := cs.GetExact(phone); ok {
+		return *c
+	}
+	return contacts.Contact{Phone: phone, IsDND: cs.WasOptedOut(phone)}
+}
+
 func runSend(cfgPath, session, to, text string) {
 	e := setup(cfgPath, session, 0, false)
 	snap := e.cfg.Snapshot()
@@ -1103,10 +1116,7 @@ func runSend(cfgPath, session, to, text string) {
 	}
 	// The same rules as every other way of sending: opt-out, blocked numbers, test mode,
 	// the 24-hour window, the daily limit and practice mode.
-	var ct contacts.Contact
-	if c, ok := cs.Get(phone); ok {
-		ct, phone = *c, c.Phone
-	}
+	ct := sendContact(cs, phone)
 	a := snap.Automation
 	switch {
 	case ct.IsDND:

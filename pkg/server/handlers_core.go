@@ -354,7 +354,7 @@ func (s *Server) sendTest(w http.ResponseWriter, r *http.Request, phone, text st
 	snap := s.cfg.Snapshot()
 	a := snap.Automation
 	if s.Contacts != nil {
-		c, found := s.Contacts.Get(phone)
+		c, found := s.Contacts.GetExact(phone)
 		if (found && c.IsDND) || (!found && s.Contacts.WasOptedOut(phone)) {
 			writeError(w, http.StatusConflict, "This number opted out of messages, so no test is sent to it. Use another phone, or ask them to reply START first.")
 			return false, false

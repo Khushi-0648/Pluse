@@ -76,3 +76,37 @@ func TestReadableAuditLogIsKept(t *testing.T) {
 		}
 	}
 }
+
+// F7: after an erasure (or "Delete everything") the masked log is saved and the backup
+// copy, which held the log before masking, is removed.
+func TestRedactionLeavesNoUnmaskedBackup(t *testing.T) {
+	saved := audit
+	audit = &auditLogger{}
+	defer func() { audit = saved }()
+
+	dir := t.TempDir()
+	box, err := securestore.OpenBox(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "audit.json")
+	OpenAuditLog(path, box)
+	for _, redact := range []func() int{func() int { return RedactAudit("6591234567") }, RedactAllCustomers} {
+		LogAudit("OPTED_OUT", "+6591234567", "Wei", "Customer +6591234567 replied STOP", "success")
+		FlushAuditLog()
+		LogAudit("OTHER", "local", "system", "something else", "success")
+		FlushAuditLog() // audit.json.bak now holds the entry above, unmasked
+		if bak, err := box.ReadBackup(path); err != nil || !strings.Contains(string(bak), "6591234567") {
+			t.Fatalf("setup: the backup should hold the number: %v", err)
+		}
+		if redact() == 0 {
+			t.Fatal("nothing was masked")
+		}
+		if bak, err := box.ReadBackup(path); err == nil && strings.Contains(string(bak), "6591234567") {
+			t.Fatal("the backup copy still holds the erased number")
+		}
+		if data, err := box.ReadFile(path); err != nil || strings.Contains(string(data), "6591234567") {
+			t.Fatalf("the saved log must be masked: %v", err)
+		}
+	}
+}

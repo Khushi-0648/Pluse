@@ -739,33 +739,54 @@ func (r *Runner) run(ctx context.Context, c *Campaign, gen int) {
 	}()
 	consecutiveFails := 0
 	sentThisRun := 0
+	waitedInFlight := false
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		// Claim the next recipient so a resumed run can never send to them twice.
+		// Claim the next recipient so a resumed run can never send to them twice. While
+		// a message from before a pause is still on its way (Resume right after Pause),
+		// nothing new is claimed.
 		r.mu.Lock()
 		phone, inFlight := "", false
 		var rec Recipient
 		for j := range c.Recipients {
 			if c.Recipients[j].Status == RSending {
 				inFlight = true
+				break
 			}
-			if phone == "" && c.Recipients[j].Status == RPending {
-				c.Recipients[j].Status = RSending
-				rec, phone = c.Recipients[j], c.Recipients[j].Phone
+		}
+		if !inFlight && !waitedInFlight {
+			for j := range c.Recipients {
+				if c.Recipients[j].Status == RPending {
+					c.Recipients[j].Status = RSending
+					rec, phone = c.Recipients[j], c.Recipients[j].Phone
+					break
+				}
 			}
 		}
 		r.mu.Unlock()
-		if phone == "" {
-			if inFlight {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(time.Second):
-				}
-				continue
+		if inFlight {
+			waitedInFlight = true
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
 			}
+			continue
+		}
+		if waitedInFlight {
+			// It went: keep the usual gap after it, so a quick Pause and Resume never
+			// sends two messages back to back.
+			waitedInFlight = false
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(Pace(r.cfg.Snapshot().Automation, sentThisRun)):
+			}
+			continue
+		}
+		if phone == "" {
 			r.finishRun(c, gen, CCompleted, "")
 			return
 		}
@@ -809,7 +830,9 @@ func (r *Runner) run(ctx context.Context, c *Campaign, gen int) {
 		}
 
 		status, errText, msgID := RSent, "", ""
-		ct, found := r.contacts.Get(rec.Phone)
+		// The stored number, matched exactly: a recipient who is no longer a contact (for
+		// example deleted after opting out) is skipped, never taken for a look-alike.
+		ct, found := r.contacts.GetExact(rec.Phone)
 		if reason := sendSkipReason(cfg, r.contacts, ct, found, rec.Phone, time.Now()); reason != "" {
 			status, errText = RSkipped, reason
 		} else {
@@ -971,8 +994,10 @@ func (r *Runner) optOutSpike(c *Campaign) string {
 	}
 	out := 0
 	for _, p := range sent {
-		if ct, ok := r.contacts.Get(p); ok && ct.IsDND {
+		if ct, ok := r.contacts.GetExact(p); ok && ct.IsDND {
 			out++
+		} else if !ok && r.contacts.WasOptedOut(p) {
+			out++ // opted out, then deleted
 		}
 	}
 	if out >= 3 && out*100/len(sent) >= 5 {

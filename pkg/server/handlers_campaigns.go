@@ -2,8 +2,10 @@ package server
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -11,6 +13,7 @@ import (
 
 	"whatsapp-automation/pkg/campaign"
 	"whatsapp-automation/pkg/msgtemplate"
+	"whatsapp-automation/pkg/scheduler"
 	"whatsapp-automation/pkg/security"
 )
 
@@ -354,7 +357,19 @@ func (s *Server) handleScheduledAction(w http.ResponseWriter, r *http.Request) {
 	case "cancel":
 		err = s.Scheduler.Cancel(id)
 	case "retry":
-		_, err = s.Scheduler.Retry(id)
+		// {"confirm": true} sends again a message that may already have reached the
+		// customer, after the person checked the chat.
+		var req struct {
+			Confirm bool `json:"confirm"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+		}
+		_, err = s.Scheduler.Retry(id, req.Confirm)
+		if errors.Is(err, scheduler.ErrRetryNeedsConfirm) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "needs_confirm": true})
+			return
+		}
 	default:
 		writeError(w, http.StatusNotFound, "Unknown action.")
 		return

@@ -147,12 +147,30 @@ func RedactAudit(phone string) int {
 			n++
 		}
 	}
-	s := audit.saver
 	audit.mu.Unlock()
-	if n > 0 && s != nil {
-		s.Trigger()
+	if n > 0 {
+		saveRedacted()
 	}
 	return n
+}
+
+// saveRedacted writes the masked log at once and then deletes audit.json.bak: the save
+// copies the previous, unmasked file there, which would keep the erased numbers.
+func saveRedacted() {
+	audit.mu.RLock()
+	s, path := audit.saver, audit.path
+	audit.mu.RUnlock()
+	if s == nil {
+		return
+	}
+	s.Trigger()
+	if err := s.Flush(); err != nil {
+		fmt.Printf("[Activity log] The masked log could not be saved yet (%v); retrying.\n", err)
+		return
+	}
+	if path != "" {
+		securestore.RemoveBackup(path)
+	}
 }
 
 var customerNumber = regexp.MustCompile(`\+?\d{7,15}`)
@@ -179,10 +197,9 @@ func RedactAllCustomers() int {
 			n++
 		}
 	}
-	s := audit.saver
 	audit.mu.Unlock()
-	if n > 0 && s != nil {
-		s.Trigger()
+	if n > 0 {
+		saveRedacted()
 	}
 	return n
 }

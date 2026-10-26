@@ -258,7 +258,28 @@
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   });
   P.act('job-cancel', async (btn) => { await P.busy(btn, () => P.post('/scheduled/' + encodeURIComponent(btn.dataset.id) + '/cancel')); P.toast('Cancelled.'); loadJobs().catch(P.error); });
-  P.act('job-retry', async (btn) => { await P.busy(btn, () => P.post('/scheduled/' + encodeURIComponent(btn.dataset.id) + '/retry')); P.toast('It will be sent within a few seconds.'); loadJobs().catch(P.error); });
+  P.act('job-retry', async (btn) => {
+    const id = btn.dataset.id;
+    const path = '/scheduled/' + encodeURIComponent(id) + '/retry';
+    // A message whose last attempt may have reached the customer is only sent again
+    // after the person checked the chat and confirmed.
+    const ask = () => P.confirm({ title: 'Send it again?', message: 'This message may already have reached the customer: WhatsApp\'s answer was lost, or Pulse stopped while sending it. Check the chat first and send it again only if they did not get it.', confirmLabel: 'Send again', danger: true });
+    const job = st.jobs.find((j) => j.id === id);
+    let confirm = false;
+    if (job && job.maybe_sent) {
+      if (!(await ask())) return;
+      confirm = true;
+    }
+    try {
+      await P.busy(btn, () => P.post(path, { confirm }));
+    } catch (e) {
+      if (confirm || !(e.data && e.data.needs_confirm)) throw e;
+      if (!(await ask())) return;
+      await P.busy(btn, () => P.post(path, { confirm: true }));
+    }
+    P.toast('It will be sent within a few seconds.');
+    loadJobs().catch(P.error);
+  });
   P.act('job-delete', (btn) => {
     const id = btn.dataset.id;
     st.jobs = st.jobs.filter((j) => j.id !== id);

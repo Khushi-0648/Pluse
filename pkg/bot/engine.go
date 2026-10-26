@@ -207,8 +207,15 @@ func (e *Engine) enqueue(in Incoming) {
 		e.record(in, e.cfg.Snapshot())
 		// An opt-out must never be lost, even when the chat is flooding.
 		if IsOptOut(in.Text) && e.contacts != nil {
+			now := e.now()
+			// As in the normal path: a send time in the future (a wrong clock) is capped
+			// at now, or the opt-out would outrank a later START.
+			sentAt := now
+			if !in.SentAt.IsZero() && in.SentAt.Before(now) {
+				sentAt = in.SentAt
+			}
 			e.contacts.Upsert(in.Phone, in.PushName, "whatsapp") // the exact number, as Meta sent it
-			e.contacts.SetDND(in.Phone, true, "Replied "+strings.ToUpper(Normalize(in.Text))+" on "+e.now().Format("2006-01-02"), in.SentAt)
+			e.contacts.SetDND(in.Phone, true, "Replied "+strings.ToUpper(Normalize(in.Text))+" on "+now.Format("2006-01-02"), sentAt)
 		}
 		e.jnl.done(in.ID)
 	}
@@ -303,7 +310,7 @@ func (e *Engine) process(in Incoming, quiet bool) Outcome {
 	if e.contacts != nil {
 		contact = e.contacts.Upsert(in.Phone, in.PushName, "whatsapp")
 		e.contacts.RecordInbound(in.Phone, sentAt)
-		if c, ok := e.contacts.Get(in.Phone); ok {
+		if c, ok := e.contacts.GetExact(in.Phone); ok {
 			contact = *c
 		}
 	}

@@ -119,12 +119,11 @@ func TestSendRecordedSettlesAmbiguousOutcome(t *testing.T) {
 // Campaign recipients still waiting under the number Pulse 2.0 saved move to the real
 // number when the contact is moved, so the campaign cannot send to the Indian number.
 func TestWaitingRecipientsFollowAMovedContact(t *testing.T) {
-	_, cs, _, _, r := setup(t)
+	_, cs, _, _, r := setup(t, contacts.Contact{Phone: "916591234567", Name: "Wei", Source: "whatsapp", CreatedAt: time.Now().Add(-48 * time.Hour)})
 	r.mu.Lock()
 	r.campaigns = append(r.campaigns, &Campaign{ID: "c-old", Name: "Old", Status: CPaused,
 		Recipients: []Recipient{{Phone: "916591234567", Status: RPending}, {Phone: "916591234568", Status: RSent}}})
 	r.mu.Unlock()
-	cs.Upsert("916591234567", "Wei", "whatsapp")
 	cs.Upsert("6591234567", "Wei", "whatsapp") // the real number writes after the upgrade
 	if _, ok := cs.Get("6591234567"); !ok {
 		t.Skip("the contact was not moved; nothing to follow")

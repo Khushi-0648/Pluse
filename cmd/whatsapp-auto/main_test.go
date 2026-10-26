@@ -129,6 +129,11 @@ func TestSessionProfileStartsWithoutCloudCredentials(t *testing.T) {
 	if m, _ := config.LoadConfig(main); !m.Snapshot().CloudAPI.Ready() {
 		t.Fatal("the main profile must keep its details")
 	}
+	// F13: the profile's backup copy must not keep the main number's details either.
+	bak, _ := os.ReadFile(s.FilePath + ".bak")
+	if strings.Contains(string(bak), "111111") || strings.Contains(string(bak), "pulse-main") || strings.Contains(string(bak), "sealed1:") {
+		t.Fatalf("config-sales.yaml.bak still holds the main profile's WhatsApp details:\n%s", bak)
+	}
 }
 
 // fail exits without running deferred calls, so cleanups registered with atFail run

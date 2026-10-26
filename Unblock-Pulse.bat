@@ -29,7 +29,8 @@ if errorlevel 2 (
 )
 powershell -NoProfile -Command "Get-ChildItem -LiteralPath $env:PULSE_DIR -Recurse | Unblock-File; Write-Host 'All Pulse files unblocked.' -ForegroundColor Green"
 echo.
-echo Smart App Control blocks unsigned programs and cannot be bypassed for one
-echo program. Use an official signed release instead of switching it off.
+echo Smart App Control ^(Windows 11^) blocks unsigned programs completely, and the
+echo unblocking above does not change that. A signed release of Pulse runs with it on.
+echo For an unsigned copy, Run-App.bat explains the choice when you start Pulse.
 echo.
 pause

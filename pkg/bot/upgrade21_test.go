@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"whatsapp-automation/pkg/config"
+	"whatsapp-automation/pkg/contacts"
 	"whatsapp-automation/pkg/history"
 )
 
@@ -14,10 +15,8 @@ import (
 // a message from 6591234567 must find that contact (one contact, still opted out, its
 // messages along) and get no reply.
 func TestLegacyMisprefixedOptOutSurvivesUpgrade(t *testing.T) {
-	r := newRig(t)
-	r.cs.Upsert("916591234567", "Wei", "whatsapp")
-	r.cs.SetDND("916591234567", true, "Replied STOP", r.now.Add(-48*time.Hour))
-	r.cs.SetTag("916591234567", "VIP", true)
+	stop := time.Date(2026, 10, 19, 11, 0, 0, 0, time.Local)
+	r := newRig(t, contacts.Contact{Phone: "916591234567", Name: "Wei", Source: "whatsapp", IsDND: true, ConsentSource: "Replied STOP", ConsentAt: &stop, Tags: []string{"VIP"}, CreatedAt: stop.Add(-time.Hour)})
 	r.hs.Record(history.MessageRecord{ID: "old.stop", Direction: history.DirectionIncoming, Type: history.TypeUserMessage, Phone: "916591234567", Text: "STOP", Timestamp: r.now.Add(-48 * time.Hour)})
 
 	out := r.e.Process(Incoming{ID: "wamid.sg1", Phone: "6591234567", PushName: "Wei", Text: "hello", SentAt: r.now})
@@ -136,5 +135,29 @@ func TestAllowListExactForSavedNumber(t *testing.T) {
 	r.e.Process(Incoming{ID: "wamid.in2", Phone: "6591234567", Text: "hours", SentAt: r.now})
 	if r.m.count() != 1 {
 		t.Fatal("the Singapore test number must be answered")
+	}
+}
+
+// F14: a STOP recorded while the chat's queue is full keeps a send time in the future
+// (a wrong clock) capped at now, like the normal path, so a later START still works.
+func TestQueueFullStopCapsFutureSendTime(t *testing.T) {
+	r := newRig(t)
+	phone := "14155550199"
+	q := make(chan Incoming, 64)
+	for i := 0; i < cap(q); i++ {
+		q <- Incoming{ID: "busy", Phone: phone, Text: "hi"}
+	}
+	r.e.mu.Lock()
+	r.e.queues[phone] = q // no worker: the queue stays full
+	r.e.mu.Unlock()
+	future := r.now.Add(48 * time.Hour)
+	r.e.enqueue(Incoming{ID: "wamid.stop", Phone: phone, Text: "STOP", SentAt: future})
+	c, ok := r.cs.GetExact(phone)
+	if !ok || !c.IsDND || c.ConsentAt == nil || !c.ConsentAt.Before(future) {
+		t.Fatalf("the opt-out must be applied with its time capped at now: %+v", c)
+	}
+	r.e.Process(Incoming{ID: "wamid.start", Phone: phone, Text: "START", SentAt: r.now.Add(time.Hour)})
+	if c, _ := r.cs.GetExact(phone); c.IsDND {
+		t.Fatal("a START sent after the STOP must opt the customer back in")
 	}
 }

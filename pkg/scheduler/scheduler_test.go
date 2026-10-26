@@ -2,8 +2,10 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -49,7 +51,9 @@ func init() {
 	pace = func(config.AutomationConfig, int) time.Duration { return time.Millisecond }
 }
 
-func newTestScheduler(t *testing.T, edit func(*config.Config)) (*Scheduler, *sender, *contacts.Store) {
+// newTestScheduler builds a scheduler. seed, when given, is a contact list written by
+// Pulse 2.0, on disk before the store opens (see contacts.LegacyWAID).
+func newTestScheduler(t *testing.T, edit func(*config.Config), seed ...contacts.Contact) (*Scheduler, *sender, *contacts.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.DefaultConfig()
@@ -60,7 +64,17 @@ func newTestScheduler(t *testing.T, edit func(*config.Config)) (*Scheduler, *sen
 		}
 		return nil
 	})
-	cs, _ := contacts.NewStore(filepath.Join(dir, "c.json"))
+	cpath := filepath.Join(dir, "c.json")
+	if len(seed) > 0 {
+		data, err := json.Marshal(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cpath, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs, _ := contacts.NewStore(cpath)
 	hs, _ := history.NewStore(filepath.Join(dir, "h.json"), 100)
 	snd := &sender{}
 	s, err := NewScheduler(filepath.Join(dir, "s.json"), snd, cfg, cs, hs)
@@ -262,7 +276,7 @@ func TestScheduledMessagesFollowPolicy(t *testing.T) {
 		t.Fatalf("message outside the 24-hour window must be skipped (P6): %+v", byID[cold.ID])
 	}
 	cs.RecordInbound("14155550302", time.Now())
-	if _, err := s.Retry(cold.ID); err != nil {
+	if _, err := s.Retry(cold.ID, false); err != nil {
 		t.Fatal(err)
 	}
 	s.processDue(context.Background())

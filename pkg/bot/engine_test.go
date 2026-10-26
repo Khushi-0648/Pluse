@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -68,7 +69,9 @@ type rig struct {
 	seq int
 }
 
-func newRig(t *testing.T) *rig {
+// newRig builds an engine. seed, when given, is a contact list written by Pulse 2.0, on
+// disk before the store opens (see contacts.LegacyWAID).
+func newRig(t *testing.T, seed ...contacts.Contact) *rig {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.DefaultConfig()
@@ -81,6 +84,15 @@ func newRig(t *testing.T) *rig {
 		c.Business = config.BusinessConfig{Name: "Verma Dental", Hours: "Mon-Sat 9-6", Address: "12 MG Road", Services: "Cleaning and fillings", Prices: ""}
 		return nil
 	})
+	if len(seed) > 0 {
+		data, err := json.Marshal(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "c.json"), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	cs, _ := contacts.NewStore(filepath.Join(dir, "c.json"))
 	hs, _ := history.NewStore(filepath.Join(dir, "h.json"), 1000)
 	r := &rig{m: &fakeMessenger{}, cfg: cfg, cs: cs, hs: hs, n: &fakeNotifier{}, now: time.Date(2026, 10, 21, 11, 0, 0, 0, time.Local)}

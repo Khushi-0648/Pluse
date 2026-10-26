@@ -2,7 +2,9 @@ package campaign
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -49,7 +51,9 @@ func (f *fakeSender) SendTextMessage(ctx context.Context, to, text string) (stri
 	return "m" + to, nil
 }
 
-func setup(t *testing.T) (*config.Config, *contacts.Store, *history.Store, *fakeSender, *Runner) {
+// setup builds a runner. seed, when given, is a contact list written by Pulse 2.0, on
+// disk before the store opens (see contacts.LegacyWAID).
+func setup(t *testing.T, seed ...contacts.Contact) (*config.Config, *contacts.Store, *history.Store, *fakeSender, *Runner) {
 	t.Helper()
 	paceOverride = time.Millisecond
 	dir := t.TempDir()
@@ -60,7 +64,7 @@ func setup(t *testing.T) (*config.Config, *contacts.Store, *history.Store, *fake
 		c.Business.Name = "Shop"
 		return nil
 	})
-	cs, _ := contacts.NewStore(filepath.Join(dir, "c.json"))
+	cs := seededStore(t, filepath.Join(dir, "c.json"), seed...)
 	hs, _ := history.NewStore(filepath.Join(dir, "h.json"), 1000)
 	fs := &fakeSender{}
 	r, err := NewRunner(filepath.Join(dir, "camp.json"), fs, cfg, cs, hs)
@@ -535,4 +539,24 @@ func TestWindowTimeZoneAndRollingLimit(t *testing.T) {
 	if left := DailyRemaining(cfg.Snapshot(), hs, time.Now()); left != 1 {
 		t.Fatalf("the limit counts the last 24 hours: %d left", left)
 	}
+}
+
+// seededStore opens a contact store at path. seed, when given, is written there first as
+// a contact list from Pulse 2.0, so those contacts count as being from before the upgrade.
+func seededStore(t *testing.T, path string, seed ...contacts.Contact) *contacts.Store {
+	t.Helper()
+	if len(seed) > 0 {
+		data, err := json.Marshal(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs, err := contacts.NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cs
 }

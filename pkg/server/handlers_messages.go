@@ -171,7 +171,7 @@ func (s *Server) handleMarkRead(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.Contacts != nil {
 		phone := s.resolvePhone(req.Phone)
-		if _, ok := s.Contacts.Get(phone); !ok {
+		if _, ok := s.Contacts.GetExact(phone); !ok {
 			s.Contacts.Upsert(phone, "", "whatsapp")
 		}
 		s.Contacts.MarkRead(phone)
@@ -296,9 +296,12 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	snap := s.cfg.Snapshot()
 	var ct contacts.Contact
 	if s.Contacts != nil {
-		if c, ok := s.Contacts.Get(phone); ok {
+		// phone is already the stored form (resolvePhone): matched exactly, so a number
+		// that is no contact never picks up a look-alike contact's details or number.
+		if c, ok := s.Contacts.GetExact(phone); ok {
 			ct = *c
-			phone = c.Phone
+		} else {
+			ct.IsDND = s.Contacts.WasOptedOut(phone) // opted out, then deleted
 		}
 	}
 	if ct.IsDND {
