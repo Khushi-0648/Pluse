@@ -3,7 +3,7 @@ package version
 
 // Version is the one place the version number is set. Build.bat reads it from here to
 // name the release zip, so the app, the zip and the docs always agree.
-var Version = "2.1.0"
+var Version = "2.1.1"
 
 const (
 	Product = "Pulse"
