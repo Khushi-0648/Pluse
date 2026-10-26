@@ -58,3 +58,7 @@ whatsapp-auto -session sales -port 8086   second number with its own settings an
 - [docs/architecture.md](docs/architecture.md) and [docs/security.md](docs/security.md).
 
 Pulse is independent software. It is not affiliated with, authorised, maintained, sponsored or endorsed by WhatsApp LLC or Meta Platforms, Inc.
+
+## Code Signing
+
+Free code signing is provided by [SignPath.io](https://signpath.io) certificate authority for the SignPath Foundation.

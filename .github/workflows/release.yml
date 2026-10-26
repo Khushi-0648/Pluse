@@ -1,0 +1,58 @@
+name: Build, Sign & Release Pulse
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Install WinRes tool
+        run: go install github.com/tc-hib/go-winres@v0.3.3
+
+      - name: Compile Resource & Windows Binaries
+        run: |
+          go-winres make --in winres\winres.json --out cmd\whatsapp-auto\rsrc
+          go build -trimpath -ldflags="-s -w" -o whatsapp-auto.exe ./cmd/whatsapp-auto
+
+      - name: Prepare Artifact for SignPath
+        run: |
+          Compress-Archive -Path whatsapp-auto.exe -DestinationPath unsigned-build.zip
+
+      - name: Submit to SignPath for Code Signing
+        uses: SignPath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+          project-slug: 'pulse'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'default'
+          wait-for-completion: true
+          output-artifact-directory: './signed-output'
+          file-path: 'unsigned-build.zip'
+
+      - name: Extract Signed Binary
+        run: |
+          Expand-Archive -Path ./signed-output/unsigned-build.zip -DestinationPath ./signed -Force
+
+      - name: Package Final Release ZIP
+        run: |
+          Copy-Item ./signed/whatsapp-auto.exe ./whatsapp-auto-exe/whatsapp-auto.exe -Force
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Package-Release.ps1 -Version ${{ github.ref_name }}
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Pulse-*.zip
+            dist/Pulse-*.zip.sha256
