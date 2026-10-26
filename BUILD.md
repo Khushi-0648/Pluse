@@ -85,6 +85,23 @@ GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o whatsapp-auto-ma
 
 On macOS and Linux the data key is protected by file permissions only (no DPAPI equivalent is used), and the "sealed" settings secrets (access token, app secret) are **not encrypted**: they are only encoded and rely on the 0600 permissions of `config.yaml`. Pulse prints a warning about this at every start on those systems.
 
+## One-line installer (`scripts/install.ps1`)
+
+Customers can install Pulse without downloading a zip in the browser:
+
+```powershell
+irm https://pulse.yourdomain.com/install.ps1 | iex
+```
+
+The script picks the zip for the PC (x64, ARM64 or x86), checks it against the SHA-256 written in the script, installs to `%LOCALAPPDATA%\Programs\Pulse` (no admin rights), closes a running copy normally before replacing it, and creates the desktop shortcut. Customer data in `%APPDATA%\Pulse` is never touched.
+
+Files that PowerShell downloads carry no "downloaded from the internet" mark, so SmartScreen does not show "Windows protected your PC". This does **not** replace code signing: Smart App Control (Windows 11) checks every program and blocks unsigned ones however they arrived, so on such PCs the script stops with an explanation. It never switches any protection off.
+
+For each release:
+1. Upload `dist\Pulse-<version>.zip`, `-arm64.zip` and `-x86.zip` to an **https** folder you control.
+2. In `scripts/install.ps1` set `$BaseUrl` to that folder, `$Version`, and the three checksums from `dist\*.zip.sha256`.
+3. Publish the script itself over https on your own domain. The checksums in it protect the zips; https protects the script, which users run directly.
+
 ## Customer package (`whatsapp-auto-exe/`)
 
 `Build.bat` packs exactly these files:
